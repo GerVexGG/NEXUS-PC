@@ -22,3 +22,9 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# C# Hardware Monitor Sidecar build artifacts
+src-tauri/hwmon-sidecar/bin/
+src-tauri/hwmon-sidecar/obj/
+hwmon-sidecar/bin/
+hwmon-sidecar/obj/

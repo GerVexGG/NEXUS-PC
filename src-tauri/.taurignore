@@ -1,0 +1,3 @@
+hwmon-sidecar/
+../hwmon-sidecar/
+*.sys

@@ -33,6 +33,7 @@ import {
   Fan,
   ShieldCheck,
   Flame,
+  Radio,
 } from "lucide-react";
 
 interface Metrics {
@@ -46,6 +47,7 @@ interface Metrics {
   disk_total_gb: number;
   net_rx_kbps: number;
   net_tx_kbps: number;
+  net_ping_ms: number;
 }
 
 interface StartupItem {
@@ -176,28 +178,28 @@ const TREEMAP_PALETTE = [
   "from-zinc-700/40 to-zinc-800/40 border-zinc-600/40 hover:border-zinc-400/60 text-zinc-200",
 ];
 
-// Варианты каскадной анимации карточек
+// Варианты упругой каскадной анимации приборных модулей Obsidian Cyber-HUD
 const cardsContainerVariants: Variants = {
   hidden: { opacity: 0 },
   show: {
     opacity: 1,
     transition: {
-      staggerChildren: 0.06,
-      delayChildren: 0.02,
+      staggerChildren: 0.045,
+      delayChildren: 0.01,
     },
   },
 };
 
 const cardItemVariants: Variants = {
-  hidden: { opacity: 0, y: 14, scale: 0.985 },
+  hidden: { opacity: 0, y: 10, scale: 0.985 },
   show: {
     opacity: 1,
     y: 0,
     scale: 1,
     transition: {
       type: "spring",
-      stiffness: 320,
-      damping: 26,
+      stiffness: 440,
+      damping: 28,
     },
   },
 };
@@ -231,14 +233,65 @@ function formatCountdown(seconds: number): string {
   return `${pad(mins)}:${pad(secs)}`;
 }
 
-function formatNetworkSpeed(kbps: number): string {
+function formatSpeedParts(kbps: number): { value: string; unit: string } {
   if (!Number.isFinite(kbps) || kbps <= 0) {
-    return "0.0 КБ/с";
+    return { value: "0.0", unit: "KB/S" };
   }
   if (kbps >= 1024) {
-    return `${(kbps / 1024).toFixed(2)} МБ/с`;
+    return { value: (kbps / 1024).toFixed(2), unit: "MB/S" };
   }
-  return `${kbps.toFixed(1)} КБ/с`;
+  return { value: kbps.toFixed(1), unit: "KB/S" };
+}
+
+function getPingHudStyle(pingMs: number): {
+  valueText: string;
+  statusLabel: string;
+  colorClass: string;
+  badgeClass: string;
+  dotClass: string;
+  barPercent: number;
+} {
+  if (!Number.isFinite(pingMs) || pingMs <= 0 || pingMs >= 999) {
+    return {
+      valueText: "—",
+      statusLabel: "НЕТ СВЯЗИ",
+      colorClass: "text-zinc-500",
+      badgeClass: "bg-zinc-800/90 text-zinc-400 border-white/[0.08]",
+      dotClass: "bg-zinc-600",
+      barPercent: 0,
+    };
+  }
+  if (pingMs < 40) {
+    return {
+      valueText: `${pingMs}`,
+      statusLabel: "ИДЕАЛЬНО",
+      colorClass: "text-emerald-400 drop-shadow-[0_0_12px_rgba(52,211,153,0.35)]",
+      badgeClass:
+        "bg-emerald-500/15 text-emerald-300 border-emerald-500/35 shadow-[0_0_12px_rgba(52,211,153,0.2)]",
+      dotClass: "bg-emerald-400 shadow-[0_0_8px_#34d399]",
+      barPercent: Math.max(12, Math.min(100, (1 - pingMs / 150) * 100)),
+    };
+  }
+  if (pingMs <= 90) {
+    return {
+      valueText: `${pingMs}`,
+      statusLabel: "СРЕДНЕ",
+      colorClass: "text-amber-400 drop-shadow-[0_0_12px_rgba(251,191,36,0.35)]",
+      badgeClass:
+        "bg-amber-500/15 text-amber-300 border-amber-500/35 shadow-[0_0_12px_rgba(251,191,36,0.2)]",
+      dotClass: "bg-amber-400 shadow-[0_0_8px_#fbbf24]",
+      barPercent: Math.max(20, Math.min(100, (1 - pingMs / 160) * 100)),
+    };
+  }
+  return {
+    valueText: `${pingMs}`,
+    statusLabel: "ВЫСОКИЙ ПИНГ",
+    colorClass: "text-rose-400 drop-shadow-[0_0_12px_rgba(244,63,94,0.4)]",
+    badgeClass:
+      "bg-rose-500/15 text-rose-300 border-rose-500/40 shadow-[0_0_14px_rgba(244,63,94,0.25)]",
+    dotClass: "bg-rose-500 shadow-[0_0_8px_#f43f5e]",
+    barPercent: 100,
+  };
 }
 
 function formatBytes(bytes: number): string {
@@ -261,7 +314,7 @@ function getTempBadgeStyle(tempC: number | null | undefined): {
 } {
   if (tempC === null || tempC === undefined || !Number.isFinite(tempC)) {
     return {
-      badgeClass: "bg-zinc-800/80 text-zinc-400 border-white/[0.08]",
+      badgeClass: "bg-zinc-900/90 text-zinc-400 border-white/[0.08]",
       textClass: "text-zinc-400",
       barClass: "bg-zinc-600",
       label: "Н/Д",
@@ -270,30 +323,30 @@ function getTempBadgeStyle(tempC: number | null | undefined): {
   if (tempC > 80) {
     return {
       badgeClass:
-        "bg-rose-500/15 text-rose-400 border-rose-500/35 shadow-[0_0_14px_rgba(244,63,94,0.25)]",
+        "bg-rose-500/15 text-rose-300 border-rose-500/40 shadow-[0_0_14px_rgba(244,63,94,0.25)]",
       textClass: "text-rose-400",
       barClass:
         "bg-gradient-to-r from-rose-500 to-red-400 shadow-[0_0_12px_rgba(244,63,94,0.6)]",
-      label: "Горячо",
+      label: "CRITICAL",
     };
   }
   if (tempC >= 65) {
     return {
       badgeClass:
-        "bg-amber-500/15 text-amber-400 border-amber-500/35 shadow-[0_0_14px_rgba(245,158,11,0.2)]",
+        "bg-amber-500/15 text-amber-300 border-amber-500/40 shadow-[0_0_14px_rgba(245,158,11,0.2)]",
       textClass: "text-amber-400",
       barClass:
         "bg-gradient-to-r from-amber-500 to-yellow-400 shadow-[0_0_12px_rgba(245,158,11,0.5)]",
-      label: "Нагрузка",
+      label: "WARM",
     };
   }
   return {
     badgeClass:
-      "bg-emerald-500/15 text-emerald-400 border-emerald-500/30 shadow-[0_0_14px_rgba(52,211,153,0.18)]",
+      "bg-emerald-500/15 text-emerald-300 border-emerald-500/35 shadow-[0_0_14px_rgba(52,211,153,0.18)]",
     textClass: "text-emerald-400",
     barClass:
       "bg-gradient-to-r from-emerald-500 to-teal-400 shadow-[0_0_12px_rgba(52,211,153,0.45)]",
-    label: "Норма",
+    label: "OPTIMAL",
   };
 }
 
@@ -411,12 +464,13 @@ function computeTreemapRects(nodes: FolderNode[]): TreemapRect[] {
 function getLoadBarStyles(
   percentage: number,
   defaultTheme: "emerald" | "cyan" = "emerald"
-): { barClass: string; badgeTextClass: string } {
+): { barClass: string; badgeTextClass: string; activeSegmentClass: string } {
   if (percentage > 90) {
     return {
       barClass:
         "bg-gradient-to-r from-rose-500 to-red-400 shadow-[0_0_12px_rgba(244,63,94,0.65)]",
       badgeTextClass: "text-rose-400",
+      activeSegmentClass: "bg-rose-400 shadow-[0_0_8px_rgba(244,63,94,0.7)]",
     };
   }
   if (percentage > 70) {
@@ -424,6 +478,7 @@ function getLoadBarStyles(
       barClass:
         "bg-gradient-to-r from-amber-500 to-yellow-400 shadow-[0_0_12px_rgba(245,158,11,0.55)]",
       badgeTextClass: "text-amber-400",
+      activeSegmentClass: "bg-amber-400 shadow-[0_0_8px_rgba(245,158,11,0.6)]",
     };
   }
   if (defaultTheme === "cyan") {
@@ -431,13 +486,46 @@ function getLoadBarStyles(
       barClass:
         "bg-gradient-to-r from-cyan-500 to-sky-400 shadow-[0_0_12px_rgba(34,211,238,0.45)]",
       badgeTextClass: "text-cyan-400",
+      activeSegmentClass: "bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.55)]",
     };
   }
   return {
     barClass:
       "bg-gradient-to-r from-emerald-500 to-teal-400 shadow-[0_0_12px_rgba(52,211,153,0.45)]",
     badgeTextClass: "text-emerald-400",
+    activeSegmentClass: "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.55)]",
   };
+}
+
+// Сегментированный индикатор приборной шкалы Obsidian Cyber-HUD
+function SegmentedHudBar({
+  percentage,
+  segments = 20,
+  theme = "emerald",
+}: {
+  percentage: number;
+  segments?: number;
+  theme?: "emerald" | "cyan";
+}) {
+  const clamped = Math.min(100, Math.max(0, percentage));
+  const activeCount = Math.round((clamped / 100) * segments);
+  const styles = getLoadBarStyles(clamped, theme);
+
+  return (
+    <div className="grid gap-1" style={{ gridTemplateColumns: `repeat(${segments}, minmax(0, 1fr))` }}>
+      {Array.from({ length: segments }, (_, i) => {
+        const isActive = i < activeCount;
+        return (
+          <div
+            key={i}
+            className={`h-2 rounded-[2px] transition-all duration-300 ${
+              isActive ? styles.activeSegmentClass : "bg-white/[0.06]"
+            }`}
+          />
+        );
+      })}
+    </div>
+  );
 }
 
 function getLocationBadgeStyles(location: string): string {
@@ -450,19 +538,21 @@ function getLocationBadgeStyles(location: string): string {
   return "bg-emerald-500/10 text-emerald-400 border-emerald-500/25";
 }
 
-// Карточка с эффектом направленного света (Spotlight Glow Card) без лишних ререндеров
+// Приборный модуль Obsidian Cyber-HUD с угловыми метками (HUD corner brackets) и Spotlight-свечением
 interface SpotlightCardProps {
   children: ReactNode;
   className?: string;
   spotlightColor?: string;
   variants?: Variants;
+  accentColor?: "emerald" | "cyan" | "amber" | "rose";
 }
 
 function SpotlightCard({
   children,
   className = "",
-  spotlightColor = "rgba(52, 211, 153, 0.13)",
+  spotlightColor = "rgba(52, 211, 153, 0.12)",
   variants,
+  accentColor = "emerald",
 }: SpotlightCardProps) {
   const handleMouseMove = (e: MouseEvent<HTMLDivElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
@@ -471,6 +561,15 @@ function SpotlightCard({
     e.currentTarget.style.setProperty("--mouse-x", `${x}px`);
     e.currentTarget.style.setProperty("--mouse-y", `${y}px`);
   };
+
+  const cornerClass =
+    accentColor === "cyan"
+      ? "border-cyan-400/40 group-hover:border-cyan-300/80"
+      : accentColor === "amber"
+      ? "border-amber-400/45 group-hover:border-amber-300/85"
+      : accentColor === "rose"
+      ? "border-rose-400/50 group-hover:border-rose-300/90"
+      : "border-emerald-400/40 group-hover:border-emerald-300/80";
 
   return (
     <motion.div
@@ -481,18 +580,33 @@ function SpotlightCard({
           "--spotlight-color": spotlightColor,
         } as React.CSSProperties
       }
-      className={`group relative overflow-hidden rounded-2xl backdrop-blur-xl bg-zinc-900/60 border border-white/5 hover:border-white/10 transition-colors duration-300 shadow-[0_8px_30px_rgb(0,0,0,0.35)] ${className}`}
+      className={`group relative overflow-hidden rounded-xl backdrop-blur-2xl bg-[#0b0d13]/90 border border-white/[0.07] hover:border-white/[0.15] transition-all duration-300 shadow-[0_12px_36px_rgba(0,0,0,0.65)] ${className}`}
     >
       {/* Направленный радиальный свет за курсором */}
       <div
         className="pointer-events-none absolute -inset-px opacity-0 group-hover:opacity-100 transition-opacity duration-300"
         style={{
           background:
-            "radial-gradient(340px circle at var(--mouse-x, 0px) var(--mouse-y, 0px), var(--spotlight-color), transparent 80%)",
+            "radial-gradient(360px circle at var(--mouse-x, 0px) var(--mouse-y, 0px), var(--spotlight-color), transparent 80%)",
         }}
       />
-      {/* Тонкий верхний блик стекла */}
-      <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/15 to-transparent" />
+      {/* Верхний металлический лазерный блик */}
+      <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/20 to-transparent" />
+
+      {/* Неоновые угловые метки приборного модуля (HUD Corner Brackets) */}
+      <span
+        className={`pointer-events-none absolute top-1.5 left-1.5 w-2.5 h-2.5 border-t border-l transition-colors duration-300 ${cornerClass}`}
+      />
+      <span
+        className={`pointer-events-none absolute top-1.5 right-1.5 w-2.5 h-2.5 border-t border-r transition-colors duration-300 ${cornerClass}`}
+      />
+      <span
+        className={`pointer-events-none absolute bottom-1.5 left-1.5 w-2.5 h-2.5 border-b border-l transition-colors duration-300 ${cornerClass}`}
+      />
+      <span
+        className={`pointer-events-none absolute bottom-1.5 right-1.5 w-2.5 h-2.5 border-b border-r transition-colors duration-300 ${cornerClass}`}
+      />
+
       <div className="relative z-10 h-full flex flex-col justify-between">{children}</div>
     </motion.div>
   );
@@ -758,6 +872,7 @@ export default function App() {
     disk_total_gb: 0,
     net_rx_kbps: 0,
     net_tx_kbps: 0,
+    net_ping_ms: 0,
   });
   const [history, setHistory] = useState<HistoryPoint[]>(createInitialHistory);
 
@@ -1060,6 +1175,18 @@ export default function App() {
       : 0;
 
   const isNetworkActive = metrics.net_rx_kbps > 0.1 || metrics.net_tx_kbps > 0.1;
+  const isGatewayOnline = metrics.net_ping_ms > 0 && metrics.net_ping_ms < 999;
+  const pingStyle = getPingHudStyle(metrics.net_ping_ms);
+  const rxParts = formatSpeedParts(metrics.net_rx_kbps);
+  const txParts = formatSpeedParts(metrics.net_tx_kbps);
+  const rxPulsePct =
+    metrics.net_rx_kbps <= 0
+      ? 0
+      : Math.min(100, Math.max(8, Math.log10(metrics.net_rx_kbps + 1) * 25));
+  const txPulsePct =
+    metrics.net_tx_kbps <= 0
+      ? 0
+      : Math.min(100, Math.max(8, Math.log10(metrics.net_tx_kbps + 1) * 25));
 
   const cpuLoadStyles = getLoadBarStyles(metrics.cpu_usage, "emerald");
   const ramLoadStyles = getLoadBarStyles(metrics.ram_percentage, "cyan");
@@ -1124,47 +1251,61 @@ export default function App() {
   const cpuTempStyle = getTempBadgeStyle(hwData?.cpu.package_temp_c);
 
   return (
-    <div className="relative flex h-screen w-screen bg-[#0a0c10] text-zinc-200 select-none overflow-hidden font-sans">
-      {/* Фоновое кибер-графитовое ambient-свечение для глубины стекла */}
-      <div className="pointer-events-none absolute -top-36 left-48 h-96 w-96 rounded-full bg-emerald-500/[0.06] blur-[120px]" />
-      <div className="pointer-events-none absolute bottom-0 right-12 h-96 w-96 rounded-full bg-cyan-500/[0.05] blur-[130px]" />
+    <div className="relative flex h-screen w-screen bg-[#07080b] obsidian-grid-bg text-zinc-200 select-none overflow-hidden font-sans">
+      {/* Точечное акцентное свечение Obsidian Cyber-HUD */}
+      <div className="pointer-events-none absolute -top-40 left-40 h-96 w-96 rounded-full bg-emerald-500/[0.055] blur-[130px]" />
+      <div className="pointer-events-none absolute bottom-0 right-10 h-96 w-96 rounded-full bg-cyan-500/[0.05] blur-[140px]" />
 
-      {/* Боковая панель */}
-      <aside className="relative z-20 w-64 shrink-0 backdrop-blur-2xl bg-[#101318]/85 border-r border-white/[0.06] flex flex-col justify-between p-4">
+      {/* Компактная строгая боковая панель Obsidian Cyber-HUD */}
+      <aside className="relative z-20 w-60 shrink-0 backdrop-blur-2xl bg-[#090b10]/95 border-r border-white/[0.07] flex flex-col justify-between p-3.5">
         <div>
-          <div className="flex items-center gap-3 px-3 py-4 mb-6 border-b border-white/[0.06]">
-            <div className="relative h-9 w-9 rounded-xl bg-emerald-500/15 border border-emerald-400/30 flex items-center justify-center text-emerald-400 font-bold text-lg shadow-[0_0_20px_rgba(52,211,153,0.2)]">
-              N
-            </div>
-            <div>
-              <h1 className="font-bold text-base tracking-wider text-zinc-100">NEXUS PC</h1>
-              <p className="text-[11px] text-zinc-500 font-mono">v0.1 Cyber-Graphite</p>
+          <div className="flex items-center justify-between px-2.5 py-3 mb-5 border-b border-white/[0.07]">
+            <div className="flex items-center gap-2.5">
+              <div className="relative h-8 w-8 rounded-lg bg-emerald-500/15 border border-emerald-400/40 flex items-center justify-center text-emerald-400 font-mono font-extrabold text-base shadow-[0_0_18px_rgba(52,211,153,0.25)]">
+                N
+                <span className="absolute -top-0.5 -right-0.5 h-1.5 w-1.5 bg-emerald-400 rounded-full shadow-[0_0_6px_#34d399]" />
+              </div>
+              <div>
+                <h1 className="font-mono font-bold text-sm tracking-[0.14em] text-zinc-100">
+                  NEXUS // HUD
+                </h1>
+                <p className="text-[10px] text-zinc-500 font-mono uppercase tracking-wider">
+                  SYS.VER 0.1 • OBSIDIAN
+                </p>
+              </div>
             </div>
           </div>
 
-          <nav className="space-y-2">
+          <div className="px-2 mb-2 text-[10px] font-mono uppercase tracking-[0.18em] text-zinc-500">
+            МОДУЛИ СИСТЕМЫ
+          </div>
+
+          <nav className="space-y-1.5">
             {/* 1. Кнопка вкладки Dashboard */}
             <motion.button
               type="button"
               whileTap={{ scale: 0.97 }}
               onClick={() => setActiveTab("dashboard")}
-              className={`relative w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium transition-colors cursor-pointer ${
+              className={`relative w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-mono tracking-wide transition-colors cursor-pointer ${
                 activeTab === "dashboard"
-                  ? "text-emerald-400"
+                  ? "text-emerald-300 font-semibold"
                   : "text-zinc-400 hover:text-zinc-200"
               }`}
             >
               {activeTab === "dashboard" && (
                 <motion.div
                   layoutId="activeTabPill"
-                  transition={{ type: "spring", stiffness: 380, damping: 30 }}
-                  className="absolute inset-0 rounded-xl bg-gradient-to-r from-emerald-500/15 via-zinc-800/80 to-zinc-800/50 border border-emerald-500/25 shadow-[0_0_20px_rgba(52,211,153,0.12)]"
-                />
+                  transition={{ type: "spring", stiffness: 460, damping: 32 }}
+                  className="absolute inset-0 rounded-lg bg-gradient-to-r from-emerald-500/20 via-emerald-500/[0.07] to-transparent border border-emerald-500/30 shadow-[0_0_18px_rgba(52,211,153,0.12)]"
+                >
+                  <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 bg-emerald-400 shadow-[0_0_8px_#34d399]" />
+                </motion.div>
               )}
-              <span className="relative z-10 flex items-center gap-3">
-                <LayoutDashboard size={18} />
-                <span>Панель управления</span>
+              <span className="relative z-10 flex items-center gap-2.5">
+                <LayoutDashboard size={15} />
+                <span>ТЕЛЕМЕТРИЯ</span>
               </span>
+              <span className="relative z-10 text-[10px] text-zinc-500">01</span>
             </motion.button>
 
             {/* 2. Кнопка вкладки Startup Manager */}
@@ -1172,27 +1313,31 @@ export default function App() {
               type="button"
               whileTap={{ scale: 0.97 }}
               onClick={() => setActiveTab("startup")}
-              className={`relative w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-sm font-medium transition-colors cursor-pointer ${
+              className={`relative w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-mono tracking-wide transition-colors cursor-pointer ${
                 activeTab === "startup"
-                  ? "text-emerald-400"
+                  ? "text-emerald-300 font-semibold"
                   : "text-zinc-400 hover:text-zinc-200"
               }`}
             >
               {activeTab === "startup" && (
                 <motion.div
                   layoutId="activeTabPill"
-                  transition={{ type: "spring", stiffness: 380, damping: 30 }}
-                  className="absolute inset-0 rounded-xl bg-gradient-to-r from-emerald-500/15 via-zinc-800/80 to-zinc-800/50 border border-emerald-500/25 shadow-[0_0_20px_rgba(52,211,153,0.12)]"
-                />
+                  transition={{ type: "spring", stiffness: 460, damping: 32 }}
+                  className="absolute inset-0 rounded-lg bg-gradient-to-r from-emerald-500/20 via-emerald-500/[0.07] to-transparent border border-emerald-500/30 shadow-[0_0_18px_rgba(52,211,153,0.12)]"
+                >
+                  <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 bg-emerald-400 shadow-[0_0_8px_#34d399]" />
+                </motion.div>
               )}
-              <span className="relative z-10 flex items-center gap-3">
-                <Rocket size={18} />
-                <span>Автозагрузка</span>
+              <span className="relative z-10 flex items-center gap-2.5">
+                <Rocket size={15} />
+                <span>АВТОЗАГРУЗКА</span>
               </span>
-              {brokenStartupCount > 0 && (
-                <span className="relative z-10 text-[11px] font-mono px-1.5 py-0.5 rounded-md bg-rose-500/15 text-rose-400 border border-rose-500/30">
-                  {brokenStartupCount}
+              {brokenStartupCount > 0 ? (
+                <span className="relative z-10 text-[10px] font-mono px-1.5 py-0.5 rounded bg-rose-500/15 text-rose-400 border border-rose-500/35">
+                  !{brokenStartupCount}
                 </span>
+              ) : (
+                <span className="relative z-10 text-[10px] text-zinc-500">02</span>
               )}
             </motion.button>
 
@@ -1201,28 +1346,32 @@ export default function App() {
               type="button"
               whileTap={{ scale: 0.97 }}
               onClick={() => setActiveTab("storage")}
-              className={`relative w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-sm font-medium transition-colors cursor-pointer ${
+              className={`relative w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-mono tracking-wide transition-colors cursor-pointer ${
                 activeTab === "storage"
-                  ? "text-emerald-400"
+                  ? "text-emerald-300 font-semibold"
                   : "text-zinc-400 hover:text-zinc-200"
               }`}
             >
               {activeTab === "storage" && (
                 <motion.div
                   layoutId="activeTabPill"
-                  transition={{ type: "spring", stiffness: 380, damping: 30 }}
-                  className="absolute inset-0 rounded-xl bg-gradient-to-r from-emerald-500/15 via-zinc-800/80 to-zinc-800/50 border border-emerald-500/25 shadow-[0_0_20px_rgba(52,211,153,0.12)]"
-                />
+                  transition={{ type: "spring", stiffness: 460, damping: 32 }}
+                  className="absolute inset-0 rounded-lg bg-gradient-to-r from-emerald-500/20 via-emerald-500/[0.07] to-transparent border border-emerald-500/30 shadow-[0_0_18px_rgba(52,211,153,0.12)]"
+                >
+                  <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 bg-emerald-400 shadow-[0_0_8px_#34d399]" />
+                </motion.div>
               )}
-              <span className="relative z-10 flex items-center gap-3">
-                <PieChart size={18} />
-                <span>Анализатор дисков</span>
+              <span className="relative z-10 flex items-center gap-2.5">
+                <PieChart size={15} />
+                <span>ДИСКОВЫЙ РАДАР</span>
               </span>
-              {isScanning && (
+              {isScanning ? (
                 <Loader2
-                  size={14}
+                  size={13}
                   className="relative z-10 animate-spin text-emerald-400"
                 />
+              ) : (
+                <span className="relative z-10 text-[10px] text-zinc-500">03</span>
               )}
             </motion.button>
 
@@ -1231,25 +1380,29 @@ export default function App() {
               type="button"
               whileTap={{ scale: 0.97 }}
               onClick={() => setActiveTab("hardware")}
-              className={`relative w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-sm font-medium transition-colors cursor-pointer ${
+              className={`relative w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-mono tracking-wide transition-colors cursor-pointer ${
                 activeTab === "hardware"
-                  ? "text-emerald-400"
+                  ? "text-emerald-300 font-semibold"
                   : "text-zinc-400 hover:text-zinc-200"
               }`}
             >
               {activeTab === "hardware" && (
                 <motion.div
                   layoutId="activeTabPill"
-                  transition={{ type: "spring", stiffness: 380, damping: 30 }}
-                  className="absolute inset-0 rounded-xl bg-gradient-to-r from-emerald-500/15 via-zinc-800/80 to-zinc-800/50 border border-emerald-500/25 shadow-[0_0_20px_rgba(52,211,153,0.12)]"
-                />
+                  transition={{ type: "spring", stiffness: 460, damping: 32 }}
+                  className="absolute inset-0 rounded-lg bg-gradient-to-r from-emerald-500/20 via-emerald-500/[0.07] to-transparent border border-emerald-500/30 shadow-[0_0_18px_rgba(52,211,153,0.12)]"
+                >
+                  <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 bg-emerald-400 shadow-[0_0_8px_#34d399]" />
+                </motion.div>
               )}
-              <span className="relative z-10 flex items-center gap-3">
-                <Gauge size={18} />
-                <span>Железо</span>
+              <span className="relative z-10 flex items-center gap-2.5">
+                <Gauge size={15} />
+                <span>ДАТЧИКИ ЖЕЛЕЗА</span>
               </span>
-              {thermalWarnings.length > 0 && (
+              {thermalWarnings.length > 0 ? (
                 <span className="relative z-10 h-2 w-2 rounded-full bg-rose-500 shadow-[0_0_8px_#f43f5e] animate-ping" />
+              ) : (
+                <span className="relative z-10 text-[10px] text-zinc-500">04</span>
               )}
             </motion.button>
 
@@ -1258,240 +1411,457 @@ export default function App() {
               type="button"
               whileTap={{ scale: 0.97 }}
               onClick={() => setActiveTab("power")}
-              className={`relative w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-sm font-medium transition-colors cursor-pointer ${
+              className={`relative w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-mono tracking-wide transition-colors cursor-pointer ${
                 activeTab === "power"
-                  ? "text-emerald-400"
+                  ? "text-emerald-300 font-semibold"
                   : "text-zinc-400 hover:text-zinc-200"
               }`}
             >
               {activeTab === "power" && (
                 <motion.div
                   layoutId="activeTabPill"
-                  transition={{ type: "spring", stiffness: 380, damping: 30 }}
-                  className="absolute inset-0 rounded-xl bg-gradient-to-r from-emerald-500/15 via-zinc-800/80 to-zinc-800/50 border border-emerald-500/25 shadow-[0_0_20px_rgba(52,211,153,0.12)]"
-                />
+                  transition={{ type: "spring", stiffness: 460, damping: 32 }}
+                  className="absolute inset-0 rounded-lg bg-gradient-to-r from-emerald-500/20 via-emerald-500/[0.07] to-transparent border border-emerald-500/30 shadow-[0_0_18px_rgba(52,211,153,0.12)]"
+                >
+                  <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 bg-emerald-400 shadow-[0_0_8px_#34d399]" />
+                </motion.div>
               )}
-              <span className="relative z-10 flex items-center gap-3">
-                <Power size={18} />
-                <span>Питание и таймер</span>
+              <span className="relative z-10 flex items-center gap-2.5">
+                <Power size={15} />
+                <span>ПИТАНИЕ // ТАЙМЕР</span>
               </span>
-              {timerState && remainingSeconds > 0 && (
-                <span className="relative z-10 text-xs font-mono px-1.5 py-0.5 rounded-md bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 shadow-[0_0_10px_rgba(52,211,153,0.25)]">
+              {timerState && remainingSeconds > 0 ? (
+                <span className="relative z-10 text-[10px] font-mono tabular-nums px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/35">
                   {formatCountdown(remainingSeconds)}
                 </span>
+              ) : (
+                <span className="relative z-10 text-[10px] text-zinc-500">05</span>
               )}
             </motion.button>
           </nav>
         </div>
 
-        {/* Пульсирующий неоновый индикатор службы внизу сайдбара */}
-        <div className="px-3.5 py-3 rounded-xl backdrop-blur-md bg-zinc-900/70 border border-white/[0.06] text-xs text-zinc-400 flex justify-between items-center font-mono shadow-inner">
-          <span>Служба:</span>
-          <span className="text-emerald-400 flex items-center gap-2 drop-shadow-[0_0_8px_rgba(52,211,153,0.45)]">
-            <span className="relative flex h-2.5 w-2.5">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-400 shadow-[0_0_10px_#34d399]"></span>
+        {/* Нижний приборный блок статуса ядра и пинга */}
+        <div className="space-y-2">
+          <div className="px-3 py-2 rounded-lg bg-[#0d1017] border border-white/[0.06] flex items-center justify-between text-[11px] font-mono">
+            <span className="text-zinc-500">PING:</span>
+            <span className={`font-bold tabular-nums ${pingStyle.colorClass}`}>
+              {metrics.net_ping_ms > 0 ? `${metrics.net_ping_ms} MS` : "OFFLINE"}
             </span>
-            sysinfo + hwmon
-          </span>
+          </div>
+
+          <div className="px-3 py-2.5 rounded-lg bg-[#0d1017] border border-white/[0.06] text-[11px] text-zinc-400 flex justify-between items-center font-mono">
+            <span className="text-zinc-500">ЯДРО:</span>
+            <span className="text-emerald-400 flex items-center gap-2 drop-shadow-[0_0_8px_rgba(52,211,153,0.45)]">
+              <span className="relative flex h-2 w-2">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-400 shadow-[0_0_8px_#34d399]"></span>
+              </span>
+              SYS + HWMON
+            </span>
+          </div>
         </div>
       </aside>
 
-      {/* Основной экран с кинематографичным переходом */}
-      <main className="relative z-10 flex-1 min-w-0 flex flex-col overflow-y-auto p-6 lg:p-8">
+      {/* Основной экран с упругим быстрым переходом */}
+      <main className="relative z-10 flex-1 min-w-0 flex flex-col overflow-y-auto p-6 lg:p-7">
         <AnimatePresence mode="wait">
           {activeTab === "dashboard" && (
             <motion.div
               key="dashboard"
-              initial={{ opacity: 0, y: 12 }}
+              initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -8 }}
-              transition={{ duration: 0.25, ease: "easeOut" }}
-              className="space-y-6 max-w-6xl w-full"
+              exit={{ opacity: 0, y: -6 }}
+              transition={{ duration: 0.18, ease: "easeOut" }}
+              className="space-y-5 max-w-6xl w-full"
             >
-              <div>
-                <h2 className="text-2xl font-bold text-zinc-100 tracking-tight">
-                  Состояние системы
-                </h2>
-                <p className="text-sm text-zinc-400 mt-1">
-                  Реальные параметры компьютера и сетевая телеметрия
-                </p>
+              <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-3 border-b border-white/[0.06] pb-3.5">
+                <div>
+                  <div className="text-[10px] font-mono uppercase tracking-[0.2em] text-emerald-400/90 mb-0.5">
+                    OBSIDIAN CYBER-HUD // REALTIME TELEMETRY
+                  </div>
+                  <h2 className="text-2xl font-bold text-zinc-100 tracking-tight">
+                    Приборная панель системы
+                  </h2>
+                </div>
+                <div className="flex items-center gap-2 text-[11px] font-mono text-zinc-400">
+                  <span className="px-2.5 py-1 rounded bg-[#0d1017] border border-white/[0.07] tabular-nums">
+                    ОПРОС: <strong className="text-emerald-400">1000 MS</strong>
+                  </span>
+                  <span className="px-2.5 py-1 rounded bg-[#0d1017] border border-white/[0.07] tabular-nums">
+                    ШЛЮЗ:{" "}
+                    <strong className={isGatewayOnline ? "text-emerald-400" : "text-rose-400"}>
+                      {isGatewayOnline ? "ONLINE" : "TIMEOUT"}
+                    </strong>
+                  </span>
+                </div>
               </div>
 
+              {/* Верхний ряд: 3 главных системных прибора (CPU, RAM+Swap, Накопитель) */}
               <motion.div
                 variants={cardsContainerVariants}
                 initial="hidden"
                 animate="show"
-                className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4"
+                className="grid grid-cols-1 md:grid-cols-3 gap-4"
               >
-                {/* 1. CPU */}
+                {/* 1. CPU HUD Module */}
                 <SpotlightCard
                   variants={cardItemVariants}
                   spotlightColor="rgba(52, 211, 153, 0.14)"
+                  accentColor="emerald"
                   className="min-w-0 p-5"
                 >
                   <div>
-                    <div className="flex items-center justify-between text-zinc-400 mb-3 gap-2">
-                      <span className="text-sm font-medium truncate">Процессор (CPU)</span>
-                      <div className="p-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/20">
+                    <div className="flex items-center justify-between mb-3 gap-2">
+                      <div>
+                        <span className="text-[10px] font-mono uppercase tracking-[0.16em] text-zinc-500 block">
+                          SYS.MOD // 01
+                        </span>
+                        <span className="text-sm font-semibold text-zinc-200">
+                          Центральный процессор
+                        </span>
+                      </div>
+                      <div className="p-2 rounded-lg bg-emerald-500/10 border border-emerald-500/25">
                         <Cpu size={16} className={cpuLoadStyles.badgeTextClass} />
                       </div>
                     </div>
-                    <div className="text-2xl 2xl:text-3xl font-bold text-zinc-100 mb-3 truncate tracking-tight">
-                      {metrics.cpu_usage.toFixed(1)}%
+
+                    <div className="flex items-baseline gap-2 my-3">
+                      <span className="text-3xl sm:text-4xl font-extrabold font-mono tabular-nums text-zinc-100 tracking-tight">
+                        {metrics.cpu_usage.toFixed(1)}
+                      </span>
+                      <span className="text-xs font-mono font-bold px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                        % LOAD
+                      </span>
                     </div>
                   </div>
-                  <div>
-                    <div className="w-full bg-zinc-800/80 h-1.5 rounded-full overflow-hidden">
-                      <div
-                        className={`h-full rounded-full transition-all duration-500 ${cpuLoadStyles.barClass}`}
-                        style={{ width: `${Math.min(metrics.cpu_usage, 100)}%` }}
-                      ></div>
-                    </div>
-                    <div className="flex items-center justify-between text-xs text-zinc-500 mt-2.5 font-mono">
-                      <span>Общая загрузка</span>
-                      <span className={cpuLoadStyles.badgeTextClass}>
+
+                  <div className="space-y-2.5">
+                    <SegmentedHudBar
+                      percentage={metrics.cpu_usage}
+                      segments={20}
+                      theme="emerald"
+                    />
+                    <div className="flex items-center justify-between text-[11px] text-zinc-500 font-mono pt-1 border-t border-white/[0.05]">
+                      <span>СТАТУС ЯДРА</span>
+                      <span className={`font-bold ${cpuLoadStyles.badgeTextClass}`}>
                         {metrics.cpu_usage > 90
-                          ? "Критическая"
+                          ? "CRITICAL LOAD"
                           : metrics.cpu_usage > 70
-                          ? "Высокая"
-                          : "Норма"}
+                          ? "HIGH LOAD"
+                          : "NOMINAL"}
                       </span>
                     </div>
                   </div>
                 </SpotlightCard>
 
-                {/* 2. RAM + Swap */}
+                {/* 2. RAM + Swap HUD Module */}
                 <SpotlightCard
                   variants={cardItemVariants}
                   spotlightColor="rgba(34, 211, 238, 0.14)"
+                  accentColor="cyan"
                   className="min-w-0 p-5"
                 >
                   <div>
-                    <div className="flex items-center justify-between text-zinc-400 mb-3 gap-2">
-                      <span className="text-sm font-medium truncate">
-                        Оперативная память
-                      </span>
-                      <div className="p-1.5 rounded-lg bg-cyan-500/10 border border-cyan-500/20">
+                    <div className="flex items-center justify-between mb-3 gap-2">
+                      <div>
+                        <span className="text-[10px] font-mono uppercase tracking-[0.16em] text-zinc-500 block">
+                          SYS.MOD // 02
+                        </span>
+                        <span className="text-sm font-semibold text-zinc-200">
+                          Оперативная память
+                        </span>
+                      </div>
+                      <div className="p-2 rounded-lg bg-cyan-500/10 border border-cyan-500/25">
                         <Activity size={16} className={ramLoadStyles.badgeTextClass} />
                       </div>
                     </div>
-                    <div className="text-2xl 2xl:text-3xl font-bold text-zinc-100 mb-3 truncate tracking-tight">
-                      {metrics.ram_used_gb.toFixed(1)} / {metrics.ram_total_gb.toFixed(0)} GB
-                    </div>
-                    <div className="w-full bg-zinc-800/80 h-1.5 rounded-full overflow-hidden">
-                      <div
-                        className={`h-full rounded-full transition-all duration-500 ${ramLoadStyles.barClass}`}
-                        style={{ width: `${Math.min(metrics.ram_percentage, 100)}%` }}
-                      ></div>
+
+                    <div className="flex items-baseline justify-between gap-2 my-3">
+                      <div className="flex items-baseline gap-1.5">
+                        <span className="text-3xl sm:text-4xl font-extrabold font-mono tabular-nums text-zinc-100 tracking-tight">
+                          {metrics.ram_used_gb.toFixed(1)}
+                        </span>
+                        <span className="text-sm font-mono text-zinc-500 tabular-nums">
+                          / {metrics.ram_total_gb.toFixed(0)}
+                        </span>
+                        <span className="text-xs font-mono font-bold px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
+                          GB
+                        </span>
+                      </div>
+                      <span className={`text-xs font-mono font-bold tabular-nums ${ramLoadStyles.badgeTextClass}`}>
+                        {metrics.ram_percentage.toFixed(0)}%
+                      </span>
                     </div>
                   </div>
 
-                  <div className="mt-3 pt-2.5 border-t border-white/[0.06] space-y-1.5">
-                    <div className="flex items-center justify-between text-xs font-mono">
-                      <span className="text-zinc-500">Swap (подкачка):</span>
-                      <span className="text-zinc-300">
-                        {metrics.swap_used_gb.toFixed(1)} / {metrics.swap_total_gb.toFixed(1)} GB
+                  <div className="space-y-2.5">
+                    <SegmentedHudBar
+                      percentage={metrics.ram_percentage}
+                      segments={20}
+                      theme="cyan"
+                    />
+                    <div className="flex items-center justify-between text-[11px] font-mono pt-1 border-t border-white/[0.05]">
+                      <span className="text-zinc-500">SWAP БУФЕР:</span>
+                      <span className="text-zinc-300 tabular-nums">
+                        {metrics.swap_used_gb.toFixed(1)} / {metrics.swap_total_gb.toFixed(1)}{" "}
+                        <span className="text-cyan-400">GB</span> ({swapPercentage.toFixed(0)}%)
                       </span>
-                    </div>
-                    <div className="w-full bg-zinc-800/80 h-1 rounded-full overflow-hidden">
-                      <div
-                        className="bg-cyan-400/75 h-full rounded-full transition-all duration-500"
-                        style={{ width: `${swapPercentage}%` }}
-                      ></div>
                     </div>
                   </div>
                 </SpotlightCard>
 
-                {/* 3. Основной накопитель */}
+                {/* 3. Primary Storage HUD Module */}
                 <SpotlightCard
                   variants={cardItemVariants}
                   spotlightColor="rgba(52, 211, 153, 0.14)"
+                  accentColor="emerald"
                   className="min-w-0 p-5"
                 >
                   <div>
-                    <div className="flex items-center justify-between text-zinc-400 mb-3 gap-2">
-                      <span className="text-sm font-medium truncate">
-                        Основной накопитель
-                      </span>
-                      <div className="p-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/20">
+                    <div className="flex items-center justify-between mb-3 gap-2">
+                      <div>
+                        <span className="text-[10px] font-mono uppercase tracking-[0.16em] text-zinc-500 block">
+                          SYS.MOD // 03
+                        </span>
+                        <span className="text-sm font-semibold text-zinc-200">
+                          Системный накопитель
+                        </span>
+                      </div>
+                      <div className="p-2 rounded-lg bg-emerald-500/10 border border-emerald-500/25">
                         <HardDrive size={16} className={diskLoadStyles.badgeTextClass} />
                       </div>
                     </div>
-                    <div className="text-2xl 2xl:text-3xl font-bold text-zinc-100 mb-3 truncate tracking-tight">
-                      {metrics.disk_free_gb} GB своб.
-                    </div>
-                  </div>
-                  <div>
-                    <div className="w-full bg-zinc-800/80 h-1.5 rounded-full overflow-hidden">
-                      <div
-                        className={`h-full rounded-full transition-all duration-500 ${diskLoadStyles.barClass}`}
-                        style={{ width: `${diskUsedPercentage}%` }}
-                      ></div>
-                    </div>
-                    <p className="text-xs text-zinc-500 mt-2.5 font-mono">
-                      Всего: {metrics.disk_total_gb} GB ({diskUsedPercentage.toFixed(0)}% исп.)
-                    </p>
-                  </div>
-                </SpotlightCard>
 
-                {/* 4. Сеть (Network) */}
-                <SpotlightCard
-                  variants={cardItemVariants}
-                  spotlightColor="rgba(34, 211, 238, 0.14)"
-                  className="min-w-0 p-5"
-                >
-                  <div>
-                    <div className="flex items-center justify-between text-zinc-400 mb-3 gap-2">
-                      <span className="text-sm font-medium truncate">Сеть (Network)</span>
-                      <div className="p-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/20">
-                        <Wifi size={16} className="text-emerald-400" />
-                      </div>
-                    </div>
-
-                    <div className="space-y-2 my-1">
-                      <div className="flex items-center justify-between text-sm">
-                        <span className="flex items-center gap-1.5 text-zinc-400 font-mono text-xs">
-                          <ArrowDown size={14} className="text-emerald-400" />
-                          Download
+                    <div className="flex items-baseline justify-between gap-2 my-3">
+                      <div className="flex items-baseline gap-2">
+                        <span className="text-3xl sm:text-4xl font-extrabold font-mono tabular-nums text-zinc-100 tracking-tight">
+                          {metrics.disk_free_gb}
                         </span>
-                        <span className="font-bold font-mono text-zinc-100">
-                          {formatNetworkSpeed(metrics.net_rx_kbps)}
+                        <span className="text-xs font-mono font-bold px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                          GB FREE
                         </span>
                       </div>
-
-                      <div className="flex items-center justify-between text-sm">
-                        <span className="flex items-center gap-1.5 text-zinc-400 font-mono text-xs">
-                          <ArrowUp size={14} className="text-cyan-400" />
-                          Upload
-                        </span>
-                        <span className="font-bold font-mono text-zinc-100">
-                          {formatNetworkSpeed(metrics.net_tx_kbps)}
-                        </span>
-                      </div>
+                      <span className="text-xs font-mono text-zinc-400 tabular-nums">
+                        {diskUsedPercentage.toFixed(0)}% ИСП.
+                      </span>
                     </div>
                   </div>
 
-                  <div className="pt-2.5 mt-2 border-t border-white/[0.06] flex items-center justify-between text-xs font-mono">
-                    <span className="text-zinc-500">Статус:</span>
-                    <span
-                      className={`flex items-center gap-1.5 ${
-                        isNetworkActive ? "text-emerald-400" : "text-zinc-400"
-                      }`}
-                    >
-                      <span
-                        className={`h-1.5 w-1.5 rounded-full ${
-                          isNetworkActive
-                            ? "bg-emerald-400 shadow-[0_0_8px_#34d399] animate-pulse"
-                            : "bg-zinc-600"
-                        }`}
-                      ></span>
-                      {isNetworkActive ? "Активен обмен" : "Ожидание"}
-                    </span>
+                  <div className="space-y-2.5">
+                    <SegmentedHudBar
+                      percentage={diskUsedPercentage}
+                      segments={20}
+                      theme="emerald"
+                    />
+                    <div className="flex items-center justify-between text-[11px] text-zinc-500 font-mono pt-1 border-t border-white/[0.05]">
+                      <span>ОБЩИЙ ОБЪЕМ</span>
+                      <span className="text-zinc-300 tabular-nums">
+                        {metrics.disk_total_gb} <span className="text-emerald-400">GB</span>
+                      </span>
+                    </div>
                   </div>
                 </SpotlightCard>
               </motion.div>
 
+              {/* Второй ряд: Полноценная тройная панель сетевой телеметрии (Network HUD) */}
+              <motion.div
+                variants={cardsContainerVariants}
+                initial="hidden"
+                animate="show"
+              >
+                <SpotlightCard
+                  variants={cardItemVariants}
+                  spotlightColor="rgba(34, 211, 238, 0.12)"
+                  accentColor="cyan"
+                  className="p-5 sm:p-6"
+                >
+                  <div className="space-y-4">
+                    {/* Шапка Network HUD со шлюзом и общим статусом подключения */}
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3.5 border-b border-white/[0.06]">
+                      <div className="flex items-center gap-3">
+                        <div className="p-2 rounded-lg bg-cyan-500/10 border border-cyan-500/30 text-cyan-400 shadow-[0_0_15px_rgba(34,211,238,0.18)]">
+                          <Wifi size={18} />
+                        </div>
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <span className="text-[10px] font-mono uppercase tracking-[0.18em] text-cyan-400">
+                              NET.HUD // TRIPLE TELEMETRY
+                            </span>
+                            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-white/[0.05] text-zinc-400">
+                              TCP 1.1.1.1:53
+                            </span>
+                          </div>
+                          <h3 className="text-base font-bold text-zinc-100 tracking-tight">
+                            Сетевой контур и задержка канала (Network HUD)
+                          </h3>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2.5 self-start sm:self-auto font-mono text-xs">
+                        <div className="px-3 py-1.5 rounded-lg bg-[#07090d] border border-white/[0.07] flex items-center gap-2">
+                          <span
+                            className={`h-2 w-2 rounded-full ${
+                              isNetworkActive
+                                ? "bg-emerald-400 shadow-[0_0_8px_#34d399] animate-pulse"
+                                : isGatewayOnline
+                                ? "bg-cyan-400"
+                                : "bg-zinc-600"
+                            }`}
+                          />
+                          <span className="text-zinc-400">КАНАЛ:</span>
+                          <span
+                            className={
+                              isNetworkActive
+                                ? "text-emerald-400 font-bold"
+                                : isGatewayOnline
+                                ? "text-cyan-300 font-semibold"
+                                : "text-zinc-500"
+                            }
+                          >
+                            {isNetworkActive
+                              ? "АКТИВНЫЙ ТРАФИК"
+                              : isGatewayOnline
+                              ? " В СЕТИ (STANDBY)"
+                              : "НЕТ ОТВЕТА"}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Тройная приборная сетка: 1. PING, 2. DOWNLOAD, 3. UPLOAD */}
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      {/* 1. PING (Задержка шлюза в мс) */}
+                      <div className="relative p-4 rounded-xl bg-[#07090e]/90 border border-white/[0.07] flex flex-col justify-between space-y-3 hud-dot-matrix">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="flex items-center gap-1.5 text-xs font-mono uppercase tracking-wider text-zinc-400">
+                            <Radio size={14} className={pingStyle.colorClass} />
+                            1. PING / ЗАДЕРЖКА
+                          </span>
+                          <span
+                            className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded border ${pingStyle.badgeClass}`}
+                          >
+                            {pingStyle.statusLabel}
+                          </span>
+                        </div>
+
+                        <div className="flex items-baseline gap-2">
+                          <span
+                            className={`text-3xl sm:text-4xl font-extrabold font-mono tabular-nums tracking-tight ${pingStyle.colorClass}`}
+                          >
+                            {pingStyle.valueText}
+                          </span>
+                          <span className="text-xs font-mono font-bold px-1.5 py-0.5 rounded bg-white/[0.06] text-zinc-300 border border-white/[0.08]">
+                            MS
+                          </span>
+                        </div>
+
+                        <div className="space-y-1.5">
+                          <div className="w-full h-1.5 bg-zinc-900 rounded-full overflow-hidden border border-white/[0.05]">
+                            <div
+                              style={{ width: `${pingStyle.barPercent}%` }}
+                              className={`h-full rounded-full transition-all duration-500 ${
+                                metrics.net_ping_ms === 0 || metrics.net_ping_ms >= 999
+                                  ? "bg-zinc-700"
+                                  : metrics.net_ping_ms < 40
+                                  ? "bg-gradient-to-r from-emerald-500 to-teal-400 shadow-[0_0_10px_#34d399]"
+                                  : metrics.net_ping_ms <= 90
+                                  ? "bg-gradient-to-r from-amber-500 to-yellow-400 shadow-[0_0_10px_#fbbf24]"
+                                  : "bg-gradient-to-r from-rose-500 to-red-400 shadow-[0_0_10px_#f43f5e]"
+                              }`}
+                            />
+                          </div>
+                          <div className="flex justify-between text-[10px] font-mono text-zinc-500">
+                            <span>&lt;40ms Идеально</span>
+                            <span>40-90ms Средне</span>
+                            <span>&gt;90ms Пик</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* 2. DOWNLOAD (Входящий поток) */}
+                      <div className="relative p-4 rounded-xl bg-[#07090e]/90 border border-white/[0.07] flex flex-col justify-between space-y-3 hud-dot-matrix">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="flex items-center gap-1.5 text-xs font-mono uppercase tracking-wider text-zinc-400">
+                            <span className="p-1 rounded bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.3)]">
+                              <ArrowDown size={13} />
+                            </span>
+                            2. DOWNLOAD / ПРИЕМ
+                          </span>
+                          <span className="text-[10px] font-mono text-emerald-400/90 uppercase">
+                            RX STREAM
+                          </span>
+                        </div>
+
+                        <div className="flex items-baseline gap-2">
+                          <span className="text-3xl sm:text-4xl font-extrabold font-mono tabular-nums text-zinc-100 tracking-tight">
+                            {rxParts.value}
+                          </span>
+                          <span className="text-xs font-mono font-bold px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                            {rxParts.unit}
+                          </span>
+                        </div>
+
+                        <div className="space-y-1.5">
+                          <div className="w-full h-1.5 bg-zinc-900 rounded-full overflow-hidden border border-white/[0.05]">
+                            <div
+                              style={{ width: `${rxPulsePct}%` }}
+                              className="h-full rounded-full bg-gradient-to-r from-emerald-500 via-teal-400 to-emerald-300 shadow-[0_0_12px_rgba(52,211,153,0.65)] transition-all duration-300"
+                            />
+                          </div>
+                          <div className="flex justify-between text-[10px] font-mono text-zinc-500">
+                            <span>Входящий импульс</span>
+                            <span className="text-emerald-400 tabular-nums">
+                              {metrics.net_rx_kbps.toFixed(1)} KB/S
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* 3. UPLOAD (Исходящий поток) */}
+                      <div className="relative p-4 rounded-xl bg-[#07090e]/90 border border-white/[0.07] flex flex-col justify-between space-y-3 hud-dot-matrix">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="flex items-center gap-1.5 text-xs font-mono uppercase tracking-wider text-zinc-400">
+                            <span className="p-1 rounded bg-cyan-500/15 border border-cyan-500/30 text-cyan-400 shadow-[0_0_10px_rgba(34,211,238,0.3)]">
+                              <ArrowUp size={13} />
+                            </span>
+                            3. UPLOAD / ОТДАЧА
+                          </span>
+                          <span className="text-[10px] font-mono text-cyan-400/90 uppercase">
+                            TX STREAM
+                          </span>
+                        </div>
+
+                        <div className="flex items-baseline gap-2">
+                          <span className="text-3xl sm:text-4xl font-extrabold font-mono tabular-nums text-zinc-100 tracking-tight">
+                            {txParts.value}
+                          </span>
+                          <span className="text-xs font-mono font-bold px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
+                            {txParts.unit}
+                          </span>
+                        </div>
+
+                        <div className="space-y-1.5">
+                          <div className="w-full h-1.5 bg-zinc-900 rounded-full overflow-hidden border border-white/[0.05]">
+                            <div
+                              style={{ width: `${txPulsePct}%` }}
+                              className="h-full rounded-full bg-gradient-to-r from-cyan-500 via-sky-400 to-cyan-300 shadow-[0_0_12px_rgba(34,211,238,0.65)] transition-all duration-300"
+                            />
+                          </div>
+                          <div className="flex justify-between text-[10px] font-mono text-zinc-500">
+                            <span>Исходящий импульс</span>
+                            <span className="text-cyan-400 tabular-nums">
+                              {metrics.net_tx_kbps.toFixed(1)} KB/S
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </SpotlightCard>
+              </motion.div>
+
+              {/* Третий ряд: 60-секундный живой неоновый график */}
               <motion.div
                 variants={cardsContainerVariants}
                 initial="hidden"
@@ -2600,8 +2970,8 @@ export default function App() {
                             </div>
                           </div>
 
-                          {/* Индикатор вертушек GPU (RPM и шкала %) */}
-                          <div className="p-3.5 rounded-xl bg-zinc-950/80 border border-white/[0.06] space-y-2">
+                          {/* Индикатор вертушек GPU (RPM и сегментированная шкала %) */}
+                          <div className="p-3.5 rounded-xl bg-[#07090e]/90 border border-white/[0.06] space-y-2.5">
                             <div className="flex items-center justify-between text-xs font-mono">
                               <span className="flex items-center gap-2 text-zinc-300">
                                 <Fan
@@ -2614,25 +2984,27 @@ export default function App() {
                                 />
                                 Охлаждение GPU (Кулеры)
                               </span>
-                              <div className="flex items-center gap-3">
-                                <span className="text-zinc-100 font-bold">
+                              <div className="flex items-center gap-2">
+                                <span className="text-zinc-100 font-bold tabular-nums">
                                   {gpu.fan_rpm != null
-                                    ? `${gpu.fan_rpm.toFixed(0)} RPM`
-                                    : "0 RPM (Zero Fan)"}
+                                    ? gpu.fan_rpm.toFixed(0)
+                                    : "0"}
                                 </span>
-                                <span className="text-cyan-400 font-semibold">
+                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
+                                  RPM
+                                </span>
+                                <span className="text-cyan-400 font-semibold tabular-nums ml-1">
                                   {gpu.fan_percent != null
                                     ? `${gpu.fan_percent.toFixed(0)}%`
                                     : "0%"}
                                 </span>
                               </div>
                             </div>
-                            <div className="w-full h-1.5 bg-zinc-800 rounded-full overflow-hidden">
-                              <div
-                                style={{ width: `${fanPct}%` }}
-                                className="h-full bg-gradient-to-r from-cyan-500 to-emerald-400 rounded-full transition-all duration-500"
-                              />
-                            </div>
+                            <SegmentedHudBar
+                              percentage={fanPct}
+                              segments={24}
+                              theme="cyan"
+                            />
                           </div>
                         </div>
                       </SpotlightCard>

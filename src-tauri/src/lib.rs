@@ -2,9 +2,11 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::{BufRead, BufReader};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use sysinfo::{Disks, Networks, System};
 use tauri::State;
 
@@ -36,6 +38,7 @@ pub struct SystemMetrics {
     pub disk_total_gb: u64,
     pub net_rx_kbps: f32,
     pub net_tx_kbps: f32,
+    pub net_ping_ms: u32,
 }
 
 // Структура записи автозагрузки Windows
@@ -146,6 +149,7 @@ pub struct HardwareTelemetry {
 pub struct AppState {
     pub sys: Mutex<System>,
     pub networks: Mutex<Networks>,
+    pub ping_cache: Mutex<(u32, Option<Instant>)>,
     pub hw_telemetry: Arc<Mutex<Option<HardwareTelemetry>>>,
     pub hw_sidecar_child: Arc<Mutex<Option<Child>>>,
 }
@@ -163,9 +167,13 @@ impl Drop for AppState {
 // Поиск скомпилированного бинарника nexus-hwmon.exe
 fn find_hwmon_sidecar_exe() -> Option<PathBuf> {
     let candidates = [
+        // Корень проекта Nexus/hwmon-sidecar (при запуске из src-tauri или из корня Nexus)
+        PathBuf::from("../hwmon-sidecar/bin/publish/nexus-hwmon.exe"),
         PathBuf::from("hwmon-sidecar/bin/publish/nexus-hwmon.exe"),
-        PathBuf::from("src-tauri/hwmon-sidecar/bin/publish/nexus-hwmon.exe"),
+        PathBuf::from("../hwmon-sidecar/bin/Release/net9.0/win-x64/nexus-hwmon.exe"),
         PathBuf::from("hwmon-sidecar/bin/Release/net9.0/win-x64/nexus-hwmon.exe"),
+        // Фоллбэки на случай размещения внутри src-tauri
+        PathBuf::from("src-tauri/hwmon-sidecar/bin/publish/nexus-hwmon.exe"),
         PathBuf::from("src-tauri/hwmon-sidecar/bin/Release/net9.0/win-x64/nexus-hwmon.exe"),
     ];
 
@@ -181,9 +189,18 @@ fn find_hwmon_sidecar_exe() -> Option<PathBuf> {
             if near_exe.exists() {
                 return Some(near_exe);
             }
-            // При запуске из target/debug поднимаемся к src-tauri/hwmon-sidecar
-            let from_target = exe_dir
-                .join("../../hwmon-sidecar/bin/publish/nexus-hwmon.exe");
+            // При запуске из src-tauri/target/debug поднимаемся на 3 уровня к Nexus/hwmon-sidecar
+            let from_target_root = exe_dir.join("../../../hwmon-sidecar/bin/publish/nexus-hwmon.exe");
+            if from_target_root.exists() {
+                return Some(from_target_root);
+            }
+            let from_target_release =
+                exe_dir.join("../../../hwmon-sidecar/bin/Release/net9.0/win-x64/nexus-hwmon.exe");
+            if from_target_release.exists() {
+                return Some(from_target_release);
+            }
+            // Фоллбэк: 2 уровня вверх (если папка внутри src-tauri)
+            let from_target = exe_dir.join("../../hwmon-sidecar/bin/publish/nexus-hwmon.exe");
             if from_target.exists() {
                 return Some(from_target);
             }
@@ -1024,6 +1041,39 @@ async fn scan_storage(path: String) -> Result<ScanResult, String> {
     .map_err(|e| format!("Ошибка выполнения фонового потока сканирования: {}", e))?
 }
 
+// Замер реального TCP-пинга до DNS-шлюзов (1.1.1.1:53 / 8.8.8.8:53) с кэшированием на 2.5 сек
+fn measure_network_ping_ms(state: &AppState) -> u32 {
+    if let Ok(guard) = state.ping_cache.lock() {
+        if let (cached_ms, Some(last_checked)) = *guard {
+            if last_checked.elapsed() < Duration::from_millis(2500) {
+                return cached_ms;
+            }
+        }
+    }
+
+    let targets = [
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
+    ];
+    let timeout = Duration::from_millis(450);
+
+    let mut measured_ms: u32 = 0;
+    for addr in &targets {
+        let start = Instant::now();
+        if TcpStream::connect_timeout(addr, timeout).is_ok() {
+            let ms = start.elapsed().as_millis() as u32;
+            measured_ms = ms.max(1);
+            break;
+        }
+    }
+
+    if let Ok(mut guard) = state.ping_cache.lock() {
+        *guard = (measured_ms, Some(Instant::now()));
+    }
+
+    measured_ms
+}
+
 #[tauri::command]
 fn get_system_metrics(state: State<'_, AppState>) -> SystemMetrics {
     let mut sys = state.sys.lock().unwrap();
@@ -1043,6 +1093,8 @@ fn get_system_metrics(state: State<'_, AppState>) -> SystemMetrics {
     let swap_used_gb = sys.used_swap() as f32 / 1024.0 / 1024.0 / 1024.0;
     let swap_total_gb = sys.total_swap() as f32 / 1024.0 / 1024.0 / 1024.0;
 
+    drop(sys);
+
     let (net_rx_kbps, net_tx_kbps) = if let Ok(mut networks) = state.networks.lock() {
         networks.refresh(true);
         let mut total_rx_bytes: u64 = 0;
@@ -1060,6 +1112,8 @@ fn get_system_metrics(state: State<'_, AppState>) -> SystemMetrics {
     } else {
         (0.0, 0.0)
     };
+
+    let net_ping_ms = measure_network_ping_ms(&state);
 
     let disks = Disks::new_with_refreshed_list();
     let (disk_free_gb, disk_total_gb) = disks
@@ -1083,6 +1137,7 @@ fn get_system_metrics(state: State<'_, AppState>) -> SystemMetrics {
         disk_total_gb,
         net_rx_kbps,
         net_tx_kbps,
+        net_ping_ms,
     }
 }
 
@@ -1168,6 +1223,7 @@ pub fn run() {
         .manage(AppState {
             sys: Mutex::new(sys),
             networks: Mutex::new(networks),
+            ping_cache: Mutex::new((0, None)),
             hw_telemetry,
             hw_sidecar_child,
         })
