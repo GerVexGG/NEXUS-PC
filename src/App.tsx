@@ -22,6 +22,12 @@ import {
   AlertTriangle,
   RefreshCw,
   AppWindow,
+  PieChart,
+  Folder,
+  FileText,
+  ChevronRight,
+  CornerUpLeft,
+  Loader2,
 } from "lucide-react";
 
 interface Metrics {
@@ -47,6 +53,38 @@ interface StartupItem {
   file_exists: boolean;
 }
 
+interface FileEntry {
+  path: string;
+  name: string;
+  size_bytes: number;
+  extension: string;
+}
+
+interface FolderNode {
+  name: string;
+  path: string;
+  size_bytes: number;
+  children: FolderNode[];
+}
+
+interface ScanResult {
+  target_path: string;
+  total_scanned_bytes: number;
+  total_files_count: number;
+  root_node: FolderNode;
+  top_files: FileEntry[];
+  category_sizes: [string, number][];
+}
+
+interface TreemapRect {
+  node: FolderNode;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  colorIndex: number;
+}
+
 interface HistoryPoint {
   timestamp: string;
   cpu: number;
@@ -62,6 +100,19 @@ interface StoredTimerState {
 const TIMER_STORAGE_KEY = "nexus_power_timer";
 const PRESET_MINUTES = [15, 30, 45, 60];
 const HISTORY_LENGTH = 60;
+
+const TREEMAP_PALETTE = [
+  "from-emerald-500/30 to-teal-600/20 border-emerald-400/35 hover:border-emerald-300/70 text-emerald-200",
+  "from-cyan-500/30 to-sky-600/20 border-cyan-400/35 hover:border-cyan-300/70 text-cyan-200",
+  "from-indigo-500/30 to-blue-600/20 border-indigo-400/35 hover:border-indigo-300/70 text-indigo-200",
+  "from-amber-500/30 to-orange-600/20 border-amber-400/35 hover:border-amber-300/70 text-amber-200",
+  "from-violet-500/30 to-purple-600/20 border-violet-400/35 hover:border-violet-300/70 text-violet-200",
+  "from-teal-500/25 to-emerald-700/20 border-teal-400/30 hover:border-teal-300/70 text-teal-200",
+  "from-sky-500/25 to-cyan-700/20 border-sky-400/30 hover:border-sky-300/70 text-sky-200",
+  "from-rose-500/25 to-pink-700/20 border-rose-400/30 hover:border-rose-300/70 text-rose-200",
+  "from-lime-500/25 to-emerald-700/20 border-lime-400/30 hover:border-lime-300/70 text-lime-200",
+  "from-zinc-700/40 to-zinc-800/40 border-zinc-600/40 hover:border-zinc-400/60 text-zinc-200",
+];
 
 // Варианты каскадной анимации карточек
 const cardsContainerVariants: Variants = {
@@ -126,6 +177,127 @@ function formatNetworkSpeed(kbps: number): string {
     return `${(kbps / 1024).toFixed(2)} МБ/с`;
   }
   return `${kbps.toFixed(1)} КБ/с`;
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 Б";
+  const gb = bytes / (1024 * 1024 * 1024);
+  if (gb >= 1) return `${gb.toFixed(2)} ГБ`;
+  const mb = bytes / (1024 * 1024);
+  if (mb >= 1) return `${mb.toFixed(1)} МБ`;
+  const kb = bytes / 1024;
+  if (kb >= 1) return `${kb.toFixed(0)} КБ`;
+  return `${bytes} Б`;
+}
+
+function getCategoryStyle(category: string): {
+  barClass: string;
+  dotClass: string;
+  textClass: string;
+} {
+  switch (category) {
+    case "Видео":
+      return {
+        barClass: "bg-cyan-400 shadow-[0_0_10px_rgba(34,211,238,0.5)]",
+        dotClass: "bg-cyan-400",
+        textClass: "text-cyan-400",
+      };
+    case "Игры и софт":
+      return {
+        barClass: "bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.5)]",
+        dotClass: "bg-emerald-400",
+        textClass: "text-emerald-400",
+      };
+    case "Архивы и образы":
+      return {
+        barClass: "bg-amber-400 shadow-[0_0_10px_rgba(251,191,36,0.5)]",
+        dotClass: "bg-amber-400",
+        textClass: "text-amber-400",
+      };
+    case "Аудио":
+      return {
+        barClass: "bg-violet-400 shadow-[0_0_10px_rgba(167,139,250,0.5)]",
+        dotClass: "bg-violet-400",
+        textClass: "text-violet-400",
+      };
+    case "Документы":
+      return {
+        barClass: "bg-sky-400 shadow-[0_0_10px_rgba(56,189,248,0.5)]",
+        dotClass: "bg-sky-400",
+        textClass: "text-sky-400",
+      };
+    default:
+      return {
+        barClass: "bg-zinc-500",
+        dotClass: "bg-zinc-500",
+        textClass: "text-zinc-400",
+      };
+  }
+}
+
+// Алгоритм пропорционального разбиения прямоугольника (Binary Split Treemap)
+function computeTreemapRects(nodes: FolderNode[]): TreemapRect[] {
+  const valid = nodes.filter((n) => n.size_bytes > 0);
+  if (valid.length === 0) return [];
+
+  const results: TreemapRect[] = [];
+
+  function subdivide(
+    items: { node: FolderNode; colorIndex: number }[],
+    x: number,
+    y: number,
+    w: number,
+    h: number
+  ) {
+    if (items.length === 0) return;
+    if (items.length === 1) {
+      results.push({
+        node: items[0].node,
+        colorIndex: items[0].colorIndex,
+        x,
+        y,
+        w,
+        h,
+      });
+      return;
+    }
+
+    const total = items.reduce((acc, it) => acc + it.node.size_bytes, 0);
+    if (total <= 0) return;
+
+    let accum = 0;
+    let splitIdx = 0;
+    for (let i = 0; i < items.length - 1; i++) {
+      accum += items[i].node.size_bytes;
+      splitIdx = i + 1;
+      if (accum >= total / 2) break;
+    }
+
+    const leftItems = items.slice(0, splitIdx);
+    const rightItems = items.slice(splitIdx);
+    const leftSum = leftItems.reduce((acc, it) => acc + it.node.size_bytes, 0);
+    const ratio = Math.min(0.88, Math.max(0.12, leftSum / total));
+
+    if (w >= h) {
+      const leftW = w * ratio;
+      subdivide(leftItems, x, y, leftW, h);
+      subdivide(rightItems, x + leftW, y, w - leftW, h);
+    } else {
+      const topH = h * ratio;
+      subdivide(leftItems, x, y, w, topH);
+      subdivide(rightItems, x, y + topH, w, h - topH);
+    }
+  }
+
+  subdivide(
+    valid.map((node, idx) => ({ node, colorIndex: idx % TREEMAP_PALETTE.length })),
+    0,
+    0,
+    100,
+    100
+  );
+
+  return results;
 }
 
 // Динамический цвет прогресс-бара и свечения в зависимости от нагрузки
@@ -473,9 +645,9 @@ const LoadHistoryChart = memo(function LoadHistoryChart({
 });
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<"dashboard" | "startup" | "power">(
-    "dashboard"
-  );
+  const [activeTab, setActiveTab] = useState<
+    "dashboard" | "startup" | "storage" | "power"
+  >("dashboard");
   const [metrics, setMetrics] = useState<Metrics>({
     cpu_usage: 0,
     ram_used_gb: 0,
@@ -495,6 +667,19 @@ export default function App() {
   const [startupSearch, setStartupSearch] = useState<string>("");
   const [startupLoading, setStartupLoading] = useState<boolean>(false);
   const [startupError, setStartupError] = useState<string | null>(null);
+
+  // Состояние модуля Storage Analyzer (Анализатор накопителей)
+  const [availableDrives, setAvailableDrives] = useState<string[]>(["C:\\"]);
+  const [selectedDriveOrPath, setSelectedDriveOrPath] = useState<string>("C:\\");
+  const [isScanning, setIsScanning] = useState<boolean>(false);
+  const [scanElapsedSec, setScanElapsedSec] = useState<number>(0);
+  const [scanResult, setScanResult] = useState<ScanResult | null>(null);
+  const [scanError, setScanError] = useState<string | null>(null);
+  const [treemapStack, setTreemapStack] = useState<FolderNode[]>([]);
+  const [selectedTreemapNode, setSelectedTreemapNode] = useState<FolderNode | null>(
+    null
+  );
+  const [fileSearch, setFileSearch] = useState<string>("");
 
   // Состояние модуля управления питанием
   const [restartMode, setRestartMode] = useState<boolean>(false);
@@ -551,7 +736,7 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  // Загрузка списка автозагрузки при старте и при переходе на вкладку «Автозагрузка»
+  // Загрузка списка автозагрузки при переходе на вкладку «Автозагрузка»
   const fetchStartupItems = async () => {
     setStartupLoading(true);
     setStartupError(null);
@@ -569,8 +754,58 @@ export default function App() {
   useEffect(() => {
     if (activeTab === "startup") {
       fetchStartupItems();
+    } else if (activeTab === "storage") {
+      invoke<string[]>("get_available_drives")
+        .then((drives) => {
+          if (drives && drives.length > 0) {
+            setAvailableDrives(drives);
+            setSelectedDriveOrPath((prev) => (prev ? prev : drives[0]));
+          }
+        })
+        .catch((err) => console.error("Ошибка получения списка дисков:", err));
     }
   }, [activeTab]);
+
+  // Секундомер ожидания во время многопоточного сканирования диска
+  useEffect(() => {
+    if (!isScanning) {
+      setScanElapsedSec(0);
+      return;
+    }
+    const start = Date.now();
+    const timer = setInterval(() => {
+      setScanElapsedSec((Date.now() - start) / 1000);
+    }, 100);
+    return () => clearInterval(timer);
+  }, [isScanning]);
+
+  const handleStartStorageScan = async (targetPathOverride?: string) => {
+    const pathToScan = (targetPathOverride ?? selectedDriveOrPath).trim();
+    if (!pathToScan || isScanning) return;
+
+    setIsScanning(true);
+    setScanError(null);
+    try {
+      const res = await invoke<ScanResult>("scan_storage", { path: pathToScan });
+      setScanResult(res);
+      setTreemapStack([res.root_node]);
+      setSelectedTreemapNode(res.root_node.children[0] ?? res.root_node);
+    } catch (err) {
+      console.error("Ошибка сканирования диска:", err);
+      setScanError(String(err));
+    } finally {
+      setIsScanning(false);
+    }
+  };
+
+  const handleOpenPathInExplorer = async (path: string) => {
+    try {
+      await invoke("open_item_location", { path });
+    } catch (err) {
+      console.error("Ошибка открытия пути в проводнике:", err);
+      setScanError(String(err));
+    }
+  };
 
   const handleToggleStartup = async (item: StartupItem) => {
     const nextEnabled = !item.enabled;
@@ -727,6 +962,26 @@ export default function App() {
     );
   });
 
+  // Данные текущего уровня Treemap и фильтрация ТОП-100 файлов
+  const currentTreemapRoot =
+    treemapStack.length > 0
+      ? treemapStack[treemapStack.length - 1]
+      : scanResult?.root_node ?? null;
+
+  const treemapRects = currentTreemapRoot
+    ? computeTreemapRects(currentTreemapRoot.children)
+    : [];
+
+  const filteredTopFiles = (scanResult?.top_files ?? []).filter((f) => {
+    const q = fileSearch.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      f.name.toLowerCase().includes(q) ||
+      f.extension.toLowerCase().includes(q) ||
+      f.path.toLowerCase().includes(q)
+    );
+  });
+
   return (
     <div className="relative flex h-screen w-screen bg-[#0a0c10] text-zinc-200 select-none overflow-hidden font-sans">
       {/* Фоновое кибер-графитовое ambient-свечение для глубины стекла */}
@@ -800,7 +1055,37 @@ export default function App() {
               )}
             </motion.button>
 
-            {/* 3. Кнопка вкладки Power Manager */}
+            {/* 3. Кнопка вкладки Storage Analyzer */}
+            <motion.button
+              type="button"
+              whileTap={{ scale: 0.97 }}
+              onClick={() => setActiveTab("storage")}
+              className={`relative w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-sm font-medium transition-colors cursor-pointer ${
+                activeTab === "storage"
+                  ? "text-emerald-400"
+                  : "text-zinc-400 hover:text-zinc-200"
+              }`}
+            >
+              {activeTab === "storage" && (
+                <motion.div
+                  layoutId="activeTabPill"
+                  transition={{ type: "spring", stiffness: 380, damping: 30 }}
+                  className="absolute inset-0 rounded-xl bg-gradient-to-r from-emerald-500/15 via-zinc-800/80 to-zinc-800/50 border border-emerald-500/25 shadow-[0_0_20px_rgba(52,211,153,0.12)]"
+                />
+              )}
+              <span className="relative z-10 flex items-center gap-3">
+                <PieChart size={18} />
+                <span>Анализатор дисков</span>
+              </span>
+              {isScanning && (
+                <Loader2
+                  size={14}
+                  className="relative z-10 animate-spin text-emerald-400"
+                />
+              )}
+            </motion.button>
+
+            {/* 4. Кнопка вкладки Power Manager */}
             <motion.button
               type="button"
               whileTap={{ scale: 0.97 }}
@@ -1097,7 +1382,9 @@ export default function App() {
                 >
                   <RefreshCw
                     size={14}
-                    className={startupLoading ? "animate-spin text-emerald-400" : "text-emerald-400"}
+                    className={
+                      startupLoading ? "animate-spin text-emerald-400" : "text-emerald-400"
+                    }
                   />
                   <span>Обновить</span>
                 </motion.button>
@@ -1161,7 +1448,6 @@ export default function App() {
                       className="p-4 sm:p-5"
                     >
                       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                        {/* Левая часть: иконка, имя, бейдж источника, путь */}
                         <div className="flex items-start gap-3.5 min-w-0 flex-1">
                           <div
                             className={`mt-0.5 p-2.5 rounded-xl border shrink-0 ${
@@ -1213,7 +1499,6 @@ export default function App() {
                           </div>
                         </div>
 
-                        {/* Правая часть: показать в проводнике и тумблер Вкл/Выкл */}
                         <div className="flex items-center justify-end gap-3 shrink-0">
                           <motion.button
                             type="button"
@@ -1258,6 +1543,567 @@ export default function App() {
                   ))
                 )}
               </motion.div>
+            </motion.div>
+          )}
+
+          {activeTab === "storage" && (
+            <motion.div
+              key="storage"
+              initial={{ opacity: 0, y: 12 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
+              transition={{ duration: 0.25, ease: "easeOut" }}
+              className="space-y-6 max-w-6xl w-full"
+            >
+              {/* Заголовок */}
+              <div>
+                <h2 className="text-2xl font-bold text-zinc-100 tracking-tight">
+                  Анализатор накопителей (Storage Analyzer)
+                </h2>
+                <p className="text-sm text-zinc-400 mt-1">
+                  Многопоточное сканирование дисков, карта занятого пространства (Treemap) и ТОП-100 тяжелых файлов
+                </p>
+              </div>
+
+              {/* Панель управления сканированием */}
+              <SpotlightCard
+                spotlightColor="rgba(52, 211, 153, 0.12)"
+                className="p-5 sm:p-6"
+              >
+                <div className="space-y-4">
+                  <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+                    {/* Быстрый выбор диска */}
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-xs font-mono uppercase tracking-wider text-zinc-400 mr-1">
+                        Диски:
+                      </span>
+                      {availableDrives.map((drive) => {
+                        const isSelected =
+                          selectedDriveOrPath.toUpperCase() === drive.toUpperCase();
+                        return (
+                          <motion.button
+                            key={drive}
+                            type="button"
+                            whileHover={{ y: -1 }}
+                            whileTap={{ scale: 0.96 }}
+                            onClick={() => setSelectedDriveOrPath(drive)}
+                            className={`inline-flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-mono font-semibold transition-all cursor-pointer border ${
+                              isSelected
+                                ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/40 shadow-[0_0_16px_rgba(52,211,153,0.2)]"
+                                : "bg-zinc-900/80 text-zinc-300 border-white/[0.07] hover:border-white/15"
+                            }`}
+                          >
+                            <HardDrive size={14} className="text-emerald-400" />
+                            <span>{drive}</span>
+                          </motion.button>
+                        );
+                      })}
+                    </div>
+
+                    {/* Ввод произвольной папки и кнопка старта */}
+                    <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 flex-1 lg:max-w-xl">
+                      <input
+                        type="text"
+                        value={selectedDriveOrPath}
+                        onChange={(e) => setSelectedDriveOrPath(e.target.value)}
+                        placeholder="Укажите диск или путь (например C:\ или C:\Users)"
+                        className="flex-1 px-4 py-2.5 rounded-xl bg-zinc-950/85 border border-white/[0.08] text-xs sm:text-sm font-mono text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-emerald-500/50 transition-all"
+                      />
+                      <motion.button
+                        type="button"
+                        whileHover={{ scale: isScanning ? 1 : 1.02 }}
+                        whileTap={{ scale: isScanning ? 1 : 0.97 }}
+                        disabled={isScanning}
+                        onClick={() => handleStartStorageScan()}
+                        className={`inline-flex items-center justify-center gap-2.5 px-5 py-2.5 rounded-xl text-sm font-medium transition-all cursor-pointer border shrink-0 ${
+                          isScanning
+                            ? "bg-emerald-500/10 text-emerald-300/80 border-emerald-500/25 cursor-wait"
+                            : "bg-gradient-to-r from-emerald-500/25 to-teal-500/25 hover:from-emerald-500/35 hover:to-teal-500/35 text-emerald-300 border-emerald-500/40 shadow-[0_0_24px_rgba(52,211,153,0.18)]"
+                        }`}
+                      >
+                        {isScanning ? (
+                          <>
+                            <Loader2 size={16} className="animate-spin text-emerald-400" />
+                            <span>Сканирование...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Play size={16} />
+                            <span>Начать сканирование</span>
+                          </>
+                        )}
+                      </motion.button>
+                    </div>
+                  </div>
+
+                  {/* Пульсирующий индикатор активного сканирования */}
+                  <AnimatePresence>
+                    {isScanning && (
+                      <motion.div
+                        initial={{ opacity: 0, height: 0 }}
+                        animate={{ opacity: 1, height: "auto" }}
+                        exit={{ opacity: 0, height: 0 }}
+                        className="pt-3 border-t border-white/[0.06] flex items-center justify-between text-xs font-mono text-emerald-400"
+                      >
+                        <div className="flex items-center gap-2.5">
+                          <span className="relative flex h-2.5 w-2.5">
+                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                            <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-400" />
+                          </span>
+                          <span>
+                            Многопоточный обход{" "}
+                            <strong className="text-zinc-100">{selectedDriveOrPath}</strong>{" "}
+                            через jwalk...
+                          </span>
+                        </div>
+                        <span className="px-2.5 py-1 rounded-lg bg-zinc-950/80 border border-white/[0.06] text-zinc-300">
+                          Время: {scanElapsedSec.toFixed(1)} сек
+                        </span>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+
+                  {/* Вывод ошибки */}
+                  <AnimatePresence>
+                    {scanError && (
+                      <motion.div
+                        initial={{ opacity: 0, y: -4 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: -4 }}
+                        className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-400 text-xs font-mono"
+                      >
+                        {scanError}
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
+              </SpotlightCard>
+
+              {/* Результаты сканирования */}
+              {scanResult && (
+                <motion.div
+                  variants={cardsContainerVariants}
+                  initial="hidden"
+                  animate="show"
+                  className="space-y-6"
+                >
+                  {/* 1. Сводка и распределение по категориям */}
+                  <SpotlightCard
+                    variants={cardItemVariants}
+                    spotlightColor="rgba(34, 211, 238, 0.12)"
+                    className="p-5 sm:p-6"
+                  >
+                    <div className="space-y-5">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                        <div>
+                          <span className="text-xs font-mono uppercase tracking-wider text-zinc-400">
+                            Сводка сканирования • {scanResult.target_path}
+                          </span>
+                          <div className="flex flex-wrap items-baseline gap-4 mt-1">
+                            <span className="text-2xl sm:text-3xl font-bold text-zinc-100 tracking-tight">
+                              {formatBytes(scanResult.total_scanned_bytes)}
+                            </span>
+                            <span className="text-xs sm:text-sm font-mono text-zinc-400">
+                              Проверено файлов:{" "}
+                              <strong className="text-emerald-400">
+                                {scanResult.total_files_count.toLocaleString("ru-RU")}
+                              </strong>
+                            </span>
+                          </div>
+                        </div>
+
+                        <motion.button
+                          type="button"
+                          whileHover={{ scale: 1.02 }}
+                          whileTap={{ scale: 0.96 }}
+                          onClick={() => handleOpenPathInExplorer(scanResult.target_path)}
+                          className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-zinc-800/80 hover:bg-zinc-700/80 text-xs font-mono text-zinc-200 border border-white/[0.07] cursor-pointer self-start sm:self-auto"
+                        >
+                          <FolderOpen size={14} className="text-emerald-400" />
+                          <span>Открыть корень в Проводнике</span>
+                        </motion.button>
+                      </div>
+
+                      {/* Мультисегментная шкала категорий */}
+                      <div className="space-y-3">
+                        <div className="w-full h-3 rounded-full bg-zinc-950/90 border border-white/[0.06] overflow-hidden flex p-0.5 gap-0.5">
+                          {scanResult.category_sizes.map(([catName, catBytes]) => {
+                            const pct =
+                              scanResult.total_scanned_bytes > 0
+                                ? (catBytes / scanResult.total_scanned_bytes) * 100
+                                : 0;
+                            if (pct < 0.4) return null;
+                            const st = getCategoryStyle(catName);
+                            return (
+                              <div
+                                key={catName}
+                                title={`${catName}: ${formatBytes(catBytes)} (${pct.toFixed(1)}%)`}
+                                style={{ width: `${pct}%` }}
+                                className={`h-full first:rounded-l-full last:rounded-r-full transition-all duration-500 ${st.barClass}`}
+                              />
+                            );
+                          })}
+                        </div>
+
+                        {/* Легенда категорий */}
+                        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 pt-1">
+                          {scanResult.category_sizes.map(([catName, catBytes]) => {
+                            const pct =
+                              scanResult.total_scanned_bytes > 0
+                                ? (catBytes / scanResult.total_scanned_bytes) * 100
+                                : 0;
+                            const st = getCategoryStyle(catName);
+                            return (
+                              <div
+                                key={catName}
+                                className="p-2.5 rounded-xl bg-zinc-950/60 border border-white/[0.05] flex flex-col justify-between"
+                              >
+                                <div className="flex items-center gap-2 text-xs text-zinc-400 truncate">
+                                  <span
+                                    className={`h-2 w-2 rounded-full shrink-0 ${st.dotClass}`}
+                                  />
+                                  <span className="truncate">{catName}</span>
+                                </div>
+                                <div className="mt-1.5 flex items-baseline justify-between gap-1 font-mono">
+                                  <span className="text-xs font-bold text-zinc-100">
+                                    {formatBytes(catBytes)}
+                                  </span>
+                                  <span className={`text-[10px] ${st.textClass}`}>
+                                    {pct.toFixed(1)}%
+                                  </span>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </div>
+                  </SpotlightCard>
+
+                  {/* 2. Интерактивный Treemap (Плиточная карта папок) */}
+                  <SpotlightCard
+                    variants={cardItemVariants}
+                    spotlightColor="rgba(52, 211, 153, 0.1)"
+                    className="p-5 sm:p-6"
+                  >
+                    <div className="space-y-4">
+                      {/* Шапка Treemap и хлебные крошки уровней */}
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                        <div>
+                          <h3 className="text-base font-semibold text-zinc-100">
+                            Карта распределения папок (Treemap)
+                          </h3>
+                          <div className="flex flex-wrap items-center gap-1.5 text-xs font-mono text-zinc-400 mt-1">
+                            {treemapStack.map((node, idx) => (
+                              <span key={node.path + idx} className="flex items-center gap-1">
+                                {idx > 0 && <ChevronRight size={12} className="text-zinc-600" />}
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const nextStack = treemapStack.slice(0, idx + 1);
+                                    setTreemapStack(nextStack);
+                                    setSelectedTreemapNode(node);
+                                  }}
+                                  className={`hover:text-emerald-400 transition-colors cursor-pointer ${
+                                    idx === treemapStack.length - 1
+                                      ? "text-emerald-400 font-semibold"
+                                      : "text-zinc-400"
+                                  }`}
+                                >
+                                  {node.name || node.path}
+                                </button>
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+
+                        {treemapStack.length > 1 && (
+                          <motion.button
+                            type="button"
+                            whileTap={{ scale: 0.96 }}
+                            onClick={() => {
+                              const nextStack = treemapStack.slice(0, -1);
+                              setTreemapStack(nextStack);
+                              setSelectedTreemapNode(nextStack[nextStack.length - 1]);
+                            }}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-zinc-800/80 hover:bg-zinc-700/80 text-xs font-mono text-zinc-200 border border-white/[0.08] cursor-pointer self-start sm:self-auto"
+                          >
+                            <CornerUpLeft size={13} className="text-emerald-400" />
+                            <span>На уровень выше</span>
+                          </motion.button>
+                        )}
+                      </div>
+
+                      {/* Мозаика Treemap */}
+                      <div className="relative w-full h-80 rounded-2xl bg-[#080a0e] border border-white/[0.07] overflow-hidden p-1.5">
+                        {treemapRects.length === 0 ? (
+                          <div className="w-full h-full flex items-center justify-center text-xs font-mono text-zinc-500">
+                            Нет вложенных подпапок для построения карты
+                          </div>
+                        ) : (
+                          <div className="relative w-full h-full">
+                            {treemapRects.map((rect) => {
+                              const isSelected =
+                                selectedTreemapNode?.path === rect.node.path;
+                              const pctOfDisk =
+                                scanResult.total_scanned_bytes > 0
+                                  ? (rect.node.size_bytes /
+                                      scanResult.total_scanned_bytes) *
+                                    100
+                                  : 0;
+                              const paletteClass =
+                                TREEMAP_PALETTE[rect.colorIndex] ?? TREEMAP_PALETTE[0];
+
+                              return (
+                                <div
+                                  key={rect.node.path}
+                                  style={{
+                                    left: `${rect.x}%`,
+                                    top: `${rect.y}%`,
+                                    width: `${rect.w}%`,
+                                    height: `${rect.h}%`,
+                                  }}
+                                  className="absolute p-1 transition-all duration-300"
+                                >
+                                  <button
+                                    type="button"
+                                    onClick={() => setSelectedTreemapNode(rect.node)}
+                                    onDoubleClick={() => {
+                                      if (rect.node.children.length > 0) {
+                                        setTreemapStack((prev) => [...prev, rect.node]);
+                                        setSelectedTreemapNode(
+                                          rect.node.children[0] ?? rect.node
+                                        );
+                                      }
+                                    }}
+                                    title={`${rect.node.name} — ${formatBytes(
+                                      rect.node.size_bytes
+                                    )} (${pctOfDisk.toFixed(1)}%)`}
+                                    className={`w-full h-full rounded-xl bg-gradient-to-br border p-2.5 flex flex-col justify-between text-left overflow-hidden transition-all cursor-pointer ${paletteClass} ${
+                                      isSelected
+                                        ? "ring-2 ring-emerald-400 shadow-[0_0_20px_rgba(52,211,153,0.3)]"
+                                        : ""
+                                    }`}
+                                  >
+                                    <div className="flex items-center justify-between gap-1 min-w-0">
+                                      <span className="font-semibold text-xs truncate">
+                                        {rect.node.name}
+                                      </span>
+                                      {rect.node.children.length > 0 &&
+                                        rect.w > 14 &&
+                                        rect.h > 18 && (
+                                          <Folder
+                                            size={12}
+                                            className="shrink-0 opacity-75"
+                                          />
+                                        )}
+                                    </div>
+
+                                    {rect.w > 10 && rect.h > 16 && (
+                                      <div className="font-mono text-[11px] leading-tight truncate opacity-90">
+                                        <div className="font-bold">
+                                          {formatBytes(rect.node.size_bytes)}
+                                        </div>
+                                        {rect.h > 26 && (
+                                          <div className="text-[10px] opacity-75">
+                                            {pctOfDisk.toFixed(1)}% от диска
+                                          </div>
+                                        )}
+                                      </div>
+                                    )}
+                                  </button>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Инспектор выбранного блока Treemap */}
+                      {selectedTreemapNode && (
+                        <div className="p-4 rounded-xl bg-zinc-950/85 border border-white/[0.08] flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                          <div className="min-w-0 space-y-1">
+                            <div className="flex flex-wrap items-center gap-2.5">
+                              <Folder size={16} className="text-emerald-400 shrink-0" />
+                              <span className="font-bold text-sm text-zinc-100 truncate">
+                                {selectedTreemapNode.name}
+                              </span>
+                              <span className="text-xs font-mono px-2 py-0.5 rounded-md bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                                {formatBytes(selectedTreemapNode.size_bytes)}
+                              </span>
+                              <span className="text-xs font-mono text-zinc-400">
+                                (
+                                {scanResult.total_scanned_bytes > 0
+                                  ? (
+                                      (selectedTreemapNode.size_bytes /
+                                        scanResult.total_scanned_bytes) *
+                                      100
+                                    ).toFixed(1)
+                                  : "0.0"}
+                                % от просканированного объёма)
+                              </span>
+                            </div>
+                            <p className="text-xs font-mono text-zinc-500 truncate">
+                              {selectedTreemapNode.path}
+                            </p>
+                          </div>
+
+                          <div className="flex items-center gap-2.5 shrink-0">
+                            {selectedTreemapNode.children.length > 0 && (
+                              <motion.button
+                                type="button"
+                                whileTap={{ scale: 0.96 }}
+                                onClick={() => {
+                                  setTreemapStack((prev) => [
+                                    ...prev,
+                                    selectedTreemapNode,
+                                  ]);
+                                  setSelectedTreemapNode(
+                                    selectedTreemapNode.children[0] ??
+                                      selectedTreemapNode
+                                  );
+                                }}
+                                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 text-xs font-mono cursor-pointer"
+                              >
+                                <span>Войти в папку</span>
+                                <ChevronRight size={14} />
+                              </motion.button>
+                            )}
+
+                            <motion.button
+                              type="button"
+                              whileTap={{ scale: 0.96 }}
+                              onClick={() =>
+                                handleOpenPathInExplorer(selectedTreemapNode.path)
+                              }
+                              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-200 border border-white/[0.08] text-xs font-mono cursor-pointer"
+                            >
+                              <FolderOpen size={14} className="text-emerald-400" />
+                              <span>Открыть в проводнике</span>
+                            </motion.button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </SpotlightCard>
+
+                  {/* 3. Таблица ТОП-100 самых тяжелых файлов */}
+                  <SpotlightCard
+                    variants={cardItemVariants}
+                    spotlightColor="rgba(34, 211, 238, 0.1)"
+                    className="p-5 sm:p-6"
+                  >
+                    <div className="space-y-4">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                        <div>
+                          <h3 className="text-base font-semibold text-zinc-100">
+                            ТОП-100 самых тяжелых файлов
+                          </h3>
+                          <p className="text-xs font-mono text-zinc-500 mt-0.5">
+                            Отсортировано по убыванию размера • Найдено:{" "}
+                            {filteredTopFiles.length}
+                          </p>
+                        </div>
+
+                        <div className="relative w-full sm:w-80">
+                          <Search
+                            size={15}
+                            className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-zinc-500"
+                          />
+                          <input
+                            type="text"
+                            value={fileSearch}
+                            onChange={(e) => setFileSearch(e.target.value)}
+                            placeholder="Фильтр по имени или расширению..."
+                            className="w-full pl-9 pr-3.5 py-2 rounded-xl bg-zinc-950/80 border border-white/[0.07] text-xs font-mono text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-emerald-500/40"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="max-h-96 overflow-y-auto rounded-xl border border-white/[0.06] bg-zinc-950/50 divide-y divide-white/[0.04]">
+                        {filteredTopFiles.length === 0 ? (
+                          <div className="p-8 text-center text-xs font-mono text-zinc-500">
+                            Файлы по заданному фильтру не найдены
+                          </div>
+                        ) : (
+                          filteredTopFiles.map((file, idx) => {
+                            const maxFileBytes =
+                              scanResult.top_files[0]?.size_bytes || 1;
+                            const relWidth = Math.min(
+                              100,
+                              Math.max(2, (file.size_bytes / maxFileBytes) * 100)
+                            );
+
+                            return (
+                              <div
+                                key={file.path + idx}
+                                className="px-4 py-3 hover:bg-white/[0.03] transition-colors flex items-center justify-between gap-4"
+                              >
+                                <div className="flex items-center gap-3 min-w-0 flex-1">
+                                  <span className="w-7 text-xs font-mono text-zinc-500 shrink-0">
+                                    #{idx + 1}
+                                  </span>
+                                  <FileText
+                                    size={16}
+                                    className="text-cyan-400 shrink-0"
+                                  />
+                                  <div className="min-w-0 flex-1">
+                                    <div className="flex items-center gap-2">
+                                      <span className="text-sm font-medium text-zinc-100 truncate">
+                                        {file.name}
+                                      </span>
+                                      {file.extension && (
+                                        <span className="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-300 border border-white/[0.06] shrink-0">
+                                          .{file.extension}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <p
+                                      title={file.path}
+                                      className="text-[11px] font-mono text-zinc-500 truncate mt-0.5"
+                                    >
+                                      {file.path}
+                                    </p>
+                                  </div>
+                                </div>
+
+                                <div className="flex items-center gap-4 shrink-0">
+                                  <div className="w-28 hidden md:block">
+                                    <div className="text-right text-xs font-mono font-bold text-emerald-400 mb-1">
+                                      {formatBytes(file.size_bytes)}
+                                    </div>
+                                    <div className="w-full h-1 bg-zinc-800 rounded-full overflow-hidden">
+                                      <div
+                                        style={{ width: `${relWidth}%` }}
+                                        className="h-full bg-gradient-to-r from-emerald-400 to-cyan-400 rounded-full"
+                                      />
+                                    </div>
+                                  </div>
+
+                                  <span className="md:hidden text-xs font-mono font-bold text-emerald-400">
+                                    {formatBytes(file.size_bytes)}
+                                  </span>
+
+                                  <motion.button
+                                    type="button"
+                                    whileHover={{ scale: 1.06 }}
+                                    whileTap={{ scale: 0.94 }}
+                                    onClick={() => handleOpenPathInExplorer(file.path)}
+                                    title="Показать файл в проводнике"
+                                    className="p-2 rounded-xl bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300 hover:text-emerald-400 border border-white/[0.06] transition-colors cursor-pointer"
+                                  >
+                                    <FolderOpen size={15} />
+                                  </motion.button>
+                                </div>
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+                    </div>
+                  </SpotlightCard>
+                </motion.div>
+              )}
             </motion.div>
           )}
 

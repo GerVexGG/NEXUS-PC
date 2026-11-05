@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -46,6 +47,33 @@ pub struct StartupItem {
     pub location: String,   // "HKCU (Реестр)", "HKLM (Система)", "Папка Автозагрузка"
     pub enabled: bool,      // активна ли запись
     pub file_exists: bool,  // существует ли физический файл на диске
+}
+
+// Структуры модуля Storage Analyzer (Анализатор накопителей)
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct FileEntry {
+    pub path: String,
+    pub name: String,
+    pub size_bytes: u64,
+    pub extension: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct FolderNode {
+    pub name: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub children: Vec<FolderNode>, // топ-10 крупнейших вложенных папок для Treemap
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ScanResult {
+    pub target_path: String,
+    pub total_scanned_bytes: u64,
+    pub total_files_count: u64,
+    pub root_node: FolderNode,
+    pub top_files: Vec<FileEntry>,          // ТОП-100 самых больших файлов
+    pub category_sizes: Vec<(String, u64)>, // ("Видео", 12345678), ("Игры и софт", ...)
 }
 
 // Хранилище состояния sysinfo в памяти, чтобы не пересоздавать его каждую секунду
@@ -374,7 +402,6 @@ fn toggle_startup_item(id: String, enable: bool) -> Result<(), String> {
         let backup_subkey_path = format!(r"{}\{}", NEXUS_DISABLED_REG_BASE, source_tag);
 
         if !enable {
-            // Переносим из боевой ветки Run в HKCU\Software\Nexus\DisabledStartup\<source>
             let active_key = active_hive
                 .open_subkey_with_flags(active_subkey, KEY_READ | KEY_SET_VALUE)
                 .map_err(|e| {
@@ -404,7 +431,6 @@ fn toggle_startup_item(id: String, enable: bool) -> Result<(), String> {
                 ));
             }
         } else {
-            // Возвращаем запись из HKCU\Software\Nexus\DisabledStartup\<source> обратно в Run
             let backup_key = hkcu
                 .open_subkey_with_flags(&backup_subkey_path, KEY_READ | KEY_SET_VALUE)
                 .or_else(|_| {
@@ -449,7 +475,11 @@ fn open_item_location(path: String) -> Result<(), String> {
     let mut cmd = Command::new("explorer.exe");
 
     if target_path.exists() {
-        cmd.arg(format!("/select,{}", trimmed));
+        if target_path.is_dir() {
+            cmd.arg(trimmed);
+        } else {
+            cmd.arg(format!("/select,{}", trimmed));
+        }
     } else if let Some(parent) = target_path.parent() {
         if parent.exists() {
             cmd.arg(parent.as_os_str());
@@ -464,6 +494,296 @@ fn open_item_location(path: String) -> Result<(), String> {
         .map_err(|e| format!("Не удалось открыть Проводник Windows: {}", e))?;
 
     Ok(())
+}
+
+// Возвращает список доступных дисков системы (C:\, D:\ и т.д.)
+#[tauri::command]
+fn get_available_drives() -> Vec<String> {
+    let disks = Disks::new_with_refreshed_list();
+    let mut drives: Vec<String> = Vec::new();
+
+    for disk in disks.iter() {
+        let mount = disk.mount_point().to_string_lossy().to_string();
+        if !mount.is_empty() && !drives.contains(&mount) {
+            drives.push(mount);
+        }
+    }
+
+    drives.sort();
+    if drives.is_empty() {
+        drives.push(r"C:\".to_string());
+    }
+    drives
+}
+
+fn classify_extension(ext: &str) -> &'static str {
+    match ext {
+        "mp4" | "mkv" | "avi" | "mov" | "wmv" | "webm" | "m4v" | "flv" => "Видео",
+        "zip" | "rar" | "7z" | "tar" | "gz" | "iso" | "vhd" | "vhdx" | "xz" | "bz2" => {
+            "Архивы и образы"
+        }
+        "exe" | "dll" | "msi" | "pak" | "bin" | "cab" | "sys" | "vpk" | "uasset" | "upk" => {
+            "Игры и софт"
+        }
+        "mp3" | "flac" | "wav" | "ogg" | "m4a" | "aac" | "wma" => "Аудио",
+        "pdf" | "docx" | "doc" | "xlsx" | "xls" | "pptx" | "ppt" | "txt" | "md" | "rtf"
+        | "csv" => "Документы",
+        _ => "Прочее",
+    }
+}
+
+// Многопоточное сканирование выбранного диска или папки через jwalk
+#[tauri::command]
+async fn scan_storage(path: String) -> Result<ScanResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut normalized = path.trim().to_string();
+        if normalized.len() == 2 && normalized.ends_with(':') {
+            normalized.push('\\');
+        }
+
+        let root_path = PathBuf::from(&normalized);
+        if !root_path.exists() {
+            return Err(format!("Указанный путь не существует: {}", normalized));
+        }
+
+        let mut total_scanned_bytes: u64 = 0;
+        let mut total_files_count: u64 = 0;
+
+        // Мин-куча для хранения ТОП-100 самых тяжелых файлов: Reverse((size_bytes, path, name, ext))
+        let mut top_heap: BinaryHeap<Reverse<(u64, String, String, String)>> =
+            BinaryHeap::with_capacity(101);
+
+        // Категории файлов
+        let mut cat_video: u64 = 0;
+        let mut cat_games_soft: u64 = 0;
+        let mut cat_archives: u64 = 0;
+        let mut cat_audio: u64 = 0;
+        let mut cat_docs: u64 = 0;
+        let mut cat_other: u64 = 0;
+
+        // Размеры папок до 3 уровней глубины относительно root_path
+        let mut level1_sizes: HashMap<String, u64> = HashMap::new();
+        let mut level2_sizes: HashMap<(String, String), u64> = HashMap::new();
+        let mut level3_sizes: HashMap<(String, String, String), u64> = HashMap::new();
+        let mut root_direct_files_bytes: u64 = 0;
+
+        let walker = jwalk::WalkDir::new(&root_path)
+            .skip_hidden(false)
+            .process_read_dir(|_depth, _path, _state, children| {
+                // Игнорируем защищенные системные каталоги тома
+                children.retain(|dir_entry_res| {
+                    if let Ok(dir_entry) = dir_entry_res {
+                        let name = dir_entry.file_name.to_string_lossy();
+                        !name.eq_ignore_ascii_case("System Volume Information")
+                            && !name.eq_ignore_ascii_case("$Recycle.Bin")
+                    } else {
+                        false
+                    }
+                });
+            });
+
+        for entry_res in walker {
+            let Ok(entry) = entry_res else {
+                continue;
+            };
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+
+            let size = meta.len();
+            total_scanned_bytes = total_scanned_bytes.saturating_add(size);
+            total_files_count = total_files_count.saturating_add(1);
+
+            let entry_path = entry.path();
+            let ext = entry_path
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+
+            match classify_extension(&ext) {
+                "Видео" => cat_video = cat_video.saturating_add(size),
+                "Игры и софт" => cat_games_soft = cat_games_soft.saturating_add(size),
+                "Архивы и образы" => cat_archives = cat_archives.saturating_add(size),
+                "Аудио" => cat_audio = cat_audio.saturating_add(size),
+                "Документы" => cat_docs = cat_docs.saturating_add(size),
+                _ => cat_other = cat_other.saturating_add(size),
+            }
+
+            // Пополнение ТОП-100 крупнейших файлов
+            let qualifies = top_heap.len() < 100
+                || top_heap
+                    .peek()
+                    .map(| smallest| size > smallest.0 .0)
+                    .unwrap_or(true);
+
+            if qualifies && size > 0 {
+                let file_name = entry
+                    .file_name()
+                    .to_string_lossy()
+                    .to_string();
+                let full_path_str = entry_path.to_string_lossy().to_string();
+                top_heap.push(Reverse((size, full_path_str, file_name, ext)));
+                if top_heap.len() > 100 {
+                    top_heap.pop();
+                }
+            }
+
+            // Учет иерархии папок (до 3 уровней глубины для Treemap)
+            if let Ok(rel) = entry_path.strip_prefix(&root_path) {
+                let mut comps = rel.components().filter_map(|c| match c {
+                    std::path::Component::Normal(os) => Some(os.to_string_lossy().to_string()),
+                    _ => None,
+                });
+
+                let first = comps.next();
+                let second = comps.next();
+                let third = comps.next();
+                let fourth = comps.next();
+
+                match (first, second, third, fourth) {
+                    (Some(_file_in_root), None, _, _) => {
+                        // Файл лежит прямо в корне сканируемой папки/диска
+                        root_direct_files_bytes = root_direct_files_bytes.saturating_add(size);
+                    }
+                    (Some(c1), Some(_c2_or_file), None, _) => {
+                        // Файл лежит на глубине 1 папки (root/c1/file)
+                        *level1_sizes.entry(c1).or_insert(0) += size;
+                    }
+                    (Some(c1), Some(c2), Some(_c3_or_file), None) => {
+                        // Файл лежит на глубине 2 папок (root/c1/c2/file)
+                        *level1_sizes.entry(c1.clone()).or_insert(0) += size;
+                        *level2_sizes.entry((c1, c2)).or_insert(0) += size;
+                    }
+                    (Some(c1), Some(c2), Some(c3), Some(_)) => {
+                        // Файл лежит на глубине >= 3 папок (root/c1/c2/c3/...)
+                        *level1_sizes.entry(c1.clone()).or_insert(0) += size;
+                        *level2_sizes.entry((c1.clone(), c2.clone())).or_insert(0) += size;
+                        *level3_sizes.entry((c1, c2, c3)).or_insert(0) += size;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Формируем отсортированный по убыванию список ТОП-100 файлов
+        let mut top_files: Vec<FileEntry> = top_heap
+            .into_iter()
+            .map(|Reverse((size_bytes, path, name, extension))| FileEntry {
+                path,
+                name,
+                size_bytes,
+                extension,
+            })
+            .collect();
+        top_files.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+
+        // Собираем дерево папок (топ-10 на каждом уровне) для Treemap
+        let mut l1_vec: Vec<(String, u64)> = level1_sizes.into_iter().collect();
+        l1_vec.sort_by(|a, b| b.1.cmp(&a.1));
+        l1_vec.truncate(10);
+
+        let mut root_children: Vec<FolderNode> = l1_vec
+            .into_iter()
+            .map(|(c1_name, c1_size)| {
+                let c1_path = root_path.join(&c1_name);
+
+                // Находим топ-10 подпапок 2-го уровня внутри c1
+                let mut l2_vec: Vec<(String, u64)> = level2_sizes
+                    .iter()
+                    .filter(|((parent_c1, _), _)| parent_c1 == &c1_name)
+                    .map(|((_, c2_name), &sz)| (c2_name.clone(), sz))
+                    .collect();
+                l2_vec.sort_by(|a, b| b.1.cmp(&a.1));
+                l2_vec.truncate(10);
+
+                let l2_children: Vec<FolderNode> = l2_vec
+                    .into_iter()
+                    .map(|(c2_name, c2_size)| {
+                        let c2_path = c1_path.join(&c2_name);
+
+                        // Находим топ-10 подпапок 3-го уровня внутри (c1, c2)
+                        let mut l3_vec: Vec<(String, u64)> = level3_sizes
+                            .iter()
+                            .filter(|((p1, p2, _), _)| p1 == &c1_name && p2 == &c2_name)
+                            .map(|((_, _, c3_name), &sz)| (c3_name.clone(), sz))
+                            .collect();
+                        l3_vec.sort_by(|a, b| b.1.cmp(&a.1));
+                        l3_vec.truncate(10);
+
+                        let l3_children: Vec<FolderNode> = l3_vec
+                            .into_iter()
+                            .map(|(c3_name, c3_size)| FolderNode {
+                                path: c2_path.join(&c3_name).to_string_lossy().to_string(),
+                                name: c3_name,
+                                size_bytes: c3_size,
+                                children: Vec::new(),
+                            })
+                            .collect();
+
+                        FolderNode {
+                            name: c2_name,
+                            path: c2_path.to_string_lossy().to_string(),
+                            size_bytes: c2_size,
+                            children: l3_children,
+                        }
+                    })
+                    .collect();
+
+                FolderNode {
+                    name: c1_name,
+                    path: c1_path.to_string_lossy().to_string(),
+                    size_bytes: c1_size,
+                    children: l2_children,
+                }
+            })
+            .collect();
+
+        if root_direct_files_bytes > 0 {
+            root_children.push(FolderNode {
+                name: "[Файлы в корне]".to_string(),
+                path: normalized.clone(),
+                size_bytes: root_direct_files_bytes,
+                children: Vec::new(),
+            });
+            root_children.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+            root_children.truncate(10);
+        }
+
+        let root_name = root_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| normalized.clone());
+
+        let root_node = FolderNode {
+            name: root_name,
+            path: normalized.clone(),
+            size_bytes: total_scanned_bytes,
+            children: root_children,
+        };
+
+        let category_sizes = vec![
+            ("Игры и софт".to_string(), cat_games_soft),
+            ("Видео".to_string(), cat_video),
+            ("Архивы и образы".to_string(), cat_archives),
+            ("Аудио".to_string(), cat_audio),
+            ("Документы".to_string(), cat_docs),
+            ("Прочее".to_string(), cat_other),
+        ];
+
+        Ok(ScanResult {
+            target_path: normalized,
+            total_scanned_bytes,
+            total_files_count,
+            root_node,
+            top_files,
+            category_sizes,
+        })
+    })
+    .await
+    .map_err(|e| format!("Ошибка выполнения фонового потока сканирования: {}", e))?
 }
 
 #[tauri::command]
@@ -616,7 +936,9 @@ pub fn run() {
             cancel_shutdown,
             get_startup_items,
             toggle_startup_item,
-            open_item_location
+            open_item_location,
+            get_available_drives,
+            scan_storage
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
