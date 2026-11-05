@@ -12,9 +12,12 @@
   "app": {
     "windows": [
       {
-        "title": "nexus",
-        "width": 800,
-        "height": 600
+        "title": "NEXUS PC",
+        "width": 1240,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 620,
+        "decorations": false
       }
     ],
     "security": {

@@ -145,6 +145,35 @@ pub struct HardwareTelemetry {
     pub storage_temps: Vec<StorageTempItem>,
 }
 
+// Структуры модуля Cleanup Center (Безопасная очистка накопителя)
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CleanupCategory {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub paths_hint: String,
+    pub size_bytes: u64,
+    pub files_count: u64,
+    pub requires_admin: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CleanupCategoryReport {
+    pub id: String,
+    pub name: String,
+    pub deleted_files: u64,
+    pub skipped_files: u64,
+    pub freed_bytes: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CleanupReport {
+    pub deleted_files_count: u64,
+    pub skipped_files_count: u64,
+    pub freed_bytes: u64,
+    pub categories: Vec<CleanupCategoryReport>,
+}
+
 // Хранилище состояния приложения
 pub struct AppState {
     pub sys: Mutex<System>,
@@ -1205,6 +1234,388 @@ fn cancel_shutdown() -> Result<(), String> {
     }
 }
 
+// Проверка запуска с правами Администратора (чтение защищённого куста реестра S-1-5-19)
+fn check_is_elevated_admin() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        RegKey::predef(HKEY_USERS).open_subkey("S-1-5-19").is_ok()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+#[tauri::command]
+fn is_elevated_admin() -> bool {
+    check_is_elevated_admin()
+}
+
+#[tauri::command]
+fn restart_as_admin(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let exe_path = std::env::current_exe()
+        .map_err(|e| format!("Не удалось определить путь к исполняемому файлу: {}", e))?;
+    let escaped = exe_path.to_string_lossy().replace('\'', "''");
+
+    let mut cmd = Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-WindowStyle",
+        "Hidden",
+        "-Command",
+        &format!("Start-Process -FilePath '{}' -Verb RunAs", escaped),
+    ]);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let status = cmd
+        .status()
+        .map_err(|e| format!("Ошибка вызова UAC PowerShell: {}", e))?;
+
+    if !status.success() {
+        return Err("Запрос на повышение привилегий (UAC) был отклонён".to_string());
+    }
+
+    // Останавливаем фоновый sidecar перед выходом текущего процесса
+    if let Ok(mut guard) = state.hw_sidecar_child.lock() {
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill();
+        }
+    }
+
+    app.exit(0);
+    Ok(())
+}
+
+#[tauri::command]
+fn app_exit(app: tauri::AppHandle, state: State<'_, AppState>) {
+    if let Ok(mut guard) = state.hw_sidecar_child.lock() {
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill();
+        }
+    }
+    app.exit(0);
+}
+
+// Описание цели очистки для модуля Cleanup Center
+struct CleanupTargetSpec {
+    id: &'static str,
+    name: &'static str,
+    description: &'static str,
+    paths_hint: &'static str,
+    requires_admin: bool,
+    dirs: Vec<PathBuf>,
+}
+
+fn build_cleanup_specs() -> Vec<CleanupTargetSpec> {
+    let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    let sys_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+
+    // 1. Временные файлы пользователя (%TEMP%)
+    let user_temp_dir = std::env::temp_dir();
+
+    // 2. Системный Temp (C:\Windows\Temp)
+    let sys_temp_dir = PathBuf::from(&sys_root).join("Temp");
+
+    // 3. Кэш миниатюр Проводника (thumbcache_*.db)
+    let explorer_dir = if !local_app_data.is_empty() {
+        vec![PathBuf::from(&local_app_data).join(r"Microsoft\Windows\Explorer")]
+    } else {
+        Vec::new()
+    };
+
+    // 4. Кэш шейдеров DirectX и видеокарт (DirectX / NVIDIA / AMD)
+    let mut shader_dirs = Vec::new();
+    if !local_app_data.is_empty() {
+        let base = PathBuf::from(&local_app_data);
+        shader_dirs.push(base.join("D3DSCache"));
+        shader_dirs.push(base.join(r"NVIDIA\DXCache"));
+        shader_dirs.push(base.join(r"NVIDIA\GLCache"));
+        shader_dirs.push(base.join(r"AMD\DxCache"));
+        shader_dirs.push(base.join(r"AMD\DxcCache"));
+        shader_dirs.push(base.join(r"AMD\GLCache"));
+    }
+
+    // 5. Корзина Windows ($Recycle.Bin на всех локальных дисках)
+    let disks = Disks::new_with_refreshed_list();
+    let mut recycle_dirs = Vec::new();
+    let mut seen_mounts = HashSet::new();
+    for d in disks.iter() {
+        let mount = d.mount_point().to_path_buf();
+        if seen_mounts.insert(mount.clone()) {
+            recycle_dirs.push(mount.join("$Recycle.Bin"));
+        }
+    }
+    if recycle_dirs.is_empty() {
+        recycle_dirs.push(PathBuf::from(r"C:\$Recycle.Bin"));
+    }
+
+    // 6. Системные дампы памяти и крэш-логи (CrashDumps, Minidump, WER)
+    let mut dump_dirs = Vec::new();
+    if !local_app_data.is_empty() {
+        let base = PathBuf::from(&local_app_data);
+        dump_dirs.push(base.join("CrashDumps"));
+        dump_dirs.push(base.join(r"Microsoft\Windows\WER\ReportArchive"));
+        dump_dirs.push(base.join(r"Microsoft\Windows\WER\ReportQueue"));
+    }
+    dump_dirs.push(PathBuf::from(&sys_root).join("Minidump"));
+    dump_dirs.push(PathBuf::from(&sys_root).join("LiveKernelReports"));
+
+    vec![
+        CleanupTargetSpec {
+            id: "user_temp",
+            name: "Временные файлы пользователя (%TEMP%)",
+            description: "Временные кэши запущенных приложений, инсталляторов и распакованных пакетов текущего профиля",
+            paths_hint: "%LOCALAPPDATA%\\Temp",
+            requires_admin: false,
+            dirs: vec![user_temp_dir],
+        },
+        CleanupTargetSpec {
+            id: "system_temp",
+            name: "Системный Temp (Windows\\Temp)",
+            description: "Временные файлы системных служб Windows и фоновых установщиков ОС",
+            paths_hint: "C:\\Windows\\Temp",
+            requires_admin: true,
+            dirs: vec![sys_temp_dir],
+        },
+        CleanupTargetSpec {
+            id: "thumbnails",
+            name: "Кэш миниатюр Проводника (Thumbnails)",
+            description: "Базы предпросмотра изображений и эскизов папок Проводника Windows (thumbcache_*.db)",
+            paths_hint: "%LOCALAPPDATA%\\Microsoft\\Windows\\Explorer\\thumbcache_*.db",
+            requires_admin: false,
+            dirs: explorer_dir,
+        },
+        CleanupTargetSpec {
+            id: "shader_cache",
+            name: "Кэш шейдеров DirectX / NVIDIA / AMD",
+            description: "Скомпилированные шейдеры игр и графических API (пересоздаются автоматически при запуске)",
+            paths_hint: "D3DSCache • NVIDIA\\DXCache • AMD\\DxCache",
+            requires_admin: false,
+            dirs: shader_dirs,
+        },
+        CleanupTargetSpec {
+            id: "recycle_bin",
+            name: "Корзина Windows ($Recycle.Bin)",
+            description: "Удалённые пользователем файлы во всех разделах накопителей, ожидающие полной очистки",
+            paths_hint: "All Drives:\\$Recycle.Bin",
+            requires_admin: false,
+            dirs: recycle_dirs,
+        },
+        CleanupTargetSpec {
+            id: "crash_dumps",
+            name: "Системные дампы памяти и отчёты сбоев (*.dmp)",
+            description: "Аварийные дампы процессов (CrashDumps), отчёты Windows Error Reporting и минидампы ядра",
+            paths_hint: "%LOCALAPPDATA%\\CrashDumps • C:\\Windows\\Minidump • WER",
+            requires_admin: false,
+            dirs: dump_dirs,
+        },
+    ]
+}
+
+// Проверка, подлежит ли конкретный файл учёту и удалению в рамках категории
+fn is_cleanup_file_eligible(category_id: &str, file_path: &Path) -> bool {
+    let Some(file_name_os) = file_path.file_name() else {
+        return false;
+    };
+    let file_name = file_name_os.to_string_lossy().to_lowercase();
+
+    match category_id {
+        "thumbnails" => file_name.starts_with("thumbcache_") && file_name.ends_with(".db"),
+        "recycle_bin" => file_name != "desktop.ini",
+        _ => true,
+    }
+}
+
+// Безопасный рекурсивный подсчёт размера и количества файлов в категории (без перехода по симлинкам)
+fn scan_category_dir_recursive(category_id: &str, dir: &Path, size_acc: &mut u64, count_acc: &mut u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry_res in entries {
+        let Ok(entry) = entry_res else {
+            continue;
+        };
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+
+        if meta.is_dir() {
+            if category_id != "thumbnails" {
+                scan_category_dir_recursive(category_id, &path, size_acc, count_acc);
+            }
+        } else if meta.is_file() && is_cleanup_file_eligible(category_id, &path) {
+            *size_acc = size_acc.saturating_add(meta.len());
+            *count_acc = count_acc.saturating_add(1);
+        }
+    }
+}
+
+// Безопасное рекурсивное удаление файлов с пропуском заблокированных системой (EBUSY / PermissionDenied)
+fn clean_category_dir_recursive(
+    category_id: &str,
+    dir: &Path,
+    is_root: bool,
+    deleted_acc: &mut u64,
+    skipped_acc: &mut u64,
+    freed_acc: &mut u64,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry_res in entries {
+        let Ok(entry) = entry_res else {
+            continue;
+        };
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+
+        if meta.is_dir() {
+            if category_id != "thumbnails" {
+                clean_category_dir_recursive(
+                    category_id,
+                    &path,
+                    false,
+                    deleted_acc,
+                    skipped_acc,
+                    freed_acc,
+                );
+                // В $Recycle.Bin сохраняем корневые SID-папки пользователя, удаляя только вложенные подпапки
+                let is_recycle_sid_dir = is_root && category_id == "recycle_bin";
+                if !is_recycle_sid_dir {
+                    let _ = std::fs::remove_dir(&path);
+                }
+            }
+        } else if meta.is_file() && is_cleanup_file_eligible(category_id, &path) {
+            let file_len = meta.len();
+            // Снимаем атрибут Read-Only перед удалением, если он установлен на старом кэше
+            if meta.permissions().readonly() {
+                let mut perms = meta.permissions();
+                perms.set_readonly(false);
+                let _ = std::fs::set_permissions(&path, perms);
+            }
+
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    *deleted_acc = deleted_acc.saturating_add(1);
+                    *freed_acc = freed_acc.saturating_add(file_len);
+                }
+                Err(_) => {
+                    // Файл занят процессом (EBUSY / Sharing Violation) или защищён — безопасно пропускаем
+                    *skipped_acc = skipped_acc.saturating_add(1);
+                }
+            }
+        }
+    }
+}
+
+#[tauri::command]
+async fn scan_cleanup_targets() -> Result<Vec<CleanupCategory>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let specs = build_cleanup_specs();
+        let mut results = Vec::with_capacity(specs.len());
+
+        for spec in specs {
+            let mut total_size: u64 = 0;
+            let mut total_files: u64 = 0;
+
+            for dir in &spec.dirs {
+                if dir.exists() {
+                    scan_category_dir_recursive(spec.id, dir, &mut total_size, &mut total_files);
+                }
+            }
+
+            results.push(CleanupCategory {
+                id: spec.id.to_string(),
+                name: spec.name.to_string(),
+                description: spec.description.to_string(),
+                paths_hint: spec.paths_hint.to_string(),
+                size_bytes: total_size,
+                files_count: total_files,
+                requires_admin: spec.requires_admin,
+            });
+        }
+
+        Ok(results)
+    })
+    .await
+    .map_err(|e| format!("Ошибка потока анализа очистки: {}", e))?
+}
+
+#[tauri::command]
+async fn execute_cleanup(category_ids: Vec<String>) -> Result<CleanupReport, String> {
+    if category_ids.is_empty() {
+        return Err("Не выбрано ни одной категории для очистки".to_string());
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let selected_set: HashSet<String> = category_ids.into_iter().collect();
+        let specs = build_cleanup_specs();
+
+        let mut total_deleted: u64 = 0;
+        let mut total_skipped: u64 = 0;
+        let mut total_freed: u64 = 0;
+        let mut category_reports = Vec::new();
+
+        for spec in specs {
+            if !selected_set.contains(spec.id) {
+                continue;
+            }
+
+            let mut cat_deleted: u64 = 0;
+            let mut cat_skipped: u64 = 0;
+            let mut cat_freed: u64 = 0;
+
+            for dir in &spec.dirs {
+                if dir.exists() {
+                    clean_category_dir_recursive(
+                        spec.id,
+                        dir,
+                        true,
+                        &mut cat_deleted,
+                        &mut cat_skipped,
+                        &mut cat_freed,
+                    );
+                }
+            }
+
+            total_deleted = total_deleted.saturating_add(cat_deleted);
+            total_skipped = total_skipped.saturating_add(cat_skipped);
+            total_freed = total_freed.saturating_add(cat_freed);
+
+            category_reports.push(CleanupCategoryReport {
+                id: spec.id.to_string(),
+                name: spec.name.to_string(),
+                deleted_files: cat_deleted,
+                skipped_files: cat_skipped,
+                freed_bytes: cat_freed,
+            });
+        }
+
+        Ok(CleanupReport {
+            deleted_files_count: total_deleted,
+            skipped_files_count: total_skipped,
+            freed_bytes: total_freed,
+            categories: category_reports,
+        })
+    })
+    .await
+    .map_err(|e| format!("Ошибка потока очистки диска: {}", e))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut sys = System::new_all();
@@ -1247,7 +1658,12 @@ pub fn run() {
             open_item_location,
             get_available_drives,
             scan_storage,
-            get_hardware_telemetry
+            get_hardware_telemetry,
+            is_elevated_admin,
+            restart_as_admin,
+            app_exit,
+            scan_cleanup_targets,
+            execute_cleanup
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

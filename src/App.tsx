@@ -1,6 +1,7 @@
 import "./App.css";
 import { useState, useEffect, memo, type ReactNode, type MouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { motion, AnimatePresence, type Variants } from "framer-motion";
 import {
   LayoutDashboard,
@@ -32,8 +33,16 @@ import {
   Thermometer,
   Fan,
   ShieldCheck,
+  ShieldAlert,
   Flame,
   Radio,
+  Trash2,
+  Minus,
+  Square,
+  X,
+  ChevronDown,
+  CheckCircle2,
+  Check,
 } from "lucide-react";
 
 interface Metrics {
@@ -147,6 +156,31 @@ interface HardwareTelemetry {
   motherboard_temps: TempSensorItem[];
   system_fans: FanSensorItem[];
   storage_temps: StorageTempItem[];
+}
+
+interface CleanupCategory {
+  id: string;
+  name: string;
+  description: string;
+  paths_hint: string;
+  size_bytes: number;
+  files_count: number;
+  requires_admin: boolean;
+}
+
+interface CleanupCategoryReport {
+  id: string;
+  name: string;
+  deleted_files: number;
+  skipped_files: number;
+  freed_bytes: number;
+}
+
+interface CleanupReport {
+  deleted_files_count: number;
+  skipped_files_count: number;
+  freed_bytes: number;
+  categories: CleanupCategoryReport[];
 }
 
 interface HistoryPoint {
@@ -859,7 +893,7 @@ const LoadHistoryChart = memo(function LoadHistoryChart({
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<
-    "dashboard" | "startup" | "storage" | "hardware" | "power"
+    "dashboard" | "startup" | "storage" | "hardware" | "cleanup" | "power"
   >("dashboard");
   const [metrics, setMetrics] = useState<Metrics>({
     cpu_usage: 0,
@@ -875,6 +909,11 @@ export default function App() {
     net_ping_ms: 0,
   });
   const [history, setHistory] = useState<HistoryPoint[]>(createInitialHistory);
+
+  // Состояние кастомного тайтлбара и привилегий процесса
+  const [isElevatedAdmin, setIsElevatedAdmin] = useState<boolean>(false);
+  const [adminMenuOpen, setAdminMenuOpen] = useState<boolean>(false);
+  const [adminError, setAdminError] = useState<string | null>(null);
 
   // Состояние модуля Startup Manager (Автозагрузка)
   const [startupItems, setStartupItems] = useState<StartupItem[]>([]);
@@ -898,6 +937,15 @@ export default function App() {
   // Состояние модуля Hardware Monitor (Мониторинг железа)
   const [hwData, setHwData] = useState<HardwareTelemetry | null>(null);
 
+  // Состояние модуля Cleanup Center (Безопасная очистка накопителя)
+  const [cleanupCategories, setCleanupCategories] = useState<CleanupCategory[]>([]);
+  const [selectedCleanupIds, setSelectedCleanupIds] = useState<string[]>([]);
+  const [isScanningCleanup, setIsScanningCleanup] = useState<boolean>(false);
+  const [isCleaning, setIsCleaning] = useState<boolean>(false);
+  const [confirmCleanupOpen, setConfirmCleanupOpen] = useState<boolean>(false);
+  const [cleanupReport, setCleanupReport] = useState<CleanupReport | null>(null);
+  const [cleanupError, setCleanupError] = useState<string | null>(null);
+
   // Состояние модуля управления питанием
   const [restartMode, setRestartMode] = useState<boolean>(false);
   const [customMinutes, setCustomMinutes] = useState<string>("");
@@ -920,6 +968,105 @@ export default function App() {
     return Math.max(0, Math.ceil((timerState.endTime - Date.now()) / 1000));
   });
   const [powerError, setPowerError] = useState<string | null>(null);
+
+  // Проверка прав Администратора при старте приложения
+  useEffect(() => {
+    invoke<boolean>("is_elevated_admin")
+      .then((elevated) => setIsElevatedAdmin(Boolean(elevated)))
+      .catch((err) => console.error("Ошибка проверки прав администратора:", err));
+  }, []);
+
+  // Обработчики безрамочного окна (Frameless Window Controls)
+  const handleWindowMinimize = async () => {
+    try {
+      await getCurrentWindow().minimize();
+    } catch (err) {
+      console.error("Ошибка сворачивания окна:", err);
+    }
+  };
+
+  const handleWindowToggleMaximize = async () => {
+    try {
+      await getCurrentWindow().toggleMaximize();
+    } catch (err) {
+      console.error("Ошибка разворачивания окна:", err);
+    }
+  };
+
+  const handleWindowClose = async () => {
+    try {
+      await invoke("app_exit");
+    } catch {
+      try {
+        await getCurrentWindow().close();
+      } catch (err) {
+        console.error("Ошибка закрытия окна:", err);
+      }
+    }
+  };
+
+  const handleRestartAsAdmin = async () => {
+    setAdminError(null);
+    setAdminMenuOpen(false);
+    try {
+      await invoke("restart_as_admin");
+    } catch (err) {
+      console.error("Ошибка перезапуска от имени Администратора:", err);
+      setAdminError(String(err));
+    }
+  };
+
+  // Обработчик анализа целей очистки (Cleanup Center)
+  const handleScanCleanup = async () => {
+    if (isScanningCleanup || isCleaning) return;
+    setIsScanningCleanup(true);
+    setCleanupError(null);
+    setConfirmCleanupOpen(false);
+    try {
+      const categories = await invoke<CleanupCategory[]>("scan_cleanup_targets");
+      setCleanupCategories(categories);
+      // По умолчанию отмечаем все непустые категории (кроме требующих прав админа, если нет админки)
+      const autoSelect = categories
+        .filter((c) => c.size_bytes > 0 && (!c.requires_admin || isElevatedAdmin))
+        .map((c) => c.id);
+      setSelectedCleanupIds(
+        autoSelect.length > 0 ? autoSelect : categories.map((c) => c.id)
+      );
+    } catch (err) {
+      console.error("Ошибка сканирования категорий очистки:", err);
+      setCleanupError(String(err));
+    } finally {
+      setIsScanningCleanup(false);
+    }
+  };
+
+  const handleToggleCleanupCategory = (id: string) => {
+    setConfirmCleanupOpen(false);
+    setSelectedCleanupIds((prev) =>
+      prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
+    );
+  };
+
+  const handleExecuteCleanup = async () => {
+    if (selectedCleanupIds.length === 0 || isCleaning) return;
+    setIsCleaning(true);
+    setCleanupError(null);
+    setConfirmCleanupOpen(false);
+    try {
+      const report = await invoke<CleanupReport>("execute_cleanup", {
+        categoryIds: selectedCleanupIds,
+      });
+      setCleanupReport(report);
+      // Обновляем размеры категорий после завершения очистки
+      const refreshed = await invoke<CleanupCategory[]>("scan_cleanup_targets");
+      setCleanupCategories(refreshed);
+    } catch (err) {
+      console.error("Ошибка выполнения очистки:", err);
+      setCleanupError(String(err));
+    } finally {
+      setIsCleaning(false);
+    }
+  };
 
   useEffect(() => {
     // Опрашиваем Rust раз в секунду и пополняем кольцевой буфер на 60 точек
@@ -961,6 +1108,9 @@ export default function App() {
       try {
         const data = await invoke<HardwareTelemetry>("get_hardware_telemetry");
         setHwData(data);
+        if (data.is_admin) {
+          setIsElevatedAdmin(true);
+        }
       } catch (err) {
         console.error("Ошибка получения аппаратной телеметрии:", err);
       }
@@ -998,6 +1148,8 @@ export default function App() {
           }
         })
         .catch((err) => console.error("Ошибка получения списка дисков:", err));
+    } else if (activeTab === "cleanup" && cleanupCategories.length === 0) {
+      handleScanCleanup();
     }
   }, [activeTab]);
 
@@ -1250,12 +1402,181 @@ export default function App() {
 
   const cpuTempStyle = getTempBadgeStyle(hwData?.cpu.package_temp_c);
 
+  // Агрегированная статистика для Cleanup Center
+  const totalCleanupBytes = cleanupCategories.reduce(
+    (acc, cat) => acc + cat.size_bytes,
+    0
+  );
+  const selectedCleanupCategories = cleanupCategories.filter((cat) =>
+    selectedCleanupIds.includes(cat.id)
+  );
+  const selectedCleanupBytes = selectedCleanupCategories.reduce(
+    (acc, cat) => acc + cat.size_bytes,
+    0
+  );
+  const selectedCleanupFilesCount = selectedCleanupCategories.reduce(
+    (acc, cat) => acc + cat.files_count,
+    0
+  );
+
   return (
-    <div className="relative flex h-screen w-screen bg-[#07080b] obsidian-grid-bg text-zinc-200 select-none overflow-hidden font-sans">
+    <div className="relative flex flex-col h-screen w-screen bg-[#07080b] obsidian-grid-bg text-zinc-200 select-none overflow-hidden font-sans border border-white/[0.08]">
       {/* Точечное акцентное свечение Obsidian Cyber-HUD */}
       <div className="pointer-events-none absolute -top-40 left-40 h-96 w-96 rounded-full bg-emerald-500/[0.055] blur-[130px]" />
       <div className="pointer-events-none absolute bottom-0 right-10 h-96 w-96 rounded-full bg-cyan-500/[0.05] blur-[140px]" />
 
+      {/* Кастомный безрамочный кибер-тайтлбар (36px) с поддержкой перетаскивания */}
+      <header
+        data-tauri-drag-region
+        className="relative z-40 h-9 shrink-0 bg-[#050609]/95 border-b border-white/[0.07] flex items-center justify-between pl-3 pr-1"
+      >
+        {/* Левая зона перетаскивания: бренд и статус сессии */}
+        <div
+          data-tauri-drag-region
+          onMouseDown={(e) => {
+            if (e.button === 0 && e.detail === 1) {
+              getCurrentWindow().startDragging().catch(() => {});
+            }
+          }}
+          onDoubleClick={() => {
+            handleWindowToggleMaximize();
+          }}
+          className="flex items-center gap-2.5 flex-1 h-full cursor-default"
+        >
+          <div className="pointer-events-none h-5 w-5 rounded bg-emerald-500/20 border border-emerald-400/50 flex items-center justify-center text-emerald-400 font-mono font-extrabold text-[11px] shadow-[0_0_10px_rgba(52,211,153,0.3)]">
+            N
+          </div>
+          <span className="pointer-events-none font-mono font-bold text-[11px] tracking-[0.16em] text-zinc-200">
+            NEXUS PC
+          </span>
+          <span className="pointer-events-none hidden sm:inline-block text-[10px] font-mono text-zinc-500">
+            // OBSIDIAN CYBER-HUD v0.1
+          </span>
+          {adminError && (
+            <span className="pointer-events-none text-[10px] font-mono text-rose-400 truncate max-w-xs ml-2">
+              {adminError}
+            </span>
+          )}
+        </div>
+
+        {/* Правая зона: индикатор привилегий (ADMIN / USER), меню рестарта и кнопки окна */}
+        <div className="flex items-center gap-1.5 h-full">
+          {!isElevatedAdmin && (
+            <button
+              type="button"
+              onClick={handleRestartAsAdmin}
+              title="Перезапустить NEXUS PC с правами Администратора (UAC)"
+              className="hidden md:inline-flex items-center gap-1.5 px-2 py-1 rounded bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 text-[10px] font-mono transition-colors cursor-pointer"
+            >
+              <ShieldAlert size={11} />
+              <span>Перезапустить от имени администратора</span>
+            </button>
+          )}
+
+          {/* Выпадающее меню статуса прав (ADMIN зелёный / USER серый) */}
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => setAdminMenuOpen((prev) => !prev)}
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded text-[10px] font-mono font-bold tracking-wider border transition-colors cursor-pointer ${
+                isElevatedAdmin
+                  ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/40 shadow-[0_0_12px_rgba(52,211,153,0.2)]"
+                  : "bg-zinc-800/80 text-zinc-400 hover:text-zinc-200 border-white/[0.1]"
+              }`}
+            >
+              <span
+                className={`h-1.5 w-1.5 rounded-full ${
+                  isElevatedAdmin
+                    ? "bg-emerald-400 shadow-[0_0_6px_#34d399]"
+                    : "bg-zinc-500"
+                }`}
+              />
+              <span>{isElevatedAdmin ? "ADMIN" : "USER"}</span>
+              <ChevronDown size={11} />
+            </button>
+
+            <AnimatePresence>
+              {adminMenuOpen && (
+                <motion.div
+                  initial={{ opacity: 0, y: 4, scale: 0.96 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: 4, scale: 0.96 }}
+                  transition={{ duration: 0.14 }}
+                  className="absolute right-0 top-7 w-72 rounded-xl backdrop-blur-2xl bg-[#0b0d14]/95 border border-white/[0.12] shadow-[0_14px_38px_rgba(0,0,0,0.8)] p-2.5 z-50 space-y-2 font-mono text-xs"
+                >
+                  <div className="px-2 py-1.5 rounded-lg bg-[#07080c] border border-white/[0.06]">
+                    <div className="text-[10px] uppercase tracking-wider text-zinc-500">
+                      ПРИВИЛЕГИИ ПРОЦЕССА
+                    </div>
+                    <div
+                      className={`text-xs font-bold mt-0.5 ${
+                        isElevatedAdmin ? "text-emerald-400" : "text-zinc-300"
+                      }`}
+                    >
+                      {isElevatedAdmin
+                        ? "Администратор (Полный доступ Ring0)"
+                        : "Стандартный пользователь (USER)"}
+                    </div>
+                  </div>
+
+                  {!isElevatedAdmin && (
+                    <button
+                      type="button"
+                      onClick={handleRestartAsAdmin}
+                      className="w-full flex items-center gap-2 px-2.5 py-2 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/35 text-left text-[11px] font-semibold transition-colors cursor-pointer"
+                    >
+                      <ShieldCheck size={14} className="shrink-0" />
+                      <span>Перезапустить от имени администратора</span>
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={handleWindowClose}
+                    className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-rose-500/15 text-zinc-400 hover:text-rose-300 text-left text-[11px] transition-colors cursor-pointer"
+                  >
+                    <XCircle size={13} className="shrink-0" />
+                    <span>Завершить работу NEXUS PC</span>
+                  </button>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+
+          <div className="h-3.5 w-px bg-white/[0.08] mx-0.5" />
+
+          {/* Кнопки управления окном (Свернуть, Развернуть, Закрыть) */}
+          <button
+            type="button"
+            onClick={handleWindowMinimize}
+            title="Свернуть"
+            className="h-7 w-8 inline-flex items-center justify-center rounded hover:bg-white/[0.08] text-zinc-400 hover:text-zinc-100 transition-colors cursor-pointer"
+          >
+            <Minus size={13} />
+          </button>
+
+          <button
+            type="button"
+            onClick={handleWindowToggleMaximize}
+            title="Развернуть / Оконный режим"
+            className="h-7 w-8 inline-flex items-center justify-center rounded hover:bg-white/[0.08] text-zinc-400 hover:text-zinc-100 transition-colors cursor-pointer"
+          >
+            <Square size={11} />
+          </button>
+
+          <button
+            type="button"
+            onClick={handleWindowClose}
+            title="Закрыть NEXUS PC"
+            className="h-7 w-8 inline-flex items-center justify-center rounded hover:bg-rose-500/80 text-zinc-400 hover:text-white transition-colors cursor-pointer"
+          >
+            <X size={14} />
+          </button>
+        </div>
+      </header>
+
+      {/* Рабочая область под кастомным тайтлбаром */}
+      <div className="relative z-10 flex flex-1 min-h-0 overflow-hidden">
       {/* Компактная строгая боковая панель Obsidian Cyber-HUD */}
       <aside className="relative z-20 w-60 shrink-0 backdrop-blur-2xl bg-[#090b10]/95 border-r border-white/[0.07] flex flex-col justify-between p-3.5">
         <div>
@@ -1406,7 +1727,41 @@ export default function App() {
               )}
             </motion.button>
 
-            {/* 5. Кнопка вкладки Power Manager */}
+            {/* 5. Кнопка вкладки Cleanup Center («Очистка») */}
+            <motion.button
+              type="button"
+              whileTap={{ scale: 0.97 }}
+              onClick={() => setActiveTab("cleanup")}
+              className={`relative w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-mono tracking-wide transition-colors cursor-pointer ${
+                activeTab === "cleanup"
+                  ? "text-emerald-300 font-semibold"
+                  : "text-zinc-400 hover:text-zinc-200"
+              }`}
+            >
+              {activeTab === "cleanup" && (
+                <motion.div
+                  layoutId="activeTabPill"
+                  transition={{ type: "spring", stiffness: 460, damping: 32 }}
+                  className="absolute inset-0 rounded-lg bg-gradient-to-r from-emerald-500/20 via-emerald-500/[0.07] to-transparent border border-emerald-500/30 shadow-[0_0_18px_rgba(52,211,153,0.12)]"
+                >
+                  <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 bg-emerald-400 shadow-[0_0_8px_#34d399]" />
+                </motion.div>
+              )}
+              <span className="relative z-10 flex items-center gap-2.5">
+                <Trash2 size={15} />
+                <span>ОЧИСТКА</span>
+              </span>
+              {isScanningCleanup || isCleaning ? (
+                <Loader2
+                  size={13}
+                  className="relative z-10 animate-spin text-emerald-400"
+                />
+              ) : (
+                <span className="relative z-10 text-[10px] text-zinc-500">05</span>
+              )}
+            </motion.button>
+
+            {/* 6. Кнопка вкладки Power Manager */}
             <motion.button
               type="button"
               whileTap={{ scale: 0.97 }}
@@ -1435,7 +1790,7 @@ export default function App() {
                   {formatCountdown(remainingSeconds)}
                 </span>
               ) : (
-                <span className="relative z-10 text-[10px] text-zinc-500">05</span>
+                <span className="relative z-10 text-[10px] text-zinc-500">06</span>
               )}
             </motion.button>
           </nav>
@@ -3185,6 +3540,358 @@ export default function App() {
             </motion.div>
           )}
 
+          {activeTab === "cleanup" && (
+            <motion.div
+              key="cleanup"
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              transition={{ duration: 0.18, ease: "easeOut" }}
+              className="space-y-5 max-w-6xl w-full"
+            >
+              {/* Шапка Cleanup Center */}
+              <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4 border-b border-white/[0.06] pb-3.5">
+                <div>
+                  <div className="text-[10px] font-mono uppercase tracking-[0.2em] text-emerald-400/90 mb-0.5">
+                    CLEANUP CENTER // SAFE STORAGE SANITIZER
+                  </div>
+                  <h2 className="text-2xl font-bold text-zinc-100 tracking-tight">
+                    Безопасная очистка накопителя
+                  </h2>
+                  <p className="text-xs sm:text-sm text-zinc-400 mt-0.5">
+                    Анализ временных кэшей, шейдеров, миниатюр, дампов памяти и корзины Windows с пропуском занятых файлов
+                  </p>
+                </div>
+
+                <motion.button
+                  type="button"
+                  whileHover={{ scale: isScanningCleanup || isCleaning ? 1 : 1.02 }}
+                  whileTap={{ scale: isScanningCleanup || isCleaning ? 1 : 0.96 }}
+                  disabled={isScanningCleanup || isCleaning}
+                  onClick={handleScanCleanup}
+                  className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-gradient-to-r from-emerald-500/20 to-teal-500/20 hover:from-emerald-500/30 hover:to-teal-500/30 text-emerald-300 border border-emerald-500/35 shadow-[0_0_20px_rgba(52,211,153,0.16)] text-xs font-mono font-bold transition-all cursor-pointer self-start sm:self-auto"
+                >
+                  <RefreshCw
+                    size={14}
+                    className={isScanningCleanup ? "animate-spin text-emerald-400" : "text-emerald-400"}
+                  />
+                  <span>{isScanningCleanup ? "АНАЛИЗ СИСТЕМЫ..." : "АНАЛИЗ СИСТЕМЫ"}</span>
+                </motion.button>
+              </div>
+
+              {/* Сводная панель объёма найденного кэша и управления выделением */}
+              <SpotlightCard
+                spotlightColor="rgba(52, 211, 153, 0.12)"
+                accentColor="emerald"
+                className="p-5"
+              >
+                <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 flex-1">
+                    <div className="p-3.5 rounded-xl bg-[#07090e]/90 border border-white/[0.06] hud-dot-matrix">
+                      <span className="text-[10px] font-mono uppercase tracking-wider text-zinc-500 block">
+                        ОБНАРУЖЕНО ВСЕГО
+                      </span>
+                      <div className="text-2xl font-extrabold font-mono tabular-nums text-zinc-100 mt-1">
+                        {formatBytes(totalCleanupBytes)}
+                      </div>
+                    </div>
+
+                    <div className="p-3.5 rounded-xl bg-[#07090e]/90 border border-emerald-500/25 hud-dot-matrix">
+                      <span className="text-[10px] font-mono uppercase tracking-wider text-emerald-400/90 block">
+                        ВЫБРАНО К ОЧИСТКЕ
+                      </span>
+                      <div className="text-2xl font-extrabold font-mono tabular-nums text-emerald-400 mt-1">
+                        {formatBytes(selectedCleanupBytes)}
+                      </div>
+                    </div>
+
+                    <div className="p-3.5 rounded-xl bg-[#07090e]/90 border border-white/[0.06] hud-dot-matrix">
+                      <span className="text-[10px] font-mono uppercase tracking-wider text-zinc-500 block">
+                        ФАЙЛОВ В ВЫБОРКЕ
+                      </span>
+                      <div className="text-2xl font-extrabold font-mono tabular-nums text-cyan-400 mt-1">
+                        {selectedCleanupFilesCount.toLocaleString("ru-RU")}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 self-start lg:self-center font-mono text-xs shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setConfirmCleanupOpen(false);
+                        setSelectedCleanupIds(cleanupCategories.map((c) => c.id));
+                      }}
+                      className="px-3 py-2 rounded-lg bg-[#0d1017] hover:bg-white/[0.07] text-zinc-300 border border-white/[0.08] transition-colors cursor-pointer"
+                    >
+                      Выбрать все
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setConfirmCleanupOpen(false);
+                        setSelectedCleanupIds([]);
+                      }}
+                      className="px-3 py-2 rounded-lg bg-[#0d1017] hover:bg-white/[0.07] text-zinc-400 border border-white/[0.08] transition-colors cursor-pointer"
+                    >
+                      Сбросить
+                    </button>
+                  </div>
+                </div>
+              </SpotlightCard>
+
+              {/* Ошибка при сканировании или очистке */}
+              <AnimatePresence>
+                {cleanupError && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -6 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -6 }}
+                    className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-400 text-xs font-mono"
+                  >
+                    {cleanupError}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              {/* Итоговый отчёт после выполнения очистки (CleanupReport) */}
+              <AnimatePresence>
+                {cleanupReport && (
+                  <motion.div
+                    initial={{ opacity: 0, scale: 0.98, y: -6 }}
+                    animate={{ opacity: 1, scale: 1, y: 0 }}
+                    exit={{ opacity: 0, scale: 0.98 }}
+                    className="p-5 rounded-xl backdrop-blur-2xl bg-gradient-to-r from-emerald-500/15 via-cyan-500/10 to-[#0b0d13] border border-emerald-500/40 shadow-[0_0_28px_rgba(52,211,153,0.18)] space-y-3"
+                  >
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                      <div className="flex items-center gap-3">
+                        <div className="p-2.5 rounded-xl bg-emerald-500/20 border border-emerald-500/40 text-emerald-300">
+                          <CheckCircle2 size={20} />
+                        </div>
+                        <div>
+                          <div className="text-[10px] font-mono uppercase tracking-wider text-emerald-300 font-bold">
+                            ОТЧЁТ ОЧИСТКИ НАКОПИТЕЛЯ // ЗАВЕРШЕНО
+                          </div>
+                          <div className="text-base sm:text-lg font-bold text-zinc-100 font-mono">
+                            Освобождено:{" "}
+                            <span className="text-emerald-400">
+                              {formatBytes(cleanupReport.freed_bytes)}
+                            </span>{" "}
+                            ({cleanupReport.freed_bytes.toLocaleString("ru-RU")} байт)
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2 text-xs font-mono">
+                        <span className="px-2.5 py-1 rounded-lg bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                          Удалено файлов: <strong>{cleanupReport.deleted_files_count}</strong>
+                        </span>
+                        <span className="px-2.5 py-1 rounded-lg bg-zinc-900/90 text-zinc-400 border border-white/[0.08]">
+                          Пропущено (заняты ОС): <strong>{cleanupReport.skipped_files_count}</strong>
+                        </span>
+                      </div>
+                    </div>
+
+                    {cleanupReport.categories.length > 0 && (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 pt-2 border-t border-white/[0.08]">
+                        {cleanupReport.categories.map((catRep) => (
+                          <div
+                            key={catRep.id}
+                            className="px-3 py-2 rounded-lg bg-[#07090e]/85 border border-white/[0.06] flex items-center justify-between text-xs font-mono"
+                          >
+                            <span className="text-zinc-300 truncate mr-2">{catRep.name}</span>
+                            <span className="text-emerald-400 font-bold shrink-0 tabular-nums">
+                              -{formatBytes(catRep.freed_bytes)} ({catRep.deleted_files})
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              {/* Список категорий очистки с чекбоксами */}
+              <motion.div
+                variants={cardsContainerVariants}
+                initial="hidden"
+                animate="show"
+                className="grid grid-cols-1 md:grid-cols-2 gap-4"
+              >
+                {cleanupCategories.map((cat) => {
+                  const isChecked = selectedCleanupIds.includes(cat.id);
+                  return (
+                    <SpotlightCard
+                      key={cat.id}
+                      variants={cardItemVariants}
+                      spotlightColor={
+                        isChecked
+                          ? "rgba(52, 211, 153, 0.13)"
+                          : "rgba(161, 161, 170, 0.07)"
+                      }
+                      accentColor={isChecked ? "emerald" : "cyan"}
+                      className="p-4 sm:p-5"
+                    >
+                      <div
+                        onClick={() => handleToggleCleanupCategory(cat.id)}
+                        className="flex items-start justify-between gap-3.5 cursor-pointer h-full"
+                      >
+                        <div className="flex items-start gap-3.5 min-w-0 flex-1">
+                          <button
+                            type="button"
+                            role="checkbox"
+                            aria-checked={isChecked}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleToggleCleanupCategory(cat.id);
+                            }}
+                            className={`mt-0.5 h-5 w-5 rounded-md border flex items-center justify-center shrink-0 transition-all cursor-pointer ${
+                              isChecked
+                                ? "bg-emerald-500/25 border-emerald-400 text-emerald-300 shadow-[0_0_12px_rgba(52,211,153,0.3)]"
+                                : "bg-[#07090e] border-white/[0.15] text-transparent hover:border-white/30"
+                            }`}
+                          >
+                            <Check size={13} />
+                          </button>
+
+                          <div className="min-w-0 flex-1 space-y-1.5">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="font-bold text-sm text-zinc-100">
+                                {cat.name}
+                              </span>
+                              {cat.requires_admin && (
+                                <span
+                                  className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${
+                                    isElevatedAdmin
+                                      ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
+                                      : "bg-amber-500/15 text-amber-300 border-amber-500/30"
+                                  }`}
+                                >
+                                  ADMIN
+                                </span>
+                              )}
+                            </div>
+
+                            <p className="text-xs text-zinc-400 leading-relaxed">
+                              {cat.description}
+                            </p>
+
+                            <div className="flex flex-wrap items-center gap-2 pt-1 text-[11px] font-mono text-zinc-500">
+                              <span className="px-2 py-0.5 rounded bg-[#07090e] border border-white/[0.05] truncate max-w-xs">
+                                {cat.paths_hint}
+                              </span>
+                              <span>
+                                Файлов:{" "}
+                                <strong className="text-zinc-300 tabular-nums">
+                                  {cat.files_count.toLocaleString("ru-RU")}
+                                </strong>
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="text-right shrink-0">
+                          <span
+                            className={`inline-block font-mono font-extrabold text-sm sm:text-base tabular-nums px-2.5 py-1 rounded-lg border ${
+                              cat.size_bytes > 100 * 1024 * 1024
+                                ? "bg-amber-500/15 text-amber-300 border-amber-500/35"
+                                : cat.size_bytes > 0
+                                ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
+                                : "bg-zinc-900/80 text-zinc-500 border-white/[0.06]"
+                            }`}
+                          >
+                            {formatBytes(cat.size_bytes)}
+                          </span>
+                        </div>
+                      </div>
+                    </SpotlightCard>
+                  );
+                })}
+              </motion.div>
+
+              {/* Блок подтверждения и безопасного запуска очистки */}
+              <SpotlightCard
+                spotlightColor="rgba(244, 63, 94, 0.12)"
+                accentColor="amber"
+                className="p-5"
+              >
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                  <div className="flex items-start gap-3">
+                    <div className="p-2 rounded-lg bg-amber-500/15 border border-amber-500/30 text-amber-400 shrink-0 mt-0.5">
+                      <AlertTriangle size={18} />
+                    </div>
+                    <div className="space-y-0.5">
+                      <div className="text-sm font-semibold text-zinc-100">
+                        Безопасный протокол очистки NEXUS
+                      </div>
+                      <p className="text-xs font-mono text-zinc-400">
+                        Заблокированные системой или открытыми программами файлы (`EBUSY` / `PermissionDenied`) автоматически пропускаются без сбоев.
+                      </p>
+                    </div>
+                  </div>
+
+                  {!confirmCleanupOpen ? (
+                    <motion.button
+                      type="button"
+                      whileHover={{
+                        scale:
+                          selectedCleanupIds.length === 0 || isCleaning ? 1 : 1.02,
+                      }}
+                      whileTap={{
+                        scale:
+                          selectedCleanupIds.length === 0 || isCleaning ? 1 : 0.96,
+                      }}
+                      disabled={selectedCleanupIds.length === 0 || isCleaning}
+                      onClick={() => setConfirmCleanupOpen(true)}
+                      className={`inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl text-xs font-mono font-bold transition-all border shrink-0 cursor-pointer ${
+                        selectedCleanupIds.length === 0 || isCleaning
+                          ? "bg-zinc-900 text-zinc-500 border-white/[0.06] cursor-not-allowed"
+                          : "bg-gradient-to-r from-rose-500/25 via-amber-500/20 to-emerald-500/20 hover:from-rose-500/35 hover:to-emerald-500/30 text-emerald-300 border-emerald-500/40 shadow-[0_0_22px_rgba(52,211,153,0.2)]"
+                      }`}
+                    >
+                      <Trash2 size={15} />
+                      <span>
+                        ОЧИСТИТЬ ВЫБРАННОЕ ({formatBytes(selectedCleanupBytes)})
+                      </span>
+                    </motion.button>
+                  ) : (
+                    <div className="flex flex-wrap items-center gap-2 shrink-0 font-mono text-xs">
+                      <span className="text-amber-300 mr-1">
+                        Удалить {selectedCleanupFilesCount.toLocaleString("ru-RU")} файлов?
+                      </span>
+                      <motion.button
+                        type="button"
+                        whileTap={{ scale: 0.96 }}
+                        disabled={isCleaning}
+                        onClick={handleExecuteCleanup}
+                        className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-rose-500/25 hover:bg-rose-500/35 text-rose-200 border border-rose-500/45 font-bold shadow-[0_0_18px_rgba(244,63,94,0.25)] cursor-pointer"
+                      >
+                        {isCleaning ? (
+                          <>
+                            <Loader2 size={14} className="animate-spin" />
+                            <span>Очистка...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Trash2 size={14} />
+                            <span>Подтвердить ({formatBytes(selectedCleanupBytes)})</span>
+                          </>
+                        )}
+                      </motion.button>
+                      <button
+                        type="button"
+                        onClick={() => setConfirmCleanupOpen(false)}
+                        className="px-3 py-2 rounded-xl bg-zinc-900 hover:bg-zinc-800 text-zinc-300 border border-white/[0.08] cursor-pointer"
+                      >
+                        Отмена
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </SpotlightCard>
+            </motion.div>
+          )}
+
           {activeTab === "power" && (
             <motion.div
               key="power"
@@ -3400,6 +4107,7 @@ export default function App() {
           )}
         </AnimatePresence>
       </main>
+      </div>
     </div>
   );
 }
