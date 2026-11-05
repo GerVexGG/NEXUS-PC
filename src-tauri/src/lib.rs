@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Mutex;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use sysinfo::{Disks, Networks, System};
 use tauri::State;
 
@@ -22,7 +23,7 @@ const NEXUS_DISABLED_REG_BASE: &str = r"Software\Nexus\DisabledStartup";
 const RUN_KEY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_WOW64_KEY_PATH: &str = r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run";
 
-// Структура данных телеметрии, которую мы отправляем в интерфейс
+// Структура данных телеметрии Dashboard
 #[derive(Serialize)]
 pub struct SystemMetrics {
     pub cpu_usage: f32,
@@ -76,10 +77,271 @@ pub struct ScanResult {
     pub category_sizes: Vec<(String, u64)>, // ("Видео", 12345678), ("Игры и софт", ...)
 }
 
-// Хранилище состояния sysinfo в памяти, чтобы не пересоздавать его каждую секунду
+// Структуры модуля Hardware Monitor (Мониторинг железа через LibreHardwareMonitor sidecar)
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct CoreTemp {
+    pub name: String,
+    pub temp_c: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct CpuTelemetry {
+    pub name: String,
+    pub package_temp_c: Option<f32>,
+    pub max_core_temp_c: Option<f32>,
+    pub avg_clock_mhz: Option<f32>,
+    pub power_watts: Option<f32>,
+    pub voltage_v: Option<f32>,
+    pub core_temps: Vec<CoreTemp>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct GpuTelemetry {
+    pub name: String,
+    pub core_temp_c: Option<f32>,
+    pub hotspot_temp_c: Option<f32>,
+    pub memory_temp_c: Option<f32>,
+    pub core_clock_mhz: Option<f32>,
+    pub memory_clock_mhz: Option<f32>,
+    pub fan_rpm: Option<f32>,
+    pub fan_percent: Option<f32>,
+    pub power_watts: Option<f32>,
+    pub voltage_v: Option<f32>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct FanSensorItem {
+    pub name: String,
+    pub rpm: f32,
+    pub percent: Option<f32>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct TempSensorItem {
+    pub name: String,
+    pub temp_c: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct StorageTempItem {
+    pub name: String,
+    pub temp_c: Option<f32>,
+    pub used_percent: Option<f32>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct HardwareTelemetry {
+    pub is_admin: bool,
+    pub sidecar_online: bool,
+    pub timestamp_ms: u64,
+    pub cpu: CpuTelemetry,
+    pub gpus: Vec<GpuTelemetry>,
+    pub motherboard_name: String,
+    pub motherboard_temps: Vec<TempSensorItem>,
+    pub system_fans: Vec<FanSensorItem>,
+    pub storage_temps: Vec<StorageTempItem>,
+}
+
+// Хранилище состояния приложения
 pub struct AppState {
     pub sys: Mutex<System>,
     pub networks: Mutex<Networks>,
+    pub hw_telemetry: Arc<Mutex<Option<HardwareTelemetry>>>,
+    pub hw_sidecar_child: Arc<Mutex<Option<Child>>>,
+}
+
+impl Drop for AppState {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.hw_sidecar_child.lock() {
+            if let Some(mut child) = guard.take() {
+                let _ = child.kill();
+            }
+        }
+    }
+}
+
+// Поиск скомпилированного бинарника nexus-hwmon.exe
+fn find_hwmon_sidecar_exe() -> Option<PathBuf> {
+    let candidates = [
+        PathBuf::from("hwmon-sidecar/bin/publish/nexus-hwmon.exe"),
+        PathBuf::from("src-tauri/hwmon-sidecar/bin/publish/nexus-hwmon.exe"),
+        PathBuf::from("hwmon-sidecar/bin/Release/net9.0/win-x64/nexus-hwmon.exe"),
+        PathBuf::from("src-tauri/hwmon-sidecar/bin/Release/net9.0/win-x64/nexus-hwmon.exe"),
+    ];
+
+    for cand in &candidates {
+        if cand.exists() {
+            return Some(cand.clone());
+        }
+    }
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let near_exe = exe_dir.join("nexus-hwmon.exe");
+            if near_exe.exists() {
+                return Some(near_exe);
+            }
+            // При запуске из target/debug поднимаемся к src-tauri/hwmon-sidecar
+            let from_target = exe_dir
+                .join("../../hwmon-sidecar/bin/publish/nexus-hwmon.exe");
+            if from_target.exists() {
+                return Some(from_target);
+            }
+        }
+    }
+
+    None
+}
+
+fn spawn_hwmon_sidecar(
+    telemetry_cache: Arc<Mutex<Option<HardwareTelemetry>>>,
+    child_holder: Arc<Mutex<Option<Child>>>,
+) {
+    let Some(exe_path) = find_hwmon_sidecar_exe() else {
+        return;
+    };
+
+    let mut cmd = Command::new(&exe_path);
+    if let Some(parent_dir) = exe_path.parent() {
+        cmd.current_dir(parent_dir);
+    }
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let Ok(mut child) = cmd.spawn() else {
+        return;
+    };
+
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        return;
+    };
+
+    if let Ok(mut guard) = child_holder.lock() {
+        *guard = Some(child);
+    }
+
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line_res in reader.lines() {
+            let Ok(line) = line_res else {
+                break;
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(parsed) = serde_json::from_str::<HardwareTelemetry>(trimmed) {
+                if let Ok(mut cache) = telemetry_cache.lock() {
+                    *cache = Some(parsed);
+                }
+            }
+        }
+    });
+}
+
+#[tauri::command]
+fn get_hardware_telemetry(state: State<'_, AppState>) -> Result<HardwareTelemetry, String> {
+    // Если sidecar еще не запущен, пробуем поднять его лениво
+    {
+        let need_spawn = state
+            .hw_sidecar_child
+            .lock()
+            .map(|mut g| match g.as_mut() {
+                Some(child) => child.try_wait().ok().flatten().is_some(),
+                None => true,
+            })
+            .unwrap_or(false);
+
+        if need_spawn {
+            spawn_hwmon_sidecar(
+                Arc::clone(&state.hw_telemetry),
+                Arc::clone(&state.hw_sidecar_child),
+            );
+        }
+    }
+
+    // Читаем базовые данные процессора из sysinfo для обогащения или fallback-ответа
+    let (fallback_cpu_name, fallback_clock_mhz) = if let Ok(mut sys) = state.sys.lock() {
+        sys.refresh_cpu_frequency();
+        let cpus = sys.cpus();
+        let name = cpus
+            .first()
+            .map(|c| c.brand().trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Процессор x64".to_string());
+        let avg_freq = if !cpus.is_empty() {
+            let sum: u64 = cpus.iter().map(|c| c.frequency()).sum();
+            Some((sum as f32) / (cpus.len() as f32))
+        } else {
+            None
+        };
+        (name, avg_freq)
+    } else {
+        ("Процессор x64".to_string(), None)
+    };
+
+    if let Ok(guard) = state.hw_telemetry.lock() {
+        if let Some(mut data) = guard.clone() {
+            if data.cpu.name.is_empty() || data.cpu.name == "Процессор" {
+                data.cpu.name = fallback_cpu_name;
+            }
+            if data.cpu.avg_clock_mhz.is_none() {
+                data.cpu.avg_clock_mhz = fallback_clock_mhz;
+            }
+            return Ok(data);
+        }
+    }
+
+    // Если sidecar еще инициализируется, возвращаем частичные метрики без падения
+    let disks = Disks::new_with_refreshed_list();
+    let storage_temps: Vec<StorageTempItem> = disks
+        .iter()
+        .map(|d| {
+            let total = d.total_space() as f32;
+            let used = total - (d.available_space() as f32);
+            let used_pct = if total > 0.0 {
+                Some((used / total) * 100.0)
+            } else {
+                None
+            };
+            let mount = d.mount_point().to_string_lossy().to_string();
+            let disk_name = d.name().to_string_lossy().to_string();
+            StorageTempItem {
+                name: if disk_name.is_empty() {
+                    format!("Накопитель ({})", mount)
+                } else {
+                    format!("{} ({})", disk_name, mount)
+                },
+                temp_c: None,
+                used_percent: used_pct,
+            }
+        })
+        .collect();
+
+    Ok(HardwareTelemetry {
+        is_admin: false,
+        sidecar_online: false,
+        timestamp_ms: 0,
+        cpu: CpuTelemetry {
+            name: fallback_cpu_name,
+            package_temp_c: None,
+            max_core_temp_c: None,
+            avg_clock_mhz: fallback_clock_mhz,
+            power_watts: None,
+            voltage_v: None,
+            core_temps: Vec::new(),
+        },
+        gpus: Vec::new(),
+        motherboard_name: "Ожидание инициализации датчиков LibreHardwareMonitor...".to_string(),
+        motherboard_temps: Vec::new(),
+        system_fans: Vec::new(),
+        storage_temps,
+    })
 }
 
 // Раскрытие переменных окружения Windows вида %VAR%
@@ -151,8 +413,6 @@ fn extract_clean_path(raw_command: &str) -> String {
         }
     };
 
-    // Если указано только имя системного файла (например, SecurityHealthSystray.exe),
-    // проверяем его наличие в System32 и папке Windows
     if !candidate.is_empty() && !candidate.contains('\\') && !candidate.contains('/') {
         if let Ok(windir) = std::env::var("WINDIR") {
             let sys32 = Path::new(&windir).join("System32").join(&candidate);
@@ -234,7 +494,6 @@ fn scan_startup_folder(dir_path: &Path, items: &mut Vec<StartupItem>, seen_ids: 
         };
         let file_name = file_name_os.to_string_lossy().to_string();
 
-        // Пропускаем служебный файл Windows
         if file_name.eq_ignore_ascii_case("desktop.ini") {
             continue;
         }
@@ -281,7 +540,6 @@ fn get_startup_items() -> Result<Vec<StartupItem>, String> {
 
     #[cfg(target_os = "windows")]
     {
-        // 1. Активные записи реестра
         read_registry_run_items(
             HKEY_CURRENT_USER,
             RUN_KEY_PATH,
@@ -310,7 +568,6 @@ fn get_startup_items() -> Result<Vec<StartupItem>, String> {
             &mut items,
         );
 
-        // 2. Отключенные через NEXUS записи в HKCU\Software\Nexus\DisabledStartup
         let disabled_sources = [
             ("HKCU_RUN", "HKCU (Реестр)"),
             ("HKLM_RUN", "HKLM (Система)"),
@@ -329,7 +586,6 @@ fn get_startup_items() -> Result<Vec<StartupItem>, String> {
             );
         }
 
-        // Поддержка плоских значений непосредственно в HKCU\Software\Nexus\DisabledStartup
         read_registry_run_items(
             HKEY_CURRENT_USER,
             NEXUS_DISABLED_REG_BASE,
@@ -341,7 +597,6 @@ fn get_startup_items() -> Result<Vec<StartupItem>, String> {
         );
     }
 
-    // 3. Папки автозагрузки (Пользовательская и Общая)
     if let Ok(appdata) = std::env::var("APPDATA") {
         let user_startup: PathBuf = Path::new(&appdata)
             .join("Microsoft")
@@ -549,11 +804,9 @@ async fn scan_storage(path: String) -> Result<ScanResult, String> {
         let mut total_scanned_bytes: u64 = 0;
         let mut total_files_count: u64 = 0;
 
-        // Мин-куча для хранения ТОП-100 самых тяжелых файлов: Reverse((size_bytes, path, name, ext))
         let mut top_heap: BinaryHeap<Reverse<(u64, String, String, String)>> =
             BinaryHeap::with_capacity(101);
 
-        // Категории файлов
         let mut cat_video: u64 = 0;
         let mut cat_games_soft: u64 = 0;
         let mut cat_archives: u64 = 0;
@@ -561,7 +814,6 @@ async fn scan_storage(path: String) -> Result<ScanResult, String> {
         let mut cat_docs: u64 = 0;
         let mut cat_other: u64 = 0;
 
-        // Размеры папок до 3 уровней глубины относительно root_path
         let mut level1_sizes: HashMap<String, u64> = HashMap::new();
         let mut level2_sizes: HashMap<(String, String), u64> = HashMap::new();
         let mut level3_sizes: HashMap<(String, String, String), u64> = HashMap::new();
@@ -570,7 +822,6 @@ async fn scan_storage(path: String) -> Result<ScanResult, String> {
         let walker = jwalk::WalkDir::new(&root_path)
             .skip_hidden(false)
             .process_read_dir(|_depth, _path, _state, children| {
-                // Игнорируем защищенные системные каталоги тома
                 children.retain(|dir_entry_res| {
                     if let Ok(dir_entry) = dir_entry_res {
                         let name = dir_entry.file_name.to_string_lossy();
@@ -612,18 +863,14 @@ async fn scan_storage(path: String) -> Result<ScanResult, String> {
                 _ => cat_other = cat_other.saturating_add(size),
             }
 
-            // Пополнение ТОП-100 крупнейших файлов
             let qualifies = top_heap.len() < 100
                 || top_heap
                     .peek()
-                    .map(| smallest| size > smallest.0 .0)
+                    .map(|smallest| size > smallest.0 .0)
                     .unwrap_or(true);
 
             if qualifies && size > 0 {
-                let file_name = entry
-                    .file_name()
-                    .to_string_lossy()
-                    .to_string();
+                let file_name = entry.file_name().to_string_lossy().to_string();
                 let full_path_str = entry_path.to_string_lossy().to_string();
                 top_heap.push(Reverse((size, full_path_str, file_name, ext)));
                 if top_heap.len() > 100 {
@@ -631,7 +878,6 @@ async fn scan_storage(path: String) -> Result<ScanResult, String> {
                 }
             }
 
-            // Учет иерархии папок (до 3 уровней глубины для Treemap)
             if let Ok(rel) = entry_path.strip_prefix(&root_path) {
                 let mut comps = rel.components().filter_map(|c| match c {
                     std::path::Component::Normal(os) => Some(os.to_string_lossy().to_string()),
@@ -645,20 +891,16 @@ async fn scan_storage(path: String) -> Result<ScanResult, String> {
 
                 match (first, second, third, fourth) {
                     (Some(_file_in_root), None, _, _) => {
-                        // Файл лежит прямо в корне сканируемой папки/диска
                         root_direct_files_bytes = root_direct_files_bytes.saturating_add(size);
                     }
                     (Some(c1), Some(_c2_or_file), None, _) => {
-                        // Файл лежит на глубине 1 папки (root/c1/file)
                         *level1_sizes.entry(c1).or_insert(0) += size;
                     }
                     (Some(c1), Some(c2), Some(_c3_or_file), None) => {
-                        // Файл лежит на глубине 2 папок (root/c1/c2/file)
                         *level1_sizes.entry(c1.clone()).or_insert(0) += size;
                         *level2_sizes.entry((c1, c2)).or_insert(0) += size;
                     }
                     (Some(c1), Some(c2), Some(c3), Some(_)) => {
-                        // Файл лежит на глубине >= 3 папок (root/c1/c2/c3/...)
                         *level1_sizes.entry(c1.clone()).or_insert(0) += size;
                         *level2_sizes.entry((c1.clone(), c2.clone())).or_insert(0) += size;
                         *level3_sizes.entry((c1, c2, c3)).or_insert(0) += size;
@@ -668,7 +910,6 @@ async fn scan_storage(path: String) -> Result<ScanResult, String> {
             }
         }
 
-        // Формируем отсортированный по убыванию список ТОП-100 файлов
         let mut top_files: Vec<FileEntry> = top_heap
             .into_iter()
             .map(|Reverse((size_bytes, path, name, extension))| FileEntry {
@@ -680,7 +921,6 @@ async fn scan_storage(path: String) -> Result<ScanResult, String> {
             .collect();
         top_files.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
 
-        // Собираем дерево папок (топ-10 на каждом уровне) для Treemap
         let mut l1_vec: Vec<(String, u64)> = level1_sizes.into_iter().collect();
         l1_vec.sort_by(|a, b| b.1.cmp(&a.1));
         l1_vec.truncate(10);
@@ -690,7 +930,6 @@ async fn scan_storage(path: String) -> Result<ScanResult, String> {
             .map(|(c1_name, c1_size)| {
                 let c1_path = root_path.join(&c1_name);
 
-                // Находим топ-10 подпапок 2-го уровня внутри c1
                 let mut l2_vec: Vec<(String, u64)> = level2_sizes
                     .iter()
                     .filter(|((parent_c1, _), _)| parent_c1 == &c1_name)
@@ -704,7 +943,6 @@ async fn scan_storage(path: String) -> Result<ScanResult, String> {
                     .map(|(c2_name, c2_size)| {
                         let c2_path = c1_path.join(&c2_name);
 
-                        // Находим топ-10 подпапок 3-го уровня внутри (c1, c2)
                         let mut l3_vec: Vec<(String, u64)> = level3_sizes
                             .iter()
                             .filter(|((p1, p2, _), _)| p1 == &c1_name && p2 == &c2_name)
@@ -790,7 +1028,6 @@ async fn scan_storage(path: String) -> Result<ScanResult, String> {
 fn get_system_metrics(state: State<'_, AppState>) -> SystemMetrics {
     let mut sys = state.sys.lock().unwrap();
 
-    // Обновляем процессор и память (включая Swap)
     sys.refresh_cpu_usage();
     sys.refresh_memory();
 
@@ -806,7 +1043,6 @@ fn get_system_metrics(state: State<'_, AppState>) -> SystemMetrics {
     let swap_used_gb = sys.used_swap() as f32 / 1024.0 / 1024.0 / 1024.0;
     let swap_total_gb = sys.total_swap() as f32 / 1024.0 / 1024.0 / 1024.0;
 
-    // Обновляем сетевые интерфейсы и считаем дельту трафика (КБ/с)
     let (net_rx_kbps, net_tx_kbps) = if let Ok(mut networks) = state.networks.lock() {
         networks.refresh(true);
         let mut total_rx_bytes: u64 = 0;
@@ -825,7 +1061,6 @@ fn get_system_metrics(state: State<'_, AppState>) -> SystemMetrics {
         (0.0, 0.0)
     };
 
-    // Читаем системный диск
     let disks = Disks::new_with_refreshed_list();
     let (disk_free_gb, disk_total_gb) = disks
         .first()
@@ -857,8 +1092,6 @@ fn schedule_shutdown(seconds: u64, restart: bool) -> Result<(), String> {
         return Err("Время таймера должно быть больше 0 секунд".to_string());
     }
 
-    // Сначала отменяем предыдущий запланированный таймер (если он был),
-    // чтобы избежать системной ошибки Windows 1190 при повторном запуске.
     let mut abort_cmd = Command::new("shutdown");
     abort_cmd.arg("/a");
     #[cfg(target_os = "windows")]
@@ -902,7 +1135,6 @@ fn cancel_shutdown() -> Result<(), String> {
         .output()
         .map_err(|e| format!("Не удалось вызвать отмену выключения: {}", e))?;
 
-    // Код 1116 в Windows означает, что запланированного выключения уже нет
     if output.status.success() || output.status.code() == Some(1116) {
         Ok(())
     } else {
@@ -924,11 +1156,31 @@ pub fn run() {
     sys.refresh_all(); // Первичный прогрев датчиков
 
     let networks = Networks::new_with_refreshed_list();
+    let hw_telemetry = Arc::new(Mutex::new(None));
+    let hw_sidecar_child = Arc::new(Mutex::new(None));
+
+    // Запускаем фоновый C# sidecar-процесс мониторинга железа
+    spawn_hwmon_sidecar(Arc::clone(&hw_telemetry), Arc::clone(&hw_sidecar_child));
+
+    let child_for_exit = Arc::clone(&hw_sidecar_child);
 
     tauri::Builder::default()
         .manage(AppState {
             sys: Mutex::new(sys),
             networks: Mutex::new(networks),
+            hw_telemetry,
+            hw_sidecar_child,
+        })
+        .on_window_event(move |window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                if window.label() == "main" {
+                    if let Ok(mut guard) = child_for_exit.lock() {
+                        if let Some(mut child) = guard.take() {
+                            let _ = child.kill();
+                        }
+                    }
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_system_metrics,
@@ -938,7 +1190,8 @@ pub fn run() {
             toggle_startup_item,
             open_item_location,
             get_available_drives,
-            scan_storage
+            scan_storage,
+            get_hardware_telemetry
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -28,6 +28,11 @@ import {
   ChevronRight,
   CornerUpLeft,
   Loader2,
+  Gauge,
+  Thermometer,
+  Fan,
+  ShieldCheck,
+  Flame,
 } from "lucide-react";
 
 interface Metrics {
@@ -83,6 +88,63 @@ interface TreemapRect {
   w: number;
   h: number;
   colorIndex: number;
+}
+
+interface CoreTemp {
+  name: string;
+  temp_c: number;
+}
+
+interface CpuTelemetry {
+  name: string;
+  package_temp_c: number | null;
+  max_core_temp_c: number | null;
+  avg_clock_mhz: number | null;
+  power_watts: number | null;
+  voltage_v: number | null;
+  core_temps: CoreTemp[];
+}
+
+interface GpuTelemetry {
+  name: string;
+  core_temp_c: number | null;
+  hotspot_temp_c: number | null;
+  memory_temp_c: number | null;
+  core_clock_mhz: number | null;
+  memory_clock_mhz: number | null;
+  fan_rpm: number | null;
+  fan_percent: number | null;
+  power_watts: number | null;
+  voltage_v: number | null;
+}
+
+interface FanSensorItem {
+  name: string;
+  rpm: number;
+  percent: number | null;
+}
+
+interface TempSensorItem {
+  name: string;
+  temp_c: number;
+}
+
+interface StorageTempItem {
+  name: string;
+  temp_c: number | null;
+  used_percent: number | null;
+}
+
+interface HardwareTelemetry {
+  is_admin: boolean;
+  sidecar_online: boolean;
+  timestamp_ms: number;
+  cpu: CpuTelemetry;
+  gpus: GpuTelemetry[];
+  motherboard_name: string;
+  motherboard_temps: TempSensorItem[];
+  system_fans: FanSensorItem[];
+  storage_temps: StorageTempItem[];
 }
 
 interface HistoryPoint {
@@ -188,6 +250,51 @@ function formatBytes(bytes: number): string {
   const kb = bytes / 1024;
   if (kb >= 1) return `${kb.toFixed(0)} КБ`;
   return `${bytes} Б`;
+}
+
+// Цветовая индикация температуры (<65°C — зеленый, 65-80°C — янтарный, >80°C — рубиновый)
+function getTempBadgeStyle(tempC: number | null | undefined): {
+  badgeClass: string;
+  textClass: string;
+  barClass: string;
+  label: string;
+} {
+  if (tempC === null || tempC === undefined || !Number.isFinite(tempC)) {
+    return {
+      badgeClass: "bg-zinc-800/80 text-zinc-400 border-white/[0.08]",
+      textClass: "text-zinc-400",
+      barClass: "bg-zinc-600",
+      label: "Н/Д",
+    };
+  }
+  if (tempC > 80) {
+    return {
+      badgeClass:
+        "bg-rose-500/15 text-rose-400 border-rose-500/35 shadow-[0_0_14px_rgba(244,63,94,0.25)]",
+      textClass: "text-rose-400",
+      barClass:
+        "bg-gradient-to-r from-rose-500 to-red-400 shadow-[0_0_12px_rgba(244,63,94,0.6)]",
+      label: "Горячо",
+    };
+  }
+  if (tempC >= 65) {
+    return {
+      badgeClass:
+        "bg-amber-500/15 text-amber-400 border-amber-500/35 shadow-[0_0_14px_rgba(245,158,11,0.2)]",
+      textClass: "text-amber-400",
+      barClass:
+        "bg-gradient-to-r from-amber-500 to-yellow-400 shadow-[0_0_12px_rgba(245,158,11,0.5)]",
+      label: "Нагрузка",
+    };
+  }
+  return {
+    badgeClass:
+      "bg-emerald-500/15 text-emerald-400 border-emerald-500/30 shadow-[0_0_14px_rgba(52,211,153,0.18)]",
+    textClass: "text-emerald-400",
+    barClass:
+      "bg-gradient-to-r from-emerald-500 to-teal-400 shadow-[0_0_12px_rgba(52,211,153,0.45)]",
+    label: "Норма",
+  };
 }
 
 function getCategoryStyle(category: string): {
@@ -491,7 +598,6 @@ const LoadHistoryChart = memo(function LoadHistoryChart({
 
         {/* Область SVG-графика */}
         <div className="relative h-52 w-full select-none">
-          {/* Подписи оси Y */}
           <div className="pointer-events-none absolute inset-y-0 left-2 flex flex-col justify-between text-[10px] font-mono text-zinc-500/80 py-2 z-10">
             <span>100%</span>
             <span>75%</span>
@@ -500,7 +606,6 @@ const LoadHistoryChart = memo(function LoadHistoryChart({
             <span>0%</span>
           </div>
 
-          {/* Анимированный плавающий бейдж при наведении */}
           <AnimatePresence>
             {hoverIndex !== null && history[hoverIndex] && (
               <motion.div
@@ -537,7 +642,6 @@ const LoadHistoryChart = memo(function LoadHistoryChart({
             onMouseLeave={() => setHoverIndex(null)}
           >
             <defs>
-              {/* Неоновый фильтр свечения для линий CPU и RAM */}
               <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
                 <feGaussianBlur stdDeviation="3.2" result="blur" />
                 <feMerge>
@@ -558,7 +662,6 @@ const LoadHistoryChart = memo(function LoadHistoryChart({
               </linearGradient>
             </defs>
 
-            {/* Горизонтальная сетка */}
             {[0.25, 0.5, 0.75].map((ratio) => (
               <line
                 key={ratio}
@@ -573,7 +676,6 @@ const LoadHistoryChart = memo(function LoadHistoryChart({
               />
             ))}
 
-            {/* Заливка и неоновая линия RAM (голубой / cyan) */}
             <path d={ramPaths.area} fill="url(#ramAreaGrad)" />
             <path
               d={ramPaths.line}
@@ -585,7 +687,6 @@ const LoadHistoryChart = memo(function LoadHistoryChart({
               filter="url(#glow)"
             />
 
-            {/* Заливка и неоновая линия CPU (зелёный / emerald) */}
             <path d={cpuPaths.area} fill="url(#cpuAreaGrad)" />
             <path
               d={cpuPaths.line}
@@ -597,7 +698,6 @@ const LoadHistoryChart = memo(function LoadHistoryChart({
               filter="url(#glow)"
             />
 
-            {/* Анимированное перекрестие и узловые точки при наведении */}
             {hoverIndex !== null && hoverCoordCpu && hoverCoordRam && (
               <g>
                 <line
@@ -632,7 +732,6 @@ const LoadHistoryChart = memo(function LoadHistoryChart({
             )}
           </svg>
 
-          {/* Подписи оси X */}
           <div className="flex justify-between text-[10px] font-mono text-zinc-500 mt-1.5 px-1">
             <span>-60 сек</span>
             <span>-30 сек</span>
@@ -646,7 +745,7 @@ const LoadHistoryChart = memo(function LoadHistoryChart({
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<
-    "dashboard" | "startup" | "storage" | "power"
+    "dashboard" | "startup" | "storage" | "hardware" | "power"
   >("dashboard");
   const [metrics, setMetrics] = useState<Metrics>({
     cpu_usage: 0,
@@ -680,6 +779,9 @@ export default function App() {
     null
   );
   const [fileSearch, setFileSearch] = useState<string>("");
+
+  // Состояние модуля Hardware Monitor (Мониторинг железа)
+  const [hwData, setHwData] = useState<HardwareTelemetry | null>(null);
 
   // Состояние модуля управления питанием
   const [restartMode, setRestartMode] = useState<boolean>(false);
@@ -735,6 +837,24 @@ export default function App() {
     const interval = setInterval(fetchMetrics, 1000);
     return () => clearInterval(interval);
   }, []);
+
+  // Опрос датчиков LibreHardwareMonitor раз в 1 секунду при активной вкладке «Железо»
+  useEffect(() => {
+    if (activeTab !== "hardware") return;
+
+    const fetchHwTelemetry = async () => {
+      try {
+        const data = await invoke<HardwareTelemetry>("get_hardware_telemetry");
+        setHwData(data);
+      } catch (err) {
+        console.error("Ошибка получения аппаратной телеметрии:", err);
+      }
+    };
+
+    fetchHwTelemetry();
+    const interval = setInterval(fetchHwTelemetry, 1000);
+    return () => clearInterval(interval);
+  }, [activeTab]);
 
   // Загрузка списка автозагрузки при переходе на вкладку «Автозагрузка»
   const fetchStartupItems = async () => {
@@ -811,7 +931,6 @@ export default function App() {
     const nextEnabled = !item.enabled;
     setStartupError(null);
 
-    // Оптимистичное обновление состояния в UI
     setStartupItems((prev) =>
       prev.map((entry) =>
         entry.id === item.id ? { ...entry, enabled: nextEnabled } : entry
@@ -826,7 +945,6 @@ export default function App() {
     } catch (err) {
       console.error("Ошибка переключения автозагрузки:", err);
       setStartupError(String(err));
-      // Откат при ошибке
       setStartupItems((prev) =>
         prev.map((entry) =>
           entry.id === item.id ? { ...entry, enabled: item.enabled } : entry
@@ -982,6 +1100,29 @@ export default function App() {
     );
   });
 
+  // Проверка перегрева для блока предупреждений Hardware Monitor (> 85°C)
+  const thermalWarnings: string[] = [];
+  if (hwData) {
+    if (hwData.cpu.package_temp_c !== null && hwData.cpu.package_temp_c > 85) {
+      thermalWarnings.push(
+        `Повышенный нагрев CPU Package: ${hwData.cpu.package_temp_c.toFixed(1)}°C`
+      );
+    }
+    for (const g of hwData.gpus) {
+      if (g.hotspot_temp_c !== null && g.hotspot_temp_c > 85) {
+        thermalWarnings.push(
+          `Повышенный нагрев GPU Hotspot (${g.name}): ${g.hotspot_temp_c.toFixed(1)}°C`
+        );
+      } else if (g.core_temp_c !== null && g.core_temp_c > 85) {
+        thermalWarnings.push(
+          `Повышенный нагрев GPU Core (${g.name}): ${g.core_temp_c.toFixed(1)}°C`
+        );
+      }
+    }
+  }
+
+  const cpuTempStyle = getTempBadgeStyle(hwData?.cpu.package_temp_c);
+
   return (
     <div className="relative flex h-screen w-screen bg-[#0a0c10] text-zinc-200 select-none overflow-hidden font-sans">
       {/* Фоновое кибер-графитовое ambient-свечение для глубины стекла */}
@@ -1085,7 +1226,34 @@ export default function App() {
               )}
             </motion.button>
 
-            {/* 4. Кнопка вкладки Power Manager */}
+            {/* 4. Кнопка вкладки Hardware Monitor («Железо») */}
+            <motion.button
+              type="button"
+              whileTap={{ scale: 0.97 }}
+              onClick={() => setActiveTab("hardware")}
+              className={`relative w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-sm font-medium transition-colors cursor-pointer ${
+                activeTab === "hardware"
+                  ? "text-emerald-400"
+                  : "text-zinc-400 hover:text-zinc-200"
+              }`}
+            >
+              {activeTab === "hardware" && (
+                <motion.div
+                  layoutId="activeTabPill"
+                  transition={{ type: "spring", stiffness: 380, damping: 30 }}
+                  className="absolute inset-0 rounded-xl bg-gradient-to-r from-emerald-500/15 via-zinc-800/80 to-zinc-800/50 border border-emerald-500/25 shadow-[0_0_20px_rgba(52,211,153,0.12)]"
+                />
+              )}
+              <span className="relative z-10 flex items-center gap-3">
+                <Gauge size={18} />
+                <span>Железо</span>
+              </span>
+              {thermalWarnings.length > 0 && (
+                <span className="relative z-10 h-2 w-2 rounded-full bg-rose-500 shadow-[0_0_8px_#f43f5e] animate-ping" />
+              )}
+            </motion.button>
+
+            {/* 5. Кнопка вкладки Power Manager */}
             <motion.button
               type="button"
               whileTap={{ scale: 0.97 }}
@@ -1124,7 +1292,7 @@ export default function App() {
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
               <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-400 shadow-[0_0_10px_#34d399]"></span>
             </span>
-            sysinfo online
+            sysinfo + hwmon
           </span>
         </div>
       </aside>
@@ -1150,7 +1318,6 @@ export default function App() {
                 </p>
               </div>
 
-              {/* Каскадная сетка из 4 Spotlight-карточек */}
               <motion.div
                 variants={cardsContainerVariants}
                 initial="hidden"
@@ -1220,7 +1387,6 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Компактная строка/шкала файла подкачки (Swap) */}
                   <div className="mt-3 pt-2.5 border-t border-white/[0.06] space-y-1.5">
                     <div className="flex items-center justify-between text-xs font-mono">
                       <span className="text-zinc-500">Swap (подкачка):</span>
@@ -1326,7 +1492,6 @@ export default function App() {
                 </SpotlightCard>
               </motion.div>
 
-              {/* Блок «История нагрузки (последние 60 сек)» */}
               <motion.div
                 variants={cardsContainerVariants}
                 initial="hidden"
@@ -1346,7 +1511,6 @@ export default function App() {
               transition={{ duration: 0.25, ease: "easeOut" }}
               className="space-y-6 max-w-6xl w-full"
             >
-              {/* Шапка и краткая статистика */}
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                 <div>
                   <h2 className="text-2xl font-bold text-zinc-100 tracking-tight">
@@ -1390,7 +1554,6 @@ export default function App() {
                 </motion.button>
               </div>
 
-              {/* Поиск / фильтрация */}
               <div className="relative">
                 <Search
                   size={16}
@@ -1418,7 +1581,6 @@ export default function App() {
                 )}
               </AnimatePresence>
 
-              {/* Список карточек автозагрузки */}
               <motion.div
                 variants={cardsContainerVariants}
                 initial="hidden"
@@ -1511,7 +1673,6 @@ export default function App() {
                             <FolderOpen size={16} />
                           </motion.button>
 
-                          {/* Анимированный тумблер Вкл / Выкл */}
                           <button
                             type="button"
                             role="switch"
@@ -1555,7 +1716,6 @@ export default function App() {
               transition={{ duration: 0.25, ease: "easeOut" }}
               className="space-y-6 max-w-6xl w-full"
             >
-              {/* Заголовок */}
               <div>
                 <h2 className="text-2xl font-bold text-zinc-100 tracking-tight">
                   Анализатор накопителей (Storage Analyzer)
@@ -1565,14 +1725,12 @@ export default function App() {
                 </p>
               </div>
 
-              {/* Панель управления сканированием */}
               <SpotlightCard
                 spotlightColor="rgba(52, 211, 153, 0.12)"
                 className="p-5 sm:p-6"
               >
                 <div className="space-y-4">
                   <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-                    {/* Быстрый выбор диска */}
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="text-xs font-mono uppercase tracking-wider text-zinc-400 mr-1">
                         Диски:
@@ -1600,7 +1758,6 @@ export default function App() {
                       })}
                     </div>
 
-                    {/* Ввод произвольной папки и кнопка старта */}
                     <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 flex-1 lg:max-w-xl">
                       <input
                         type="text"
@@ -1636,7 +1793,6 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Пульсирующий индикатор активного сканирования */}
                   <AnimatePresence>
                     {isScanning && (
                       <motion.div
@@ -1663,7 +1819,6 @@ export default function App() {
                     )}
                   </AnimatePresence>
 
-                  {/* Вывод ошибки */}
                   <AnimatePresence>
                     {scanError && (
                       <motion.div
@@ -1679,7 +1834,6 @@ export default function App() {
                 </div>
               </SpotlightCard>
 
-              {/* Результаты сканирования */}
               {scanResult && (
                 <motion.div
                   variants={cardsContainerVariants}
@@ -1687,7 +1841,6 @@ export default function App() {
                   animate="show"
                   className="space-y-6"
                 >
-                  {/* 1. Сводка и распределение по категориям */}
                   <SpotlightCard
                     variants={cardItemVariants}
                     spotlightColor="rgba(34, 211, 238, 0.12)"
@@ -1724,7 +1877,6 @@ export default function App() {
                         </motion.button>
                       </div>
 
-                      {/* Мультисегментная шкала категорий */}
                       <div className="space-y-3">
                         <div className="w-full h-3 rounded-full bg-zinc-950/90 border border-white/[0.06] overflow-hidden flex p-0.5 gap-0.5">
                           {scanResult.category_sizes.map(([catName, catBytes]) => {
@@ -1745,7 +1897,6 @@ export default function App() {
                           })}
                         </div>
 
-                        {/* Легенда категорий */}
                         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 pt-1">
                           {scanResult.category_sizes.map(([catName, catBytes]) => {
                             const pct =
@@ -1780,14 +1931,12 @@ export default function App() {
                     </div>
                   </SpotlightCard>
 
-                  {/* 2. Интерактивный Treemap (Плиточная карта папок) */}
                   <SpotlightCard
                     variants={cardItemVariants}
                     spotlightColor="rgba(52, 211, 153, 0.1)"
                     className="p-5 sm:p-6"
                   >
                     <div className="space-y-4">
-                      {/* Шапка Treemap и хлебные крошки уровней */}
                       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                         <div>
                           <h3 className="text-base font-semibold text-zinc-100">
@@ -1834,7 +1983,6 @@ export default function App() {
                         )}
                       </div>
 
-                      {/* Мозаика Treemap */}
                       <div className="relative w-full h-80 rounded-2xl bg-[#080a0e] border border-white/[0.07] overflow-hidden p-1.5">
                         {treemapRects.length === 0 ? (
                           <div className="w-full h-full flex items-center justify-center text-xs font-mono text-zinc-500">
@@ -1919,7 +2067,6 @@ export default function App() {
                         )}
                       </div>
 
-                      {/* Инспектор выбранного блока Treemap */}
                       {selectedTreemapNode && (
                         <div className="p-4 rounded-xl bg-zinc-950/85 border border-white/[0.08] flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                           <div className="min-w-0 space-y-1">
@@ -1987,7 +2134,6 @@ export default function App() {
                     </div>
                   </SpotlightCard>
 
-                  {/* 3. Таблица ТОП-100 самых тяжелых файлов */}
                   <SpotlightCard
                     variants={cardItemVariants}
                     spotlightColor="rgba(34, 211, 238, 0.1)"
@@ -2107,6 +2253,566 @@ export default function App() {
             </motion.div>
           )}
 
+          {activeTab === "hardware" && (
+            <motion.div
+              key="hardware"
+              initial={{ opacity: 0, y: 12 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
+              transition={{ duration: 0.25, ease: "easeOut" }}
+              className="space-y-6 max-w-6xl w-full"
+            >
+              {/* Заголовок и статус LibreHardwareMonitor */}
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-2xl font-bold text-zinc-100 tracking-tight">
+                    Аппаратный мониторинг (Hardware Monitor)
+                  </h2>
+                  <p className="text-sm text-zinc-400 mt-1">
+                    Глубокая телеметрия датчиков CPU, GPU Hotspot, кулеров и накопителей (LibreHardwareMonitor)
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-2.5 self-start sm:self-auto">
+                  <span
+                    className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-mono border ${
+                      hwData?.sidecar_online
+                        ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/25"
+                        : "bg-amber-500/10 text-amber-400 border-amber-500/25"
+                    }`}
+                  >
+                    <span
+                      className={`h-2 w-2 rounded-full ${
+                        hwData?.sidecar_online
+                          ? "bg-emerald-400 animate-pulse"
+                          : "bg-amber-400"
+                      }`}
+                    />
+                    {hwData?.sidecar_online ? "LHM Sidecar Online" : "Инициализация..."}
+                  </span>
+
+                  <span
+                    className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-mono border ${
+                      hwData?.is_admin
+                        ? "bg-cyan-500/10 text-cyan-400 border-cyan-500/25"
+                        : "bg-zinc-900/80 text-zinc-400 border-white/[0.07]"
+                    }`}
+                    title="Для чтения низкоуровневых датчиков кулеров SuperIO и температур ядер рекомендуется запуск от имени Администратора"
+                  >
+                    <ShieldCheck size={14} />
+                    {hwData?.is_admin ? "Admin Mode" : "Standard Mode"}
+                  </span>
+                </div>
+              </div>
+
+              {/* 1. Блок предупреждений / Health Status */}
+              {thermalWarnings.length > 0 ? (
+                <motion.div
+                  initial={{ opacity: 0, scale: 0.98 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  className="p-4 sm:p-5 rounded-2xl backdrop-blur-xl bg-gradient-to-r from-rose-500/20 via-amber-500/15 to-zinc-900/80 border border-rose-500/40 shadow-[0_0_30px_rgba(244,63,94,0.25)] flex items-start gap-3.5"
+                >
+                  <div className="p-2.5 rounded-xl bg-rose-500/20 border border-rose-500/40 text-rose-400 shrink-0">
+                    <Flame size={20} className="animate-pulse" />
+                  </div>
+                  <div className="space-y-1">
+                    <h3 className="text-sm font-bold text-rose-300 uppercase tracking-wider font-mono">
+                      Внимание: критический температурный режим (&gt; 85°C)
+                    </h3>
+                    <ul className="text-xs sm:text-sm font-mono text-zinc-100 space-y-0.5">
+                      {thermalWarnings.map((warn, i) => (
+                        <li key={i}>• {warn}</li>
+                      ))}
+                    </ul>
+                  </div>
+                </motion.div>
+              ) : (
+                <div className="p-4 rounded-2xl backdrop-blur-xl bg-emerald-500/[0.06] border border-emerald-500/20 flex items-center justify-between gap-4">
+                  <div className="flex items-center gap-3">
+                    <div className="p-2 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-400">
+                      <Thermometer size={18} />
+                    </div>
+                    <div>
+                      <div className="text-sm font-semibold text-zinc-100">
+                        Температурный режим всех узлов в пределах нормы
+                      </div>
+                      <div className="text-xs font-mono text-zinc-400">
+                        Порог тревоги CPU Package / GPU Hotspot: 85.0°C • Плата:{" "}
+                        <span className="text-zinc-300">
+                          {hwData?.motherboard_name || "Определяется..."}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                  <span className="hidden sm:inline-flex text-xs font-mono px-2.5 py-1 rounded-lg bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                    HEALTH OK
+                  </span>
+                </div>
+              )}
+
+              {/* Сетка карточек: CPU и GPU */}
+              <motion.div
+                variants={cardsContainerVariants}
+                initial="hidden"
+                animate="show"
+                className="grid grid-cols-1 lg:grid-cols-2 gap-5"
+              >
+                {/* 2. Карточка CPU */}
+                <SpotlightCard
+                  variants={cardItemVariants}
+                  spotlightColor="rgba(52, 211, 153, 0.14)"
+                  className="p-5 sm:p-6"
+                >
+                  <div className="space-y-5">
+                    <div className="flex items-start justify-between gap-3 pb-4 border-b border-white/[0.06]">
+                      <div className="flex items-center gap-3 min-w-0">
+                        <div className="p-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/25 text-emerald-400 shrink-0">
+                          <Cpu size={20} />
+                        </div>
+                        <div className="min-w-0">
+                          <span className="text-[11px] font-mono uppercase tracking-wider text-zinc-400">
+                            Центральный процессор (CPU)
+                          </span>
+                          <h3 className="text-base font-bold text-zinc-100 truncate">
+                            {hwData?.cpu.name || "Определение модели CPU..."}
+                          </h3>
+                        </div>
+                      </div>
+
+                      <span
+                        className={`text-xs font-mono px-2.5 py-1 rounded-lg border shrink-0 ${cpuTempStyle.badgeClass}`}
+                      >
+                        {hwData?.cpu.package_temp_c !== null &&
+                        hwData?.cpu.package_temp_c !== undefined
+                          ? `${hwData.cpu.package_temp_c.toFixed(1)}°C • ${cpuTempStyle.label}`
+                          : "Датчик Т°: Н/Д"}
+                      </span>
+                    </div>
+
+                    {/* Основные показатели CPU */}
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                      <div className="p-3 rounded-xl bg-zinc-950/70 border border-white/[0.05]">
+                        <span className="text-[11px] font-mono text-zinc-500">
+                          CPU Package
+                        </span>
+                        <div
+                          className={`text-xl font-bold font-mono mt-1 ${cpuTempStyle.textClass}`}
+                        >
+                          {hwData?.cpu.package_temp_c != null
+                            ? `${hwData.cpu.package_temp_c.toFixed(1)}°C`
+                            : `${metrics.cpu_usage.toFixed(0)}% исп.`}
+                        </div>
+                      </div>
+
+                      <div className="p-3 rounded-xl bg-zinc-950/70 border border-white/[0.05]">
+                        <span className="text-[11px] font-mono text-zinc-500">
+                          Частота ядер
+                        </span>
+                        <div className="text-xl font-bold font-mono text-zinc-100 mt-1">
+                          {hwData?.cpu.avg_clock_mhz != null
+                            ? `${(hwData.cpu.avg_clock_mhz / 1000).toFixed(2)} ГГц`
+                            : "—"}
+                        </div>
+                      </div>
+
+                      <div className="p-3 rounded-xl bg-zinc-950/70 border border-white/[0.05]">
+                        <span className="text-[11px] font-mono text-zinc-500">
+                          Потребление
+                        </span>
+                        <div className="text-xl font-bold font-mono text-emerald-400 mt-1">
+                          {hwData?.cpu.power_watts != null
+                            ? `${hwData.cpu.power_watts.toFixed(1)} W`
+                            : "—"}
+                        </div>
+                      </div>
+
+                      <div className="p-3 rounded-xl bg-zinc-950/70 border border-white/[0.05]">
+                        <span className="text-[11px] font-mono text-zinc-500">
+                          Вольтаж (VID)
+                        </span>
+                        <div className="text-xl font-bold font-mono text-cyan-400 mt-1">
+                          {hwData?.cpu.voltage_v != null
+                            ? `${hwData.cpu.voltage_v.toFixed(3)} V`
+                            : "—"}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Список температур по ядрам */}
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between text-xs font-mono text-zinc-400">
+                        <span>Датчики ядер процессора</span>
+                        {hwData?.cpu.max_core_temp_c != null && (
+                          <span>
+                            Пик:{" "}
+                            <strong className="text-zinc-200">
+                              {hwData.cpu.max_core_temp_c.toFixed(1)}°C
+                            </strong>
+                          </span>
+                        )}
+                      </div>
+
+                      {hwData?.cpu.core_temps && hwData.cpu.core_temps.length > 0 ? (
+                        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-40 overflow-y-auto pr-1">
+                          {hwData.cpu.core_temps.map((core, idx) => {
+                            const cStyle = getTempBadgeStyle(core.temp_c);
+                            return (
+                              <div
+                                key={core.name + idx}
+                                className="px-3 py-2 rounded-lg bg-zinc-950/60 border border-white/[0.05] flex items-center justify-between text-xs font-mono"
+                              >
+                                <span className="text-zinc-400 truncate mr-2">
+                                  {core.name}
+                                </span>
+                                <span className={`font-bold ${cStyle.textClass}`}>
+                                  {core.temp_c.toFixed(0)}°C
+                                </span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <div className="p-3 rounded-xl bg-zinc-950/50 border border-white/[0.04] text-xs font-mono text-zinc-500">
+                          {hwData?.is_admin
+                            ? "Индивидуальные датчики ядер не предоставлены драйвером CPU"
+                            : "Запустите приложение от имени Администратора для чтения температур отдельных ядер CPU Ring0"}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </SpotlightCard>
+
+                {/* 3. Карточка GPU (с выделенным Hotspot и индикатором вертушек) */}
+                {hwData?.gpus && hwData.gpus.length > 0 ? (
+                  hwData.gpus.map((gpu, gIdx) => {
+                    const hotspotStyle = getTempBadgeStyle(
+                      gpu.hotspot_temp_c ?? gpu.core_temp_c
+                    );
+                    const coreStyle = getTempBadgeStyle(gpu.core_temp_c);
+                    const fanPct = Math.min(100, Math.max(0, gpu.fan_percent ?? 0));
+
+                    return (
+                      <SpotlightCard
+                        key={gpu.name + gIdx}
+                        variants={cardItemVariants}
+                        spotlightColor="rgba(34, 211, 238, 0.14)"
+                        className="p-5 sm:p-6"
+                      >
+                        <div className="space-y-5">
+                          <div className="flex items-start justify-between gap-3 pb-4 border-b border-white/[0.06]">
+                            <div className="flex items-center gap-3 min-w-0">
+                              <div className="p-2.5 rounded-xl bg-cyan-500/10 border border-cyan-500/25 text-cyan-400 shrink-0">
+                                <Activity size={20} />
+                              </div>
+                              <div className="min-w-0">
+                                <span className="text-[11px] font-mono uppercase tracking-wider text-zinc-400">
+                                  Графический адаптер (GPU #{gIdx + 1})
+                                </span>
+                                <h3 className="text-base font-bold text-zinc-100 truncate">
+                                  {gpu.name}
+                                </h3>
+                              </div>
+                            </div>
+
+                            <span
+                              className={`text-xs font-mono px-2.5 py-1 rounded-lg border shrink-0 ${hotspotStyle.badgeClass}`}
+                            >
+                              {hotspotStyle.label}
+                            </span>
+                          </div>
+
+                          {/* Крупный блок температур: Core, HOTSPOT, VRAM */}
+                          <div className="grid grid-cols-3 gap-3">
+                            <div className="p-3.5 rounded-xl bg-zinc-950/70 border border-white/[0.05]">
+                              <span className="text-[11px] font-mono text-zinc-400">
+                                Чип (GPU Core)
+                              </span>
+                              <div
+                                className={`text-2xl font-bold font-mono mt-1 ${coreStyle.textClass}`}
+                              >
+                                {gpu.core_temp_c != null
+                                  ? `${gpu.core_temp_c.toFixed(1)}°C`
+                                  : "—"}
+                              </div>
+                            </div>
+
+                            {/* Выделенный крупно GPU Hotspot */}
+                            <div className="p-3.5 rounded-xl bg-gradient-to-br from-amber-500/15 via-rose-500/10 to-zinc-950 border border-amber-500/35 shadow-[0_0_20px_rgba(245,158,11,0.12)]">
+                              <span className="text-[11px] font-mono uppercase tracking-wider text-amber-300 font-semibold flex items-center gap-1">
+                                <Flame size={12} /> HOTSPOT
+                              </span>
+                              <div
+                                className={`text-2xl sm:text-3xl font-extrabold font-mono mt-0.5 ${hotspotStyle.textClass}`}
+                              >
+                                {gpu.hotspot_temp_c != null
+                                  ? `${gpu.hotspot_temp_c.toFixed(1)}°C`
+                                  : gpu.core_temp_c != null
+                                  ? `${gpu.core_temp_c.toFixed(1)}°C`
+                                  : "—"}
+                              </div>
+                            </div>
+
+                            <div className="p-3.5 rounded-xl bg-zinc-950/70 border border-white/[0.05]">
+                              <span className="text-[11px] font-mono text-zinc-400">
+                                Память (VRAM)
+                              </span>
+                              <div className="text-2xl font-bold font-mono text-cyan-400 mt-1">
+                                {gpu.memory_temp_c != null
+                                  ? `${gpu.memory_temp_c.toFixed(1)}°C`
+                                  : "—"}
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* Частоты, питание и вольтаж */}
+                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs font-mono">
+                            <div className="p-2.5 rounded-xl bg-zinc-950/60 border border-white/[0.04]">
+                              <span className="text-zinc-500 block">Ядро МГц</span>
+                              <span className="text-zinc-100 font-bold text-sm">
+                                {gpu.core_clock_mhz != null
+                                  ? `${gpu.core_clock_mhz.toFixed(0)} MHz`
+                                  : "—"}
+                              </span>
+                            </div>
+                            <div className="p-2.5 rounded-xl bg-zinc-950/60 border border-white/[0.04]">
+                              <span className="text-zinc-500 block">Память МГц</span>
+                              <span className="text-zinc-100 font-bold text-sm">
+                                {gpu.memory_clock_mhz != null
+                                  ? `${gpu.memory_clock_mhz.toFixed(0)} MHz`
+                                  : "—"}
+                              </span>
+                            </div>
+                            <div className="p-2.5 rounded-xl bg-zinc-950/60 border border-white/[0.04]">
+                              <span className="text-zinc-500 block">Потребление</span>
+                              <span className="text-emerald-400 font-bold text-sm">
+                                {gpu.power_watts != null
+                                  ? `${gpu.power_watts.toFixed(1)} W`
+                                  : "—"}
+                              </span>
+                            </div>
+                            <div className="p-2.5 rounded-xl bg-zinc-950/60 border border-white/[0.04]">
+                              <span className="text-zinc-500 block">Вольтаж</span>
+                              <span className="text-cyan-400 font-bold text-sm">
+                                {gpu.voltage_v != null
+                                  ? `${gpu.voltage_v.toFixed(3)} V`
+                                  : "—"}
+                              </span>
+                            </div>
+                          </div>
+
+                          {/* Индикатор вертушек GPU (RPM и шкала %) */}
+                          <div className="p-3.5 rounded-xl bg-zinc-950/80 border border-white/[0.06] space-y-2">
+                            <div className="flex items-center justify-between text-xs font-mono">
+                              <span className="flex items-center gap-2 text-zinc-300">
+                                <Fan
+                                  size={15}
+                                  className={
+                                    (gpu.fan_rpm ?? 0) > 0
+                                      ? "text-cyan-400 animate-spin"
+                                      : "text-zinc-500"
+                                  }
+                                />
+                                Охлаждение GPU (Кулеры)
+                              </span>
+                              <div className="flex items-center gap-3">
+                                <span className="text-zinc-100 font-bold">
+                                  {gpu.fan_rpm != null
+                                    ? `${gpu.fan_rpm.toFixed(0)} RPM`
+                                    : "0 RPM (Zero Fan)"}
+                                </span>
+                                <span className="text-cyan-400 font-semibold">
+                                  {gpu.fan_percent != null
+                                    ? `${gpu.fan_percent.toFixed(0)}%`
+                                    : "0%"}
+                                </span>
+                              </div>
+                            </div>
+                            <div className="w-full h-1.5 bg-zinc-800 rounded-full overflow-hidden">
+                              <div
+                                style={{ width: `${fanPct}%` }}
+                                className="h-full bg-gradient-to-r from-cyan-500 to-emerald-400 rounded-full transition-all duration-500"
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      </SpotlightCard>
+                    );
+                  })
+                ) : (
+                  <SpotlightCard
+                    variants={cardItemVariants}
+                    spotlightColor="rgba(34, 211, 238, 0.12)"
+                    className="p-6 flex flex-col justify-center items-center text-center"
+                  >
+                    <Activity size={28} className="text-cyan-400 mb-2 opacity-80" />
+                    <div className="text-sm font-semibold text-zinc-200">
+                      Датчики дискретной видеокарты (GPU)
+                    </div>
+                    <p className="text-xs font-mono text-zinc-500 mt-1 max-w-sm">
+                      Ожидание ответа от LibreHardwareMonitor или в системе используется встроенное видеоядро без открытых термодатчиков.
+                    </p>
+                  </SpotlightCard>
+                )}
+              </motion.div>
+
+              {/* 4. Карточка системных вентиляторов и температур накопителей SSD/HDD */}
+              <motion.div
+                variants={cardsContainerVariants}
+                initial="hidden"
+                animate="show"
+                className="grid grid-cols-1 lg:grid-cols-2 gap-5"
+              >
+                {/* Системные вентиляторы и датчики материнской платы */}
+                <SpotlightCard
+                  variants={cardItemVariants}
+                  spotlightColor="rgba(52, 211, 153, 0.12)"
+                  className="p-5 sm:p-6"
+                >
+                  <div className="space-y-4">
+                    <div className="flex items-center justify-between border-b border-white/[0.06] pb-3">
+                      <div className="flex items-center gap-2.5">
+                        <Fan size={18} className="text-emerald-400" />
+                        <h3 className="text-base font-semibold text-zinc-100">
+                          Вентиляторы корпуса и датчики платы
+                        </h3>
+                      </div>
+                      <span className="text-xs font-mono text-zinc-500">
+                        Кулеров: {hwData?.system_fans.length ?? 0}
+                      </span>
+                    </div>
+
+                    {hwData?.system_fans && hwData.system_fans.length > 0 ? (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                        {hwData.system_fans.map((fan, fIdx) => (
+                          <div
+                            key={fan.name + fIdx}
+                            className="p-3 rounded-xl bg-zinc-950/70 border border-white/[0.05] flex items-center justify-between"
+                          >
+                            <div className="flex items-center gap-2.5 min-w-0">
+                              <Fan
+                                size={15}
+                                className={
+                                  fan.rpm > 0
+                                    ? "text-emerald-400 animate-spin shrink-0"
+                                    : "text-zinc-600 shrink-0"
+                                }
+                              />
+                              <span className="text-xs font-mono text-zinc-300 truncate">
+                                {fan.name}
+                              </span>
+                            </div>
+                            <span className="text-sm font-mono font-bold text-emerald-400 shrink-0">
+                              {fan.rpm.toFixed(0)} RPM
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="p-4 rounded-xl bg-zinc-950/50 border border-white/[0.04] text-xs font-mono text-zinc-500">
+                        Обороты корпусных вентиляторов (SuperIO) недоступны без прав Администратора или управляются напрямую через BIOS.
+                      </div>
+                    )}
+
+                    {hwData?.motherboard_temps &&
+                      hwData.motherboard_temps.length > 0 && (
+                        <div className="pt-2 space-y-2">
+                          <span className="text-xs font-mono text-zinc-400 block">
+                            Термодатчики системной платы:
+                          </span>
+                          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                            {hwData.motherboard_temps.slice(0, 6).map((t, idx) => {
+                              const st = getTempBadgeStyle(t.temp_c);
+                              return (
+                                <div
+                                  key={t.name + idx}
+                                  className="px-3 py-2 rounded-lg bg-zinc-950/60 border border-white/[0.05] flex items-center justify-between text-xs font-mono"
+                                >
+                                  <span className="text-zinc-400 truncate mr-2">
+                                    {t.name}
+                                  </span>
+                                  <span className={`font-bold ${st.textClass}`}>
+                                    {t.temp_c.toFixed(0)}°C
+                                  </span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+                  </div>
+                </SpotlightCard>
+
+                {/* Температуры накопителей SSD / HDD */}
+                <SpotlightCard
+                  variants={cardItemVariants}
+                  spotlightColor="rgba(34, 211, 238, 0.12)"
+                  className="p-5 sm:p-6"
+                >
+                  <div className="space-y-4">
+                    <div className="flex items-center justify-between border-b border-white/[0.06] pb-3">
+                      <div className="flex items-center gap-2.5">
+                        <HardDrive size={18} className="text-cyan-400" />
+                        <h3 className="text-base font-semibold text-zinc-100">
+                          Температуры накопителей (SSD / NVMe / HDD)
+                        </h3>
+                      </div>
+                      <span className="text-xs font-mono text-zinc-500">
+                        Устройств: {hwData?.storage_temps.length ?? 0}
+                      </span>
+                    </div>
+
+                    {hwData?.storage_temps && hwData.storage_temps.length > 0 ? (
+                      <div className="space-y-2.5">
+                        {hwData.storage_temps.map((st, idx) => {
+                          const tempBadge = getTempBadgeStyle(st.temp_c);
+                          return (
+                            <div
+                              key={st.name + idx}
+                              className="p-3.5 rounded-xl bg-zinc-950/70 border border-white/[0.05] flex items-center justify-between gap-4"
+                            >
+                              <div className="min-w-0 flex-1">
+                                <div className="text-sm font-medium text-zinc-100 truncate">
+                                  {st.name}
+                                </div>
+                                {st.used_percent != null && (
+                                  <div className="flex items-center gap-2 mt-1.5">
+                                    <div className="w-28 h-1 bg-zinc-800 rounded-full overflow-hidden">
+                                      <div
+                                        style={{
+                                          width: `${Math.min(100, st.used_percent)}%`,
+                                        }}
+                                        className="h-full bg-cyan-400 rounded-full"
+                                      />
+                                    </div>
+                                    <span className="text-[11px] font-mono text-zinc-500">
+                                      Занято: {st.used_percent.toFixed(0)}%
+                                    </span>
+                                  </div>
+                                )}
+                              </div>
+
+                              <span
+                                className={`text-xs font-mono font-bold px-2.5 py-1 rounded-lg border shrink-0 ${tempBadge.badgeClass}`}
+                              >
+                                {st.temp_c != null
+                                  ? `${st.temp_c.toFixed(1)}°C`
+                                  : "SMART Н/Д"}
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <div className="p-4 rounded-xl bg-zinc-950/50 border border-white/[0.04] text-xs font-mono text-zinc-500">
+                        Опрос SMART-датчиков накопителей...
+                      </div>
+                    )}
+                  </div>
+                </SpotlightCard>
+              </motion.div>
+            </motion.div>
+          )}
+
           {activeTab === "power" && (
             <motion.div
               key="power"
@@ -2134,7 +2840,6 @@ export default function App() {
                 className="p-6"
               >
                 <div className="space-y-6">
-                  {/* Заголовок и переключатель режима */}
                   <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-white/[0.06]">
                     <div className="flex items-center gap-3 text-zinc-200">
                       <div className="p-2 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
@@ -2192,7 +2897,6 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Быстрые пресеты с интерактивным spring-откликом */}
                   <div className="space-y-2.5">
                     <label className="block text-xs font-mono uppercase tracking-wider text-zinc-400">
                       Быстрый запуск
@@ -2214,7 +2918,6 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Произвольное время */}
                   <form onSubmit={handleCustomSubmit} className="space-y-2.5">
                     <label className="block text-xs font-mono uppercase tracking-wider text-zinc-400">
                       Произвольное время (в минутах)
@@ -2255,7 +2958,6 @@ export default function App() {
                     )}
                   </AnimatePresence>
 
-                  {/* Активный таймер и живой обратный отсчет */}
                   <AnimatePresence>
                     {timerState && remainingSeconds > 0 && (
                       <motion.div
