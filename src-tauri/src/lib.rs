@@ -174,11 +174,26 @@ pub struct CleanupReport {
     pub categories: Vec<CleanupCategoryReport>,
 }
 
+// Структура процесса модуля Process Explorer
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ProcessItem {
+    pub pid: u32,
+    pub parent_pid: Option<u32>,
+    pub name: String,
+    pub exe_path: String,
+    pub cpu_usage: f32,  // процент загрузки CPU (нормализован к числу логических ядер)
+    pub memory_mb: f64,  // занятая память в МБ
+    pub disk_read_bytes_sec: u64,
+    pub disk_write_bytes_sec: u64,
+    pub run_time_sec: u64,
+}
+
 // Хранилище состояния приложения
 pub struct AppState {
     pub sys: Mutex<System>,
     pub networks: Mutex<Networks>,
     pub ping_cache: Mutex<(u32, Option<Instant>)>,
+    pub process_last_refresh: Mutex<Option<Instant>>,
     pub hw_telemetry: Arc<Mutex<Option<HardwareTelemetry>>>,
     pub hw_sidecar_child: Arc<Mutex<Option<Child>>>,
 }
@@ -1616,6 +1631,185 @@ async fn execute_cleanup(category_ids: Vec<String>) -> Result<CleanupReport, Str
     .map_err(|e| format!("Ошибка потока очистки диска: {}", e))?
 }
 
+// ===================== Process Explorer =====================
+
+#[tauri::command]
+fn get_process_list(state: State<'_, AppState>) -> Result<Vec<ProcessItem>, String> {
+    // Интервал с прошлого опроса нужен для пересчёта дельты дискового I/O в байт/сек
+    let elapsed_secs = {
+        let mut guard = state
+            .process_last_refresh
+            .lock()
+            .map_err(|_| "Состояние процессов заблокировано".to_string())?;
+        let now = Instant::now();
+        let secs = guard
+            .map(|prev| now.duration_since(prev).as_secs_f64())
+            .unwrap_or(1.0)
+            .max(0.25);
+        *guard = Some(now);
+        secs
+    };
+
+    let mut sys = state
+        .sys
+        .lock()
+        .map_err(|_| "Системный монитор заблокирован".to_string())?;
+
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+
+    let cpu_count = sys.cpus().len().max(1) as f32;
+
+    let list = sys
+        .processes()
+        .values()
+        .filter(|p| p.pid().as_u32() != 0)
+        .map(|p| {
+            let disk = p.disk_usage();
+            ProcessItem {
+                pid: p.pid().as_u32(),
+                parent_pid: p.parent().map(|pp| pp.as_u32()),
+                name: p.name().to_string_lossy().to_string(),
+                exe_path: p
+                    .exe()
+                    .map(|e| e.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                cpu_usage: (p.cpu_usage() / cpu_count).clamp(0.0, 100.0),
+                memory_mb: p.memory() as f64 / 1024.0 / 1024.0,
+                disk_read_bytes_sec: (disk.read_bytes as f64 / elapsed_secs) as u64,
+                disk_write_bytes_sec: (disk.written_bytes as f64 / elapsed_secs) as u64,
+                run_time_sec: p.run_time(),
+            }
+        })
+        .collect();
+
+    Ok(list)
+}
+
+// Защита от завершения критичных узлов (System Idle, System) и самого NEXUS PC
+fn guard_process_pid(pid: u32) -> Result<(), String> {
+    if pid == 0 || pid == 4 {
+        return Err("Системный процесс Windows защищён от изменения".to_string());
+    }
+    if pid == std::process::id() {
+        return Err("Нельзя применить действие к самому NEXUS PC".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn kill_process(pid: u32, tree: bool) -> Result<(), String> {
+    guard_process_pid(pid)?;
+
+    let pid_str = pid.to_string();
+    let mut cmd = Command::new("taskkill");
+    if tree {
+        cmd.args(["/F", "/T", "/PID", &pid_str]);
+    } else {
+        cmd.args(["/F", "/PID", &pid_str]);
+    }
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let output = cmd
+        .output()
+        .map_err(|e| format!("Не удалось вызвать taskkill: {}", e))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let details = if !stderr.is_empty() { stderr } else { stdout };
+        Err(if details.is_empty() {
+            format!(
+                "Не удалось завершить процесс PID {} (код {:?}). Возможно, требуются права Администратора",
+                pid,
+                output.status.code()
+            )
+        } else {
+            details
+        })
+    }
+}
+
+// Минимальный FFI к kernel32 для динамической загрузки NtSuspendProcess / NtResumeProcess из ntdll.dll
+#[cfg(target_os = "windows")]
+mod win_process_ffi {
+    use std::ffi::c_void;
+
+    pub type Handle = *mut c_void;
+    pub const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> Handle;
+        pub fn CloseHandle(handle: Handle) -> i32;
+        pub fn GetModuleHandleW(module_name: *const u16) -> Handle;
+        pub fn GetProcAddress(module: Handle, proc_name: *const u8) -> *mut c_void;
+        pub fn GetLastError() -> u32;
+    }
+
+    pub type NtProcessFn = unsafe extern "system" fn(process_handle: Handle) -> i32;
+}
+
+#[tauri::command]
+fn suspend_process(pid: u32, suspend: bool) -> Result<(), String> {
+    guard_process_pid(pid)?;
+
+    #[cfg(target_os = "windows")]
+    {
+        use win_process_ffi::*;
+
+        let ntdll_name: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
+        let fn_name: &[u8] = if suspend {
+            b"NtSuspendProcess\0"
+        } else {
+            b"NtResumeProcess\0"
+        };
+
+        unsafe {
+            let ntdll = GetModuleHandleW(ntdll_name.as_ptr());
+            if ntdll.is_null() {
+                return Err("Не удалось получить дескриптор ntdll.dll".to_string());
+            }
+
+            let proc_addr = GetProcAddress(ntdll, fn_name.as_ptr());
+            if proc_addr.is_null() {
+                return Err("Функция NtSuspendProcess/NtResumeProcess недоступна".to_string());
+            }
+            let nt_fn: NtProcessFn = std::mem::transmute(proc_addr);
+
+            let handle = OpenProcess(PROCESS_SUSPEND_RESUME, 0, pid);
+            if handle.is_null() {
+                let err = GetLastError();
+                return Err(format!(
+                    "Нет доступа к процессу PID {} (Win32 код {}). Запустите NEXUS PC от имени Администратора",
+                    pid, err
+                ));
+            }
+
+            let status = nt_fn(handle);
+            CloseHandle(handle);
+
+            if status < 0 {
+                return Err(format!(
+                    "{} завершился с NTSTATUS 0x{:08X}",
+                    if suspend { "NtSuspendProcess" } else { "NtResumeProcess" },
+                    status as u32
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = suspend;
+        Err("Заморозка процессов поддерживается только в Windows".to_string())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut sys = System::new_all();
@@ -1635,6 +1829,7 @@ pub fn run() {
             sys: Mutex::new(sys),
             networks: Mutex::new(networks),
             ping_cache: Mutex::new((0, None)),
+            process_last_refresh: Mutex::new(None),
             hw_telemetry,
             hw_sidecar_child,
         })
@@ -1663,7 +1858,10 @@ pub fn run() {
             restart_as_admin,
             app_exit,
             scan_cleanup_targets,
-            execute_cleanup
+            execute_cleanup,
+            get_process_list,
+            kill_process,
+            suspend_process
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
