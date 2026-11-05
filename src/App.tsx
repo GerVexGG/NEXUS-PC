@@ -1,5 +1,5 @@
 import "./App.css";
-import { useState, useEffect, memo, type ReactNode, type MouseEvent } from "react";
+import { useState, useEffect, useRef, memo, type ReactNode, type MouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { motion, AnimatePresence, type Variants } from "framer-motion";
@@ -1018,6 +1018,8 @@ export default function App() {
   const [selectedPid, setSelectedPid] = useState<number | null>(null);
   const [suspendedPids, setSuspendedPids] = useState<number[]>([]);
   const [processMenu, setProcessMenu] = useState<ProcessContextMenuState | null>(null);
+  const processMenuRef = useRef<ProcessContextMenuState | null>(null);
+  processMenuRef.current = processMenu;
 
   // Состояние модуля управления питанием
   const [restartMode, setRestartMode] = useState<boolean>(false);
@@ -1059,7 +1061,8 @@ export default function App() {
         if (e.key === "F11") {
           e.preventDefault();
           await win.setFullscreen(!isFullscreen);
-        } else if (isFullscreen) {
+        } else if (isFullscreen && !processMenuRef.current) {
+          e.preventDefault();
           await win.setFullscreen(false);
         }
       } catch (err) {
@@ -2063,237 +2066,7 @@ export default function App() {
                   : "text-zinc-400 hover:text-zinc-200"
               }`}
             >
-              {activeTab === "processes" && (
-            <motion.div
-              key="processes"
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -6 }}
-              transition={{ duration: 0.18, ease: "easeOut" }}
-              className="space-y-4 max-w-6xl w-full"
-            >
-              {/* Шапка Process Explorer */}
-              <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4 border-b border-white/[0.06] pb-3.5">
-                <div>
-                  <div className="text-[10px] font-mono uppercase tracking-[0.2em] text-emerald-400/90 mb-0.5">
-                    PROCESS EXPLORER // LIVE TASK MATRIX
-                  </div>
-                  <h2 className="text-2xl font-bold text-zinc-100 tracking-tight">
-                    Диспетчер процессов
-                  </h2>
-                  <p className="text-xs text-zinc-500 font-mono mt-0.5">
-                    ПКМ по строке — действия с процессом • Клик по заголовку — сортировка
-                  </p>
-                </div>
-
-                <div className="flex flex-wrap items-center gap-2 font-mono text-[11px]">
-                  <span className="px-2.5 py-1.5 rounded-lg bg-[#0e1118] border border-white/[0.07] text-zinc-400 tabular-nums">
-                    ПРОЦЕССОВ: <strong className="text-zinc-100">{processes.length}</strong>
-                  </span>
-                  <span className="px-2.5 py-1.5 rounded-lg bg-[#0e1118] border border-white/[0.07] text-zinc-400 tabular-nums">
-                    CPU Σ:{" "}
-                    <strong className={getLoadBarStyles(totalProcessCpu).badgeTextClass}>
-                      {totalProcessCpu.toFixed(1)}%
-                    </strong>
-                  </span>
-                  <span className="px-2.5 py-1.5 rounded-lg bg-[#0e1118] border border-white/[0.07] text-zinc-400 tabular-nums">
-                    RAM Σ: <strong className="text-cyan-300">{totalProcessMemoryGb.toFixed(2)} GB</strong>
-                  </span>
-                  <motion.button
-                    type="button"
-                    whileTap={{ scale: 0.95 }}
-                    onClick={() => setProcessAutoRefresh((prev) => !prev)}
-                    title={processAutoRefresh ? "Приостановить автообновление" : "Включить автообновление"}
-                    className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border transition-colors cursor-pointer ${
-                      processAutoRefresh
-                        ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/35"
-                        : "bg-amber-500/15 text-amber-300 border-amber-500/35"
-                    }`}
-                  >
-                    {processAutoRefresh ? <Pause size={12} /> : <Play size={12} />}
-                    <span>{processAutoRefresh ? "LIVE 1.5s" : "ПАУЗА"}</span>
-                  </motion.button>
-                  <motion.button
-                    type="button"
-                    whileTap={{ scale: 0.95 }}
-                    onClick={fetchProcesses}
-                    title="Обновить сейчас"
-                    className="inline-flex items-center justify-center h-[30px] w-[30px] rounded-lg bg-[#0e1118] hover:bg-white/[0.06] text-zinc-300 border border-white/[0.07] cursor-pointer"
-                  >
-                    <RefreshCw size={13} className={processLoading ? "animate-spin" : ""} />
-                  </motion.button>
-                </div>
-              </div>
-
-              {/* Поиск по имени, PID или пути */}
-              <div className="relative">
-                <Search
-                  size={15}
-                  className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-zinc-500"
-                />
-                <input
-                  type="text"
-                  value={processSearch}
-                  onChange={(e) => setProcessSearch(e.target.value)}
-                  placeholder="Мгновенный поиск по имени процесса, PID или пути к файлу..."
-                  className="w-full pl-10 pr-24 py-2.5 rounded-xl bg-[#0e1118] border border-white/[0.07] text-sm font-mono text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-emerald-500/40 focus:shadow-[0_0_18px_rgba(52,211,153,0.1)] transition-all"
-                />
-                <span className="absolute right-3.5 top-1/2 -translate-y-1/2 text-[10px] font-mono text-zinc-500 tabular-nums">
-                  {visibleProcesses.length} / {processes.length}
-                </span>
-              </div>
-
-              {/* Уведомления и ошибки действий */}
-              <AnimatePresence>
-                {processError && (
-                  <motion.div
-                    initial={{ opacity: 0, y: -6 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: -6 }}
-                    className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-400 text-xs font-mono flex items-center justify-between gap-3"
-                  >
-                    <span>{processError}</span>
-                    <button
-                      type="button"
-                      onClick={() => setProcessError(null)}
-                      className="text-rose-300 hover:text-rose-100 cursor-pointer shrink-0"
-                    >
-                      <X size={13} />
-                    </button>
-                  </motion.div>
-                )}
-                {processNotice && (
-                  <motion.div
-                    initial={{ opacity: 0, y: -6 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: -6 }}
-                    className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs font-mono truncate"
-                  >
-                    {processNotice}
-                  </motion.div>
-                )}
-              </AnimatePresence>
-
-              {/* Сортируемая таблица процессов */}
-              <div className="relative rounded-xl bg-[#0b0d13]/95 border border-white/[0.07] shadow-[0_12px_36px_rgba(0,0,0,0.6)] overflow-hidden">
-                <div className="grid grid-cols-[minmax(0,1fr)_90px_110px_170px_110px] gap-3 px-4 py-2.5 bg-[#0e1118] border-b border-white/[0.07]">
-                  {renderSortHeader("name", "Процесс / PID", false)}
-                  {renderSortHeader("cpu", "CPU %")}
-                  {renderSortHeader("memory", "RAM (МБ)")}
-                  {renderSortHeader("disk", "Диск R / W")}
-                  {renderSortHeader("runtime", "Время")}
-                </div>
-
-                <div className="max-h-[calc(100vh-340px)] min-h-[240px] overflow-y-auto divide-y divide-white/[0.035]">
-                  {processLoading && processes.length === 0 ? (
-                    <div className="p-10 flex items-center justify-center gap-2 text-xs font-mono text-zinc-500">
-                      <Loader2 size={14} className="animate-spin text-emerald-400" />
-                      Построение матрицы процессов...
-                    </div>
-                  ) : visibleProcesses.length === 0 ? (
-                    <div className="p-10 text-center text-xs font-mono text-zinc-500">
-                      Процессы по запросу не найдены
-                    </div>
-                  ) : (
-                    visibleProcesses.map((proc) => {
-                      const isSelected = selectedPid === proc.pid;
-                      const isSuspended = suspendedPids.includes(proc.pid);
-                      const cpuStyle = getLoadBarStyles(proc.cpu_usage * 2.5);
-                      const hasDisk =
-                        proc.disk_read_bytes_sec > 0 || proc.disk_write_bytes_sec > 0;
-                      return (
-                        <div
-                          key={proc.pid}
-                          onClick={() => setSelectedPid(proc.pid)}
-                          onContextMenu={(e) => handleProcessContextMenu(e, proc)}
-                          className={`grid grid-cols-[minmax(0,1fr)_90px_110px_170px_110px] gap-3 px-4 py-2 items-center text-xs font-mono cursor-default transition-colors ${
-                            isSelected
-                              ? "bg-emerald-500/[0.09] shadow-[inset_2px_0_0_#34d399]"
-                              : isSuspended
-                              ? "bg-cyan-500/[0.06] shadow-[inset_2px_0_0_#22d3ee]"
-                              : "hover:bg-white/[0.025]"
-                          }`}
-                        >
-                          <div className="min-w-0 flex items-center gap-2.5">
-                            <div
-                              className={`h-6 w-6 rounded-md flex items-center justify-center shrink-0 border ${
-                                isSuspended
-                                  ? "bg-cyan-500/15 border-cyan-500/35 text-cyan-300"
-                                  : "bg-[#0e1118] border-white/[0.07] text-zinc-500"
-                              }`}
-                            >
-                              {isSuspended ? <Pause size={11} /> : <AppWindow size={11} />}
-                            </div>
-                            <div className="min-w-0">
-                              <div className="flex items-center gap-2">
-                                <span
-                                  className={`truncate font-semibold ${
-                                    isSuspended ? "text-cyan-200" : "text-zinc-100"
-                                  }`}
-                                  title={proc.exe_path || proc.name}
-                                >
-                                  {proc.name}
-                                </span>
-                                {isSuspended && (
-                                  <span className="text-[9px] px-1 py-px rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 shrink-0">
-                                    FROZEN
-                                  </span>
-                                )}
-                              </div>
-                              <div className="text-[10px] text-zinc-500 tabular-nums">
-                                PID {proc.pid}
-                                {proc.parent_pid != null && ` • PPID ${proc.parent_pid}`}
-                              </div>
-                            </div>
-                          </div>
-
-                          <div className="text-right">
-                            <div className={`font-bold tabular-nums ${proc.cpu_usage >= 0.1 ? cpuStyle.badgeTextClass : "text-zinc-600"}`}>
-                              {proc.cpu_usage.toFixed(1)}
-                            </div>
-                            <div className="mt-1 h-0.5 w-full bg-white/[0.05] rounded-full overflow-hidden">
-                              <div
-                                className={`h-full rounded-full ${cpuStyle.barClass}`}
-                                style={{ width: `${Math.min(100, proc.cpu_usage)}%` }}
-                              />
-                            </div>
-                          </div>
-
-                          <div
-                            className={`text-right tabular-nums ${
-                              proc.memory_mb >= 1024
-                                ? "text-amber-300 font-bold"
-                                : proc.memory_mb >= 300
-                                ? "text-cyan-300"
-                                : "text-zinc-300"
-                            }`}
-                          >
-                            {proc.memory_mb.toFixed(1)}
-                          </div>
-
-                          <div className={`text-right tabular-nums text-[11px] ${hasDisk ? "text-zinc-300" : "text-zinc-600"}`}>
-                            <span className={proc.disk_read_bytes_sec > 0 ? "text-emerald-400" : ""}>
-                              {formatRate(proc.disk_read_bytes_sec)}
-                            </span>
-                            <span className="text-zinc-600"> / </span>
-                            <span className={proc.disk_write_bytes_sec > 0 ? "text-cyan-400" : ""}>
-                              {formatRate(proc.disk_write_bytes_sec)}
-                            </span>
-                          </div>
-
-                          <div className="text-right tabular-nums text-zinc-400">
-                            {formatUptime(proc.run_time_sec)}
-                          </div>
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-              </div>
-            </motion.div>
-          )}
-
-          {activeTab === "power" && (
+              {activeTab === "power" && (
                 <motion.div
                   layoutId="activeTabPill"
                   transition={{ type: "spring", stiffness: 460, damping: 32 }}
@@ -4567,7 +4340,10 @@ export default function App() {
                   {renderSortHeader("runtime", "Время")}
                 </div>
 
-                <div className="max-h-[calc(100vh-340px)] min-h-[240px] overflow-y-auto divide-y divide-white/[0.035]">
+                <div
+                  onScroll={() => setProcessMenu(null)}
+                  className="max-h-[calc(100vh-340px)] min-h-[240px] overflow-y-auto divide-y divide-white/[0.035]"
+                >
                   {processLoading && processes.length === 0 ? (
                     <div className="p-10 flex items-center justify-center gap-2 text-xs font-mono text-zinc-500">
                       <Loader2 size={14} className="animate-spin text-emerald-400" />
