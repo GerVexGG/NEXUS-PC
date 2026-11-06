@@ -189,6 +189,17 @@ pub struct ProcessItem {
     pub icon_base64: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NetworkConnection {
+    pub protocol: String,
+    pub local_addr: String,
+    pub remote_addr: String,
+    pub state: String,
+    pub pid: u32,
+    pub process_name: String,
+    pub icon_base64: Option<String>,
+}
+
 // Хранилище состояния приложения
 pub struct AppState {
     pub sys: Mutex<System>,
@@ -2074,6 +2085,276 @@ fn suspend_process(pid: u32, suspend: bool) -> Result<(), String> {
     }
 }
 
+fn tcp_state_name(state: u32) -> &'static str {
+    match state {
+        1 => "CLOSED",
+        2 => "LISTEN",
+        3 => "SYN_SENT",
+        4 => "SYN_RCVD",
+        5 => "ESTABLISHED",
+        6 => "FIN_WAIT1",
+        7 => "FIN_WAIT2",
+        8 => "CLOSE_WAIT",
+        9 => "CLOSING",
+        10 => "LAST_ACK",
+        11 => "TIME_WAIT",
+        12 => "DELETE_TCB",
+        _ => "UNKNOWN",
+    }
+}
+
+fn read_u32(buf: &[u8], offset: usize) -> Option<u32> {
+    let bytes: [u8; 4] = buf.get(offset..offset + 4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
+fn port_from_net_dword(value: u32) -> u16 {
+    let low = (value & 0xFF) as u16;
+    let high = ((value >> 8) & 0xFF) as u16;
+    (low << 8) | high
+}
+
+fn ipv4_from_dword(addr: u32) -> String {
+    format!(
+        "{}.{}.{}.{}",
+        addr & 0xFF,
+        (addr >> 8) & 0xFF,
+        (addr >> 16) & 0xFF,
+        (addr >> 24) & 0xFF
+    )
+}
+
+fn format_socket(ip: &str, port: u16, ipv6: bool) -> String {
+    let unspecified = (!ipv6 && ip == "0.0.0.0" && port == 0) || (ipv6 && ip == "::" && port == 0);
+    if unspecified {
+        return "*:*".to_string();
+    }
+    if ipv6 {
+        format!("[{}]:{}", ip, port)
+    } else {
+        format!("{}:{}", ip, port)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn query_iphlp_table(mut call: impl FnMut(*mut u8, *mut u32) -> u32) -> Result<Vec<u8>, String> {
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+    let mut size = 0u32;
+    let first = call(std::ptr::null_mut(), &mut size);
+    if first == 0 || size == 0 {
+        return Ok(Vec::new());
+    }
+    if first != ERROR_INSUFFICIENT_BUFFER {
+        return Err(format!("Таблица сокетов недоступна (код {})", first));
+    }
+
+    for _ in 0..4 {
+        let mut buffer = vec![0u8; size as usize];
+        let mut needed = size;
+        let code = call(buffer.as_mut_ptr(), &mut needed);
+        if code == 0 {
+            return Ok(buffer);
+        }
+        if code == ERROR_INSUFFICIENT_BUFFER && needed > size {
+            size = needed;
+            continue;
+        }
+        return Err(format!("Не удалось прочитать таблицу сокетов (код {})", code));
+    }
+    Err("Не удалось выделить буфер таблицы сокетов".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn collect_socket_rows() -> Result<Vec<(String, String, String, String, u32)>, String> {
+    #[link(name = "iphlpapi")]
+    unsafe extern "system" {
+        fn GetExtendedTcpTable(
+            table: *mut u8,
+            size: *mut u32,
+            order: i32,
+            family: u32,
+            table_class: i32,
+            reserved: u32,
+        ) -> u32;
+        fn GetExtendedUdpTable(
+            table: *mut u8,
+            size: *mut u32,
+            order: i32,
+            family: u32,
+            table_class: i32,
+            reserved: u32,
+        ) -> u32;
+    }
+
+    const AF_INET: u32 = 2;
+    const AF_INET6: u32 = 23;
+    const TCP_TABLE_OWNER_PID_ALL: i32 = 5;
+    const UDP_TABLE_OWNER_PID: i32 = 1;
+
+    let mut rows = Vec::new();
+
+    let tcp4 = query_iphlp_table(|ptr, size| unsafe {
+        GetExtendedTcpTable(ptr, size, 1, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0)
+    })?;
+    if tcp4.len() >= 4 {
+        let count = read_u32(&tcp4, 0).unwrap_or(0) as usize;
+        for index in 0..count {
+            let offset = 4 + index * 24;
+            let Some(state) = read_u32(&tcp4, offset) else { break };
+            let Some(local_addr) = read_u32(&tcp4, offset + 4) else { break };
+            let Some(local_port) = read_u32(&tcp4, offset + 8) else { break };
+            let Some(remote_addr) = read_u32(&tcp4, offset + 12) else { break };
+            let Some(remote_port) = read_u32(&tcp4, offset + 16) else { break };
+            let Some(pid) = read_u32(&tcp4, offset + 20) else { break };
+            let local_ip = ipv4_from_dword(local_addr);
+            let remote_ip = ipv4_from_dword(remote_addr);
+            rows.push((
+                "TCP".to_string(),
+                format_socket(&local_ip, port_from_net_dword(local_port), false),
+                format_socket(&remote_ip, port_from_net_dword(remote_port), false),
+                tcp_state_name(state).to_string(),
+                pid,
+            ));
+        }
+    }
+
+    let tcp6 = query_iphlp_table(|ptr, size| unsafe {
+        GetExtendedTcpTable(ptr, size, 1, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0)
+    })?;
+    if tcp6.len() >= 4 {
+        let count = read_u32(&tcp6, 0).unwrap_or(0) as usize;
+        for index in 0..count {
+            let offset = 4 + index * 56;
+            if offset + 56 > tcp6.len() {
+                break;
+            }
+            let local_raw: [u8; 16] = tcp6[offset..offset + 16].try_into().unwrap_or([0; 16]);
+            let remote_raw: [u8; 16] = tcp6[offset + 24..offset + 40].try_into().unwrap_or([0; 16]);
+            let local_port = read_u32(&tcp6, offset + 20).unwrap_or(0);
+            let remote_port = read_u32(&tcp6, offset + 44).unwrap_or(0);
+            let state = read_u32(&tcp6, offset + 48).unwrap_or(0);
+            let pid = read_u32(&tcp6, offset + 52).unwrap_or(0);
+            let local_ip = std::net::Ipv6Addr::from(local_raw).to_string();
+            let remote_ip = std::net::Ipv6Addr::from(remote_raw).to_string();
+            rows.push((
+                "TCP".to_string(),
+                format_socket(&local_ip, port_from_net_dword(local_port), true),
+                format_socket(&remote_ip, port_from_net_dword(remote_port), true),
+                tcp_state_name(state).to_string(),
+                pid,
+            ));
+        }
+    }
+
+    let udp4 = query_iphlp_table(|ptr, size| unsafe {
+        GetExtendedUdpTable(ptr, size, 1, AF_INET, UDP_TABLE_OWNER_PID, 0)
+    })?;
+    if udp4.len() >= 4 {
+        let count = read_u32(&udp4, 0).unwrap_or(0) as usize;
+        for index in 0..count {
+            let offset = 4 + index * 12;
+            let Some(local_addr) = read_u32(&udp4, offset) else { break };
+            let Some(local_port) = read_u32(&udp4, offset + 4) else { break };
+            let Some(pid) = read_u32(&udp4, offset + 8) else { break };
+            rows.push((
+                "UDP".to_string(),
+                format_socket(&ipv4_from_dword(local_addr), port_from_net_dword(local_port), false),
+                "*:*".to_string(),
+                "—".to_string(),
+                pid,
+            ));
+        }
+    }
+
+    let udp6 = query_iphlp_table(|ptr, size| unsafe {
+        GetExtendedUdpTable(ptr, size, 1, AF_INET6, UDP_TABLE_OWNER_PID, 0)
+    })?;
+    if udp6.len() >= 4 {
+        let count = read_u32(&udp6, 0).unwrap_or(0) as usize;
+        for index in 0..count {
+            let offset = 4 + index * 28;
+            if offset + 28 > udp6.len() {
+                break;
+            }
+            let local_raw: [u8; 16] = udp6[offset..offset + 16].try_into().unwrap_or([0; 16]);
+            let local_port = read_u32(&udp6, offset + 20).unwrap_or(0);
+            let pid = read_u32(&udp6, offset + 24).unwrap_or(0);
+            rows.push((
+                "UDP".to_string(),
+                format_socket(
+                    &std::net::Ipv6Addr::from(local_raw).to_string(),
+                    port_from_net_dword(local_port),
+                    true,
+                ),
+                "*:*".to_string(),
+                "—".to_string(),
+                pid,
+            ));
+        }
+    }
+
+    Ok(rows)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn collect_socket_rows() -> Result<Vec<(String, String, String, String, u32)>, String> {
+    Err("Таблица сокетов доступна только в Windows".to_string())
+}
+
+#[tauri::command]
+fn get_network_connections(state: State<'_, AppState>) -> Result<Vec<NetworkConnection>, String> {
+    let sockets = collect_socket_rows()?;
+
+    let mut names: HashMap<u32, (String, String)> = HashMap::new();
+    {
+        let mut sys = state
+            .sys
+            .lock()
+            .map_err(|_| "Системный монитор заблокирован".to_string())?;
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        for process in sys.processes().values() {
+            names.insert(
+                process.pid().as_u32(),
+                (
+                    process.name().to_string_lossy().to_string(),
+                    process
+                        .exe()
+                        .map(|path| path.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                ),
+            );
+        }
+    }
+
+    let mut icon_memo: HashMap<String, Option<String>> = HashMap::new();
+    let mut connections = Vec::with_capacity(sockets.len());
+    for (protocol, local_addr, remote_addr, socket_state, pid) in sockets {
+        let (process_name, exe_path) = names
+            .get(&pid)
+            .cloned()
+            .unwrap_or_else(|| ("Неизвестно".to_string(), String::new()));
+        let icon_base64 = if exe_path.is_empty() {
+            None
+        } else {
+            icon_memo
+                .entry(exe_path.clone())
+                .or_insert_with(|| cached_process_icon(&state.icon_cache, &exe_path))
+                .clone()
+        };
+        connections.push(NetworkConnection {
+            protocol,
+            local_addr,
+            remote_addr,
+            state: socket_state,
+            pid,
+            process_name,
+            icon_base64,
+        });
+    }
+
+    Ok(connections)
+}
+
 fn hwnd_to_isize<T: Copy>(hwnd: T) -> isize {
     assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<isize>());
     unsafe { std::mem::transmute_copy(&hwnd) }
@@ -2164,7 +2445,8 @@ pub fn run() {
             execute_cleanup,
             get_process_list,
             kill_process,
-            suspend_process
+            suspend_process,
+            get_network_connections
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
