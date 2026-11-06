@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::{Disks, Networks, System};
 mod drop_server;
+mod settings;
 
 use tauri::{Manager, State};
 
@@ -385,6 +386,10 @@ fn get_hardware_telemetry(state: State<'_, AppState>) -> Result<HardwareTelemetr
             if data.cpu.avg_clock_mhz.is_none() {
                 data.cpu.avg_clock_mhz = fallback_clock_mhz;
             }
+            settings::consider_hardware(
+                data.cpu.package_temp_c.or(data.cpu.max_core_temp_c),
+                data.gpus.iter().filter_map(|gpu| gpu.core_temp_c).reduce(f32::max),
+            );
             return Ok(data);
         }
     }
@@ -1644,6 +1649,7 @@ fn remove_startup_entry(entry_id: String, source: String) -> Result<(), String> 
                     .map_err(|e| format!("Не удалось удалить файл автозапуска: {e}"))?;
             }
         }
+        settings::record_startup_removal(&entry_id, &source);
         if let Some(file_name) = Path::new(base_path).file_name().and_then(|name| name.to_str()) {
             let _ = delete_registry_value(
                 HKEY_CURRENT_USER,
@@ -1684,6 +1690,7 @@ fn remove_startup_entry(entry_id: String, source: String) -> Result<(), String> 
         let _ = delete_registry_value(approved_root, approved_subkey, value_name);
         let backup = format!(r"{NEXUS_DISABLED_REG_BASE}\{source_tag}");
         let _ = delete_registry_value(HKEY_CURRENT_USER, &backup, value_name);
+        settings::record_startup_removal(&entry_id, &source);
         return Ok(());
     }
 
@@ -1705,6 +1712,7 @@ fn remove_startup_entry(entry_id: String, source: String) -> Result<(), String> 
             r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
         };
         delete_registry_value(hive, subkey, value_name)?;
+        settings::record_startup_removal(&entry_id, &source);
         return Ok(());
     }
 
@@ -1720,6 +1728,7 @@ fn remove_startup_entry(entry_id: String, source: String) -> Result<(), String> 
             .open_subkey_with_flags(&parent, KEY_WRITE)
             .and_then(|key| key.delete_subkey_all(task))
             .map_err(|e| format!("Не удалось удалить задачу Store: {e}"))?;
+        settings::record_startup_removal(&entry_id, &source);
         return Ok(());
     }
 
@@ -1745,6 +1754,7 @@ fn remove_startup_entry(entry_id: String, source: String) -> Result<(), String> 
         if !removed {
             return Err(format!("Запись «{name}» не найдена в реестре ({source})"));
         }
+        settings::record_startup_removal(&entry_id, &source);
         return Ok(());
     }
 
@@ -1755,6 +1765,7 @@ fn remove_startup_entry(entry_id: String, source: String) -> Result<(), String> 
         cmd.creation_flags(CREATE_NO_WINDOW);
         let output = cmd.output().map_err(|e| format!("Не удалось запустить schtasks: {e}"))?;
         if output.status.success() {
+            settings::record_startup_removal(&entry_id, &source);
             return Ok(());
         }
         let stderr = decode_command_output(&output.stderr);
@@ -2255,6 +2266,7 @@ fn get_system_metrics(state: State<'_, AppState>) -> SystemMetrics {
         .lock()
         .map(|slot| *slot)
         .unwrap_or((0, 0));
+    settings::consider_disk(disk_free_gb, disk_total_gb);
 
     SystemMetrics {
         cpu_usage,
@@ -3138,7 +3150,13 @@ async fn execute_cleanup(category_ids: Vec<String>) -> Result<CleanupReport, Str
         })
     })
     .await
-    .map_err(|e| format!("Ошибка потока очистки диска: {}", e))?
+    .map_err(|e| format!("Ошибка потока очистки диска: {}", e))
+    .and_then(|report| {
+        if let Ok(done) = &report {
+            settings::record_cleanup(done.freed_bytes);
+        }
+        report
+    })
 }
 
 // ===================== Process Explorer =====================
@@ -3829,6 +3847,26 @@ fn open_drop_folder(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn get_settings() -> settings::NexusSettings {
+    settings::load_settings()
+}
+
+#[tauri::command]
+fn save_settings(settings: settings::NexusSettings) -> Result<(), String> {
+    settings::save_settings(settings)
+}
+
+#[tauri::command]
+fn get_event_log() -> Vec<settings::NexusEvent> {
+    settings::get_event_log()
+}
+
+#[tauri::command]
+fn clear_event_log() -> Result<(), String> {
+    settings::clear_event_log()
+}
+
+#[tauri::command]
 fn get_network_connections(state: State<'_, AppState>) -> Result<Vec<NetworkConnection>, String> {
     let sockets = collect_socket_rows()?;
 
@@ -4038,8 +4076,11 @@ pub fn run() {
         })
         .on_window_event(move |window, event| match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {
-                api.prevent_close();
-                let _ = window.hide();
+                let hide_main = window.label() == "main" && settings::load_settings().minimize_to_tray;
+                if window.label() != "main" || hide_main {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
             }
             tauri::WindowEvent::Destroyed => {
                 if window.label() == "main" {
@@ -4085,7 +4126,11 @@ pub fn run() {
             get_drop_session,
             get_drop_history,
             get_drop_texts,
-            open_drop_folder
+            open_drop_folder,
+            get_settings,
+            save_settings,
+            get_event_log,
+            clear_event_log
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

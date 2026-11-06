@@ -10,6 +10,7 @@ const TAB_TITLES: Record<string, string> = {
   cleanup: "Центр очистки системы",
   power: "Управление питанием",
   drop: "NEXUS Drop",
+  settings: "Настройки и журнал",
 };
 
 interface TitleBarProps {

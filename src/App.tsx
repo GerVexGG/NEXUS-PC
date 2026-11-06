@@ -2,8 +2,9 @@ import { useEffect, type ReactNode } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import type { LucideIcon } from "lucide-react";
 import {
-  Activity, Cpu, HardDrive, LayoutDashboard, Loader2, LogOut, Minimize2, Network, Power, Rocket, Smartphone, Trash2,
+  Activity, Cpu, HardDrive, LayoutDashboard, Loader2, LogOut, Minimize2, Network, Power, Rocket, Settings, Smartphone, Trash2,
 } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useNexusController } from "./hooks/useNexusController";
 import {
@@ -19,6 +20,7 @@ import { PowerModule } from "./components/modules/PowerModule";
 import { ProcessModule } from "./components/modules/ProcessModule";
 import { NetworkModule } from "./components/modules/NetworkModule";
 import { DropModule } from "./components/modules/DropModule";
+import { SettingsModule } from "./components/modules/SettingsModule";
 import "./App.css";
 
 function SidebarItem({
@@ -64,8 +66,16 @@ export default function App() {
 
   useEffect(() => {
     const window = getCurrentWindow();
-    void window.show();
-    void window.setFocus();
+    void (async () => {
+      try {
+        const settings = await invoke<{ start_minimized: boolean }>("get_settings");
+        if (settings.start_minimized) return;
+      } catch {
+        /* окно откроется обычным образом */
+      }
+      await window.show();
+      await window.setFocus();
+    })();
   }, []);
 
   return (
@@ -167,6 +177,7 @@ export default function App() {
           </nav>
         </div>
         <div className="space-y-2 px-1">
+          <SidebarItem active={c.activeTab === "settings"} icon={Settings} label="Настройки" onClick={() => c.setActiveTab("settings")} />
           <button
             type="button"
             onClick={() => {
@@ -209,6 +220,7 @@ export default function App() {
             {c.activeTab === "processes" && <ProcessModule c={c} />}
             {c.activeTab === "network" && <NetworkModule c={c} />}
             {c.activeTab === "drop" && <DropModule />}
+            {c.activeTab === "settings" && <SettingsModule />}
           </motion.div>
         </AnimatePresence>
       </main>

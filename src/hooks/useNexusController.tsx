@@ -32,7 +32,7 @@ import {
 
 export function useNexusController() {
   const [activeTab, setActiveTab] = useState<
-    "dashboard" | "startup" | "storage" | "hardware" | "cleanup" | "power" | "processes" | "network" | "drop"
+    "dashboard" | "startup" | "storage" | "hardware" | "cleanup" | "power" | "processes" | "network" | "drop" | "settings"
   >("dashboard");
   const [metricsReady, setMetricsReady] = useState(false);
   const [metrics, setMetrics] = useState<Metrics>({
@@ -429,9 +429,26 @@ export function useNexusController() {
       }
     };
 
-    fetchHwTelemetry();
-    const interval = setInterval(fetchHwTelemetry, 1000);
-    return () => clearInterval(interval);
+    const handle = { id: 0, cancelled: false };
+    void (async () => {
+      let rate = 2000;
+      try {
+        const settings = await invoke<{ polling_rate_ms: number }>("get_settings");
+        if (settings.polling_rate_ms === 1000 || settings.polling_rate_ms === 2000 || settings.polling_rate_ms === 5000) {
+          rate = settings.polling_rate_ms;
+        }
+      } catch {
+        rate = 2000;
+      }
+      if (handle.cancelled) return;
+      await fetchHwTelemetry();
+      if (handle.cancelled) return;
+      handle.id = window.setInterval(() => void fetchHwTelemetry(), rate);
+    })();
+    return () => {
+      handle.cancelled = true;
+      window.clearInterval(handle.id);
+    };
   }, [activeTab]);
 
   // Загрузка списка автозагрузки при переходе на вкладку «Автозагрузка»
