@@ -225,7 +225,7 @@ export function useNexusController() {
       setProcessSortDesc((prev) => !prev);
     } else {
       setProcessSortKey(key);
-      setProcessSortDesc(key !== "name");
+      setProcessSortDesc(key !== "name" && key !== "pid");
     }
   };
 
@@ -767,6 +767,9 @@ export function useNexusController() {
       switch (processSortKey) {
         case "name":
           diff = a.name.localeCompare(b.name, "ru");
+          break;
+        case "pid":
+          diff = a.pid - b.pid;
           break;
         case "cpu":
           diff = a.cpu_usage - b.cpu_usage;

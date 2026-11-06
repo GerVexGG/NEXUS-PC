@@ -1,19 +1,7 @@
 import { useEffect, useState, type MouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { AnimatePresence, motion } from "framer-motion";
-import {
-  AppWindow,
-  ChevronDown,
-  ChevronUp,
-  Copy,
-  Globe,
-  Loader2,
-  Pause,
-  Play,
-  RefreshCw,
-  Search,
-  X,
-} from "lucide-react";
+import { AppWindow, Copy, Loader2, RefreshCw, Search, X } from "lucide-react";
 import { copyTextToClipboard } from "../../lib/studio";
 import type { NexusController } from "../../hooks/useNexusController";
 
@@ -27,40 +15,31 @@ interface NetworkConnection {
   icon_base64: string | null;
 }
 
-type SocketFilter = "all" | "established" | "listen";
-type SocketSortKey = "process" | "protocol" | "local" | "remote" | "state";
+type SocketFilter = "all" | "established" | "listen" | "udp";
 
 const REFRESH_MS = 2000;
 
-const STATE_RANK: Record<string, number> = {
-  ESTABLISHED: 50,
-  SYN_SENT: 40,
-  SYN_RCVD: 39,
-  LISTEN: 30,
-  CLOSE_WAIT: 20,
-  TIME_WAIT: 19,
-  FIN_WAIT1: 18,
-  FIN_WAIT2: 17,
-  CLOSING: 16,
-  LAST_ACK: 15,
-  CLOSED: 5,
-  "—": 0,
-};
+function isListening(state: string): boolean {
+  return state === "LISTEN" || state === "LISTENING";
+}
 
-function stateBadgeClass(state: string): string {
-  switch (state) {
-    case "ESTABLISHED":
-      return "text-[#38bdf8] bg-sky-500/15 border-sky-400/35";
-    case "LISTEN":
-      return "text-[#10b981] bg-emerald-500/15 border-emerald-400/35";
-    case "TIME_WAIT":
-    case "CLOSE_WAIT":
-      return "text-[#8793a5] bg-white/[0.04] border-[#222b38]";
-    case "SYN_SENT":
-      return "text-[#f59e0b] bg-amber-500/15 border-amber-400/35";
-    default:
-      return "text-[#c5d0de] bg-[#151c27] border-[#222b38]";
+function stateBadge(state: string): { label: string; className: string } {
+  if (state === "ESTABLISHED") {
+    return {
+      label: "ESTABLISHED",
+      className: "border-emerald-500/20 bg-emerald-500/10 text-emerald-400",
+    };
   }
+  if (isListening(state)) {
+    return {
+      label: "LISTENING",
+      className: "border-sky-500/20 bg-sky-500/10 text-sky-400",
+    };
+  }
+  return {
+    label: state || "—",
+    className: "border-[#222b38] bg-[#151c27] text-slate-400",
+  };
 }
 
 function endpointHost(value: string): string {
@@ -83,12 +62,9 @@ export function NetworkModule({ c }: { c: NexusController }) {
   const [connections, setConnections] = useState<NetworkConnection[]>([]);
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<SocketFilter>("all");
-  const [autoRefresh, setAutoRefresh] = useState(true);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [sortKey, setSortKey] = useState<SocketSortKey>("state");
-  const [sortDesc, setSortDesc] = useState(true);
   const [menu, setMenu] = useState<{ x: number; y: number; conn: NetworkConnection } | null>(null);
 
   const fetchConnections = async () => {
@@ -106,10 +82,9 @@ export function NetworkModule({ c }: { c: NexusController }) {
 
   useEffect(() => {
     fetchConnections();
-    if (!autoRefresh) return;
     const timer = setInterval(fetchConnections, REFRESH_MS);
     return () => clearInterval(timer);
-  }, [autoRefresh]);
+  }, []);
 
   useEffect(() => {
     if (!menu) return;
@@ -130,55 +105,29 @@ export function NetworkModule({ c }: { c: NexusController }) {
     setTimeout(() => setNotice((current) => (current === message ? null : current)), 2200);
   };
 
+  const copyRemoteIp = async (conn: NetworkConnection) => {
+    const host = endpointHost(conn.remote_addr);
+    await copyTextToClipboard(host);
+    showNotice(`Скопирован IP: ${host}`);
+  };
+
   const query = search.trim().toLowerCase();
-  const visible = connections
-    .filter((conn) => {
-      if (filter === "established" && conn.state !== "ESTABLISHED") return false;
-      if (filter === "listen" && conn.state !== "LISTEN") return false;
-      if (!query) return true;
-      return (
-        conn.process_name.toLowerCase().includes(query) ||
-        conn.pid.toString().includes(query) ||
-        conn.remote_addr.toLowerCase().includes(query) ||
-        conn.local_addr.toLowerCase().includes(query) ||
-        endpointPort(conn.remote_addr).includes(query) ||
-        endpointPort(conn.local_addr).includes(query)
-      );
-    })
-    .sort((a, b) => {
-      let diff = 0;
-      switch (sortKey) {
-        case "process":
-          diff = a.process_name.localeCompare(b.process_name, "ru");
-          break;
-        case "protocol":
-          diff = a.protocol.localeCompare(b.protocol);
-          break;
-        case "local":
-          diff = a.local_addr.localeCompare(b.local_addr);
-          break;
-        case "remote":
-          diff = a.remote_addr.localeCompare(b.remote_addr);
-          break;
-        case "state":
-          diff = (STATE_RANK[a.state] ?? 1) - (STATE_RANK[b.state] ?? 1);
-          break;
-      }
-      if (diff === 0) diff = a.pid - b.pid;
-      return sortDesc ? -diff : diff;
-    });
+  const visible = connections.filter((conn) => {
+    if (filter === "established" && conn.state !== "ESTABLISHED") return false;
+    if (filter === "listen" && !isListening(conn.state)) return false;
+    if (filter === "udp" && conn.protocol.toUpperCase() !== "UDP") return false;
+    if (!query) return true;
+    return (
+      conn.process_name.toLowerCase().includes(query) ||
+      conn.pid.toString().includes(query) ||
+      conn.remote_addr.toLowerCase().includes(query) ||
+      conn.local_addr.toLowerCase().includes(query) ||
+      endpointHost(conn.remote_addr).toLowerCase().includes(query)
+    );
+  });
 
   const establishedCount = connections.filter((conn) => conn.state === "ESTABLISHED").length;
-  const listenCount = connections.filter((conn) => conn.state === "LISTEN").length;
-
-  const toggleSort = (key: SocketSortKey) => {
-    if (sortKey === key) {
-      setSortDesc((prev) => !prev);
-    } else {
-      setSortKey(key);
-      setSortDesc(key === "state");
-    }
-  };
+  const listenCount = connections.filter((conn) => isListening(conn.state)).length;
 
   const openMenu = (event: MouseEvent<HTMLDivElement>, conn: NetworkConnection) => {
     event.preventDefault();
@@ -188,26 +137,17 @@ export function NetworkModule({ c }: { c: NexusController }) {
     setMenu({ x: Math.max(8, x), y: Math.max(8, y), conn });
   };
 
-  const header = (key: SocketSortKey, label: string, alignRight = false) => {
-    const active = sortKey === key;
-    return (
-      <button
-        type="button"
-        onClick={() => toggleSort(key)}
-        className={`flex items-center gap-1 text-[10px] font-mono uppercase tracking-[0.14em] cursor-pointer ${
-          alignRight ? "justify-end" : "justify-start"
-        } ${active ? "text-sky-300" : "text-[#8793a5] hover:text-[#d5dde8]"}`}
-      >
-        <span>{label}</span>
-        {active ? sortDesc ? <ChevronDown size={11} /> : <ChevronUp size={11} /> : <span className="w-[11px]" />}
-      </button>
-    );
-  };
-
   const filters: { id: SocketFilter; label: string }[] = [
-    { id: "all", label: "Все соединения" },
-    { id: "established", label: "Активные (ESTABLISHED)" },
-    { id: "listen", label: "Слушающие порты (LISTEN)" },
+    { id: "all", label: "Все" },
+    { id: "established", label: "Установленные (ESTABLISHED)" },
+    { id: "listen", label: "Слушающие (LISTENING)" },
+    { id: "udp", label: "UDP" },
+  ];
+
+  const kpis = [
+    { label: "Активные соединения", value: connections.length, tone: "text-slate-100" },
+    { label: "TCP сокеты", value: establishedCount, tone: "text-emerald-400" },
+    { label: "Прослушивание", value: listenCount, tone: "text-sky-400" },
   ];
 
   return (
@@ -218,78 +158,62 @@ export function NetworkModule({ c }: { c: NexusController }) {
         animate={{ opacity: 1, y: 0 }}
         exit={{ opacity: 0, y: -6 }}
         transition={{ duration: 0.18, ease: "easeOut" }}
-        className="space-y-4 max-w-6xl w-full"
+        className="w-full max-w-6xl space-y-4"
       >
-        <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4 border-b border-[#222b38] pb-3.5">
+        <div className="flex flex-col justify-between gap-4 border-b border-[#222b38] pb-3.5 lg:flex-row lg:items-end">
           <div>
-            <h2 className="text-2xl font-semibold tracking-tight text-slate-100">Анализатор сети</h2>
-            <p className="mt-0.5 text-sm text-slate-400">
-              TCP и UDP сокеты Windows с привязкой к процессу-владельцу
-            </p>
+            <h2 className="text-2xl font-semibold tracking-tight text-slate-100">Сетевой монитор</h2>
+            <p className="mt-0.5 text-sm text-slate-400">Активные сетевые сокеты и соединения процессов</p>
           </div>
-          <div className="flex flex-wrap items-center gap-2 font-mono text-[11px]">
-            <span className="px-2.5 py-1.5 rounded-lg bg-[#151c27] border border-[#222b38] text-[#8793a5] tabular-nums">
-              СОКЕТОВ: <strong className="text-[#e8edf4]">{connections.length}</strong>
-            </span>
-            <span className="px-2.5 py-1.5 rounded-lg bg-[#151c27] border border-[#222b38] text-[#8793a5] tabular-nums">
-              ESTABLISHED: <strong className="text-[#38bdf8]">{establishedCount}</strong>
-            </span>
-            <span className="px-2.5 py-1.5 rounded-lg bg-[#151c27] border border-[#222b38] text-[#8793a5] tabular-nums">
-              LISTEN: <strong className="text-[#10b981]">{listenCount}</strong>
-            </span>
-            <motion.button
-              type="button"
-              whileTap={{ scale: 0.95 }}
-              onClick={() => setAutoRefresh((prev) => !prev)}
-              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border cursor-pointer ${
-                autoRefresh
-                  ? "bg-sky-500/15 text-sky-300 border-sky-500/35"
-                  : "bg-amber-500/15 text-amber-300 border-amber-500/35"
-              }`}
-            >
-              {autoRefresh ? <Pause size={12} /> : <Play size={12} />}
-              <span>{autoRefresh ? "LIVE 2s" : "ПАУЗА"}</span>
-            </motion.button>
-            <motion.button
-              type="button"
-              whileTap={{ scale: 0.95 }}
-              onClick={fetchConnections}
-              className="inline-flex items-center justify-center h-[30px] w-[30px] rounded-lg bg-[#151c27] hover:bg-white/[0.06] text-[#c5d0de] border border-[#222b38] cursor-pointer"
-            >
-              <RefreshCw size={13} className={loading ? "animate-spin" : ""} />
-            </motion.button>
-          </div>
+          <button
+            type="button"
+            onClick={() => void fetchConnections()}
+            className="inline-flex items-center gap-2 rounded-lg border border-[#222b38] bg-[#111722] px-3 py-2 text-xs font-medium text-slate-200 hover:bg-[#151c27]"
+          >
+            <RefreshCw size={13} className={loading ? "animate-spin" : ""} />
+            Обновить
+          </button>
         </div>
 
-        <div className="flex flex-wrap gap-2">
-          {filters.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              onClick={() => setFilter(item.id)}
-              className={`px-3 py-1.5 rounded-lg text-[11px] font-mono border cursor-pointer transition-colors ${
-                filter === item.id
-                  ? "bg-sky-500/15 text-sky-300 border-sky-400/40"
-                  : "bg-[#151c27] text-[#8793a5] border-[#222b38] hover:text-[#e8edf4]"
-              }`}
-            >
-              {item.label}
-            </button>
+        <div className="grid gap-3 sm:grid-cols-3">
+          {kpis.map((item) => (
+            <div key={item.label} className="rounded-xl border border-[#222b38] bg-[#111722] px-4 py-3">
+              <div className="text-xs text-slate-400">{item.label}</div>
+              <div className={`mt-1 font-mono text-2xl font-semibold tabular-nums ${item.tone}`}>{item.value}</div>
+            </div>
           ))}
         </div>
 
-        <div className="relative">
-          <Search size={15} className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-[#8793a5]" />
-          <input
-            type="text"
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            placeholder="Поиск по процессу, удалённому IP или порту..."
-            className="w-full pl-10 pr-24 py-2.5 rounded-xl bg-[#151c27] border border-[#222b38] text-sm font-mono text-[#e8edf4] placeholder-[#8793a5] focus:outline-none focus:border-sky-500/40 transition-all"
-          />
-          <span className="absolute right-3.5 top-1/2 -translate-y-1/2 text-[10px] font-mono text-[#8793a5] tabular-nums">
-            {visible.length} / {connections.length}
-          </span>
+        <div className="space-y-3 rounded-xl border border-[#222b38] bg-[#111722] p-3">
+          <div className="relative">
+            <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
+            <input
+              type="text"
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="Поиск по процессу или IP-адресу"
+              className="w-full rounded-lg border border-[#222b38] bg-[#151c27] py-2 pr-16 pl-9 text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:border-slate-500"
+            />
+            <span className="absolute top-1/2 right-3 -translate-y-1/2 font-mono text-[10px] text-slate-500">
+              {visible.length}/{connections.length}
+            </span>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {filters.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => setFilter(item.id)}
+                className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
+                  filter === item.id
+                    ? "border-sky-500/30 bg-sky-500/10 text-sky-300"
+                    : "border-[#222b38] bg-[#151c27] text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
         </div>
 
         <AnimatePresence>
@@ -298,10 +222,10 @@ export function NetworkModule({ c }: { c: NexusController }) {
               initial={{ opacity: 0, y: -6 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -6 }}
-              className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs font-mono flex items-center justify-between gap-3"
+              className="flex items-center justify-between gap-3 rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300"
             >
               <span>{error}</span>
-              <button type="button" onClick={() => setError(null)} className="cursor-pointer">
+              <button type="button" onClick={() => setError(null)}>
                 <X size={13} />
               </button>
             </motion.div>
@@ -311,82 +235,90 @@ export function NetworkModule({ c }: { c: NexusController }) {
               initial={{ opacity: 0, y: -6 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0 }}
-              className="p-3 rounded-xl bg-sky-500/10 border border-sky-500/30 text-sky-300 text-xs font-mono truncate"
+              className="rounded-xl border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-xs text-sky-300"
             >
               {notice}
             </motion.div>
           )}
         </AnimatePresence>
 
-        <div className="relative rounded-xl bg-[#111722] border border-[#222b38] overflow-hidden">
-          <div className="grid grid-cols-[minmax(0,1.2fr)_80px_minmax(0,1fr)_minmax(0,1fr)_130px] gap-3 px-4 py-2.5 bg-[#151c27] border-b border-[#222b38]">
-            {header("process", "Процесс")}
-            {header("protocol", "Протокол")}
-            {header("local", "Локальный адрес")}
-            {header("remote", "Удалённый узел")}
-            {header("state", "Состояние", true)}
+        <div className="overflow-hidden rounded-xl border border-[#222b38] bg-[#111722]">
+          <div className="grid grid-cols-[minmax(0,1.3fr)_88px_minmax(0,1fr)_minmax(0,1fr)_130px_72px] gap-3 border-b border-[#222b38] bg-[#151c27] px-4 py-2.5 text-[11px] font-medium text-slate-400">
+            <span>Процесс (PID)</span>
+            <span>Протокол</span>
+            <span>Локальный адрес</span>
+            <span>Удалённый адрес</span>
+            <span>Состояние</span>
+            <span>Действие</span>
           </div>
           <div
             onScroll={() => setMenu(null)}
-            className="max-h-[calc(100vh-360px)] min-h-[240px] overflow-y-auto divide-y divide-white/[0.035]"
+            className="max-h-[calc(100vh-460px)] min-h-[240px] divide-y divide-[#222b38] overflow-y-auto"
           >
             {loading && connections.length === 0 ? (
-              <div className="p-10 flex items-center justify-center gap-2 text-xs font-mono text-[#8793a5]">
+              <div className="flex items-center justify-center gap-2 p-10 text-xs text-slate-400">
                 <Loader2 size={14} className="animate-spin text-sky-400" />
                 Чтение таблицы сокетов...
               </div>
             ) : visible.length === 0 ? (
-              <div className="p-10 text-center text-xs font-mono text-[#8793a5]">
-                Соединения по запросу не найдены
+              <div className="flex flex-col items-center gap-2 p-10 text-sm text-slate-400">
+                <Search size={18} />
+                Соединения не найдены
               </div>
             ) : (
-              visible.map((conn, index) => (
-                <div
-                  key={`${conn.protocol}-${conn.local_addr}-${conn.remote_addr}-${conn.pid}-${index}`}
-                  onContextMenu={(event) => openMenu(event, conn)}
-                  className="grid grid-cols-[minmax(0,1.2fr)_80px_minmax(0,1fr)_minmax(0,1fr)_130px] gap-3 px-4 py-2 items-center text-xs font-mono hover:bg-white/[0.03]"
-                >
-                  <div className="min-w-0 flex items-center gap-2.5">
-                    <div className="h-4 w-4 rounded flex items-center justify-center shrink-0 overflow-hidden text-[#8793a5]">
-                      {conn.icon_base64 ? (
-                        <img
-                          src={`data:image/png;base64,${conn.icon_base64}`}
-                          alt=""
-                          draggable={false}
-                          className="h-4 w-4 object-contain"
-                        />
-                      ) : (
-                        <AppWindow size={12} />
-                      )}
+              visible.map((conn, index) => {
+                const badge = stateBadge(conn.state);
+                return (
+                  <div
+                    key={`${conn.protocol}-${conn.local_addr}-${conn.remote_addr}-${conn.pid}-${index}`}
+                    onContextMenu={(event) => openMenu(event, conn)}
+                    className="grid grid-cols-[minmax(0,1.3fr)_88px_minmax(0,1fr)_minmax(0,1fr)_130px_72px] items-center gap-3 px-4 py-2.5 text-xs hover:bg-[#151c27]"
+                  >
+                    <div className="flex min-w-0 items-center gap-2.5">
+                      <div className="flex h-4 w-4 shrink-0 items-center justify-center overflow-hidden text-slate-500">
+                        {conn.icon_base64 ? (
+                          <img
+                            src={`data:image/png;base64,${conn.icon_base64}`}
+                            alt=""
+                            draggable={false}
+                            className="h-4 w-4 object-contain"
+                          />
+                        ) : (
+                          <AppWindow size={12} />
+                        )}
+                      </div>
+                      <div className="min-w-0">
+                        <div className="truncate font-semibold text-slate-100">{conn.process_name}</div>
+                        <div className="font-mono text-[10px] text-slate-500">PID {conn.pid}</div>
+                      </div>
                     </div>
-                    <div className="min-w-0">
-                      <div className="truncate text-[#e8edf4] font-semibold">{conn.process_name}</div>
-                      <div className="text-[10px] text-[#8793a5] tabular-nums">PID {conn.pid}</div>
+                    <div className={`font-mono ${conn.protocol.toUpperCase() === "TCP" ? "text-sky-300" : "text-violet-300"}`}>
+                      {conn.protocol}
                     </div>
+                    <div className="truncate font-mono text-slate-300" title={conn.local_addr}>
+                      {conn.local_addr}
+                    </div>
+                    <div className="truncate font-mono text-slate-300" title={conn.remote_addr}>
+                      {conn.remote_addr}
+                    </div>
+                    <div>
+                      <span className={`inline-flex rounded-md border px-2 py-0.5 font-mono text-[10px] ${badge.className}`}>
+                        {badge.label}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      title="Копировать удалённый IP"
+                      onClick={() => void copyRemoteIp(conn)}
+                      className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[#222b38] text-slate-400 hover:bg-[#151c27] hover:text-slate-100"
+                    >
+                      <Copy size={13} />
+                    </button>
                   </div>
-                  <div className={conn.protocol === "TCP" ? "text-sky-300" : "text-violet-300"}>
-                    {conn.protocol}
-                  </div>
-                  <div className="truncate text-[#c5d0de] tabular-nums" title={conn.local_addr}>
-                    {conn.local_addr}
-                  </div>
-                  <div className="truncate text-[#c5d0de] tabular-nums" title={conn.remote_addr}>
-                    {conn.remote_addr}
-                  </div>
-                  <div className="text-right">
-                    <span className={`inline-flex px-2 py-0.5 rounded-md border text-[10px] tracking-wide ${stateBadgeClass(conn.state)}`}>
-                      {conn.state}
-                    </span>
-                  </div>
-                </div>
-              ))
+                );
+              })
             )}
           </div>
-        </div>
-
-        <div className="flex items-center gap-2 text-[10px] font-mono text-[#8793a5]">
-          <Globe size={12} className="text-sky-400" />
-          ПКМ по строке — копирование адреса или переход к процессу
         </div>
       </motion.div>
 
@@ -400,26 +332,24 @@ export function NetworkModule({ c }: { c: NexusController }) {
             style={{ left: menu.x, top: menu.y }}
             onMouseDown={(event) => event.stopPropagation()}
             onContextMenu={(event) => event.preventDefault()}
-            className="fixed z-[100] w-64 rounded-xl bg-[#111722] border border-[#222b38] shadow-[0_18px_44px_rgba(0,0,0,0.85)] p-1.5 font-mono text-xs"
+            className="fixed z-[100] w-64 rounded-xl border border-[#222b38] bg-[#111722] p-1.5 text-xs shadow-[0_18px_44px_rgba(0,0,0,0.85)]"
           >
-            <div className="px-2.5 py-2 mb-1 rounded-lg bg-[#151c27] border border-[#222b38]">
-              <div className="text-[#e8edf4] font-bold truncate">{menu.conn.process_name}</div>
-              <div className="text-[10px] text-[#8793a5] truncate">
+            <div className="mb-1 rounded-lg border border-[#222b38] bg-[#151c27] px-2.5 py-2">
+              <div className="truncate font-semibold text-slate-100">{menu.conn.process_name}</div>
+              <div className="truncate font-mono text-[10px] text-slate-500">
                 {menu.conn.protocol} {menu.conn.remote_addr}
               </div>
             </div>
             <button
               type="button"
-              onClick={async () => {
-                const host = endpointHost(menu.conn.remote_addr);
+              onClick={() => {
+                void copyRemoteIp(menu.conn);
                 setMenu(null);
-                await copyTextToClipboard(host);
-                showNotice(`Скопирован IP: ${host}`);
               }}
-              className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-left text-[#e8edf4] hover:bg-white/[0.06] cursor-pointer"
+              className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-slate-200 hover:bg-[#151c27]"
             >
-              <Copy size={14} className="text-sky-300 shrink-0" />
-              <span>Копировать удалённый IP</span>
+              <Copy size={14} className="shrink-0 text-sky-300" />
+              Копировать удалённый IP
             </button>
             <button
               type="button"
@@ -429,10 +359,10 @@ export function NetworkModule({ c }: { c: NexusController }) {
                 await copyTextToClipboard(port);
                 showNotice(`Скопирован порт: ${port}`);
               }}
-              className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-left text-[#e8edf4] hover:bg-white/[0.06] cursor-pointer"
+              className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-slate-200 hover:bg-[#151c27]"
             >
-              <Copy size={14} className="text-[#8793a5] shrink-0" />
-              <span>Копировать порт</span>
+              <Copy size={14} className="shrink-0 text-slate-400" />
+              Копировать порт
             </button>
             <div className="my-1 h-px bg-[#222b38]" />
             <button
@@ -444,10 +374,10 @@ export function NetworkModule({ c }: { c: NexusController }) {
                 c.setSelectedPid(pid);
                 c.setActiveTab("processes");
               }}
-              className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-left text-sky-200 hover:bg-sky-500/10 cursor-pointer"
+              className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sky-200 hover:bg-sky-500/10"
             >
-              <AppWindow size={14} className="text-sky-300 shrink-0" />
-              <span>Перейти к процессу</span>
+              <AppWindow size={14} className="shrink-0 text-sky-300" />
+              Перейти к процессу
             </button>
           </motion.div>
         )}

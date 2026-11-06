@@ -157,7 +157,7 @@ export interface ProcessItem {
   icon_base64: string | null;
 }
 
-export type ProcessSortKey = "name" | "cpu" | "memory" | "disk" | "runtime";
+export type ProcessSortKey = "name" | "pid" | "cpu" | "memory" | "disk" | "runtime";
 
 export interface ProcessContextMenuState {
   x: number;
