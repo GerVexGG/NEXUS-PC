@@ -17,6 +17,24 @@ pub struct DropSessionInfo {
     pub url: String,
     pub save_dir: String,
     pub qr_svg: String,
+    pub transfer: Option<DropTransfer>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct DropTransfer {
+    pub filename: String,
+    pub received_bytes: u64,
+    pub total_bytes: u64,
+    pub speed_bps: f64,
+}
+
+struct LiveTransfer {
+    filename: String,
+    received_bytes: u64,
+    total_bytes: u64,
+    speed_bps: f64,
+    sample_bytes: u64,
+    sample_at: Instant,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -41,6 +59,7 @@ struct DropInner {
     info: DropSessionInfo,
     files: Vec<DroppedFileItem>,
     texts: Vec<DropTextItem>,
+    transfer: Option<LiveTransfer>,
 }
 
 pub struct DropHub {
@@ -59,6 +78,7 @@ impl DropHub {
                 info: idle_info(),
                 files: Vec::new(),
                 texts: Vec::new(),
+                transfer: None,
             }),
             shutdown: AtomicBool::new(true),
             alive: AtomicBool::new(false),
@@ -70,7 +90,16 @@ impl DropHub {
     pub fn session(&self) -> DropSessionInfo {
         self.inner
             .lock()
-            .map(|guard| guard.info.clone())
+            .map(|guard| {
+                let mut info = guard.info.clone();
+                info.transfer = guard.transfer.as_ref().map(|item| DropTransfer {
+                    filename: item.filename.clone(),
+                    received_bytes: item.received_bytes,
+                    total_bytes: item.total_bytes,
+                    speed_bps: item.speed_bps,
+                });
+                info
+            })
             .unwrap_or_else(|_| idle_info())
     }
 
@@ -133,6 +162,7 @@ impl DropHub {
             url,
             save_dir: save_dir.display().to_string(),
             qr_svg,
+            transfer: None,
         };
 
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -164,6 +194,8 @@ impl DropHub {
             guard.info.token.clear();
             guard.info.url.clear();
             guard.info.qr_svg.clear();
+            guard.info.transfer = None;
+            guard.transfer = None;
         }
         Ok(())
     }
@@ -219,6 +251,8 @@ fn serve(listener: TcpListener, generation: u64, hub: HubHandle) {
         if let Ok(mut guard) = unsafe { &*hub.files }.lock() {
             guard.running = false;
             guard.info.is_running = false;
+            guard.transfer = None;
+            guard.info.transfer = None;
         }
     }
 }
@@ -321,10 +355,11 @@ fn receive_upload(
         return UploadOutcome::Failed(format!("Папка недоступна: {err}"));
     }
     let saved = if let Some(boundary) = content_boundary(headers) {
-        save_multipart(hub, &mut reader, &save_dir, &boundary)
+        save_multipart(hub, &mut reader, &save_dir, &boundary, length)
     } else {
-        save_raw(hub, &mut reader, &save_dir)
+        save_raw(hub, &mut reader, &save_dir, length)
     };
+    clear_transfer(hub);
     let drained = reader.discard_rest();
     match saved.and(drained) {
         Ok(()) => UploadOutcome::Ok,
@@ -389,6 +424,46 @@ fn session_token_ok(hub: &HubHandle, token: &str) -> bool {
         .lock()
         .map(|guard| guard.running && guard.info.token == token)
         .unwrap_or(false)
+}
+
+fn note_transfer(hub: &HubHandle, filename: &str, received: u64, total: u64) {
+    let Ok(mut guard) = unsafe { &*hub.files }.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    let speed = match &guard.transfer {
+        Some(prev) => {
+            let elapsed = now.saturating_duration_since(prev.sample_at).as_secs_f64();
+            if elapsed >= 0.2 {
+                let delta = received.saturating_sub(prev.sample_bytes) as f64;
+                if elapsed > 0.0 { delta / elapsed } else { prev.speed_bps }
+            } else {
+                prev.speed_bps
+            }
+        }
+        None => 0.0,
+    };
+    let (sample_bytes, sample_at) = match &guard.transfer {
+        Some(prev) if now.saturating_duration_since(prev.sample_at).as_secs_f64() < 0.2 => {
+            (prev.sample_bytes, prev.sample_at)
+        }
+        _ => (received, now),
+    };
+    guard.transfer = Some(LiveTransfer {
+        filename: filename.to_string(),
+        received_bytes: received,
+        total_bytes: total,
+        speed_bps: speed,
+        sample_bytes,
+        sample_at,
+    });
+}
+
+fn clear_transfer(hub: &HubHandle) {
+    if let Ok(mut guard) = unsafe { &*hub.files }.lock() {
+        guard.transfer = None;
+        guard.info.transfer = None;
+    }
 }
 
 fn hub_save_dir(hub: &HubHandle) -> PathBuf {
@@ -511,7 +586,7 @@ fn read_headers(stream: &mut TcpStream) -> Result<(String, Vec<u8>), String> {
     Err("Заголовки не завершены".to_string())
 }
 
-fn save_raw(hub: &HubHandle, reader: &mut BodyReader<'_>, save_dir: &Path) -> Result<(), String> {
+fn save_raw(hub: &HubHandle, reader: &mut BodyReader<'_>, save_dir: &Path, total: u64) -> Result<(), String> {
     let path = unique_path(save_dir, "upload.bin");
     let mut file = fs::File::create(&path).map_err(|err| format!("Не удалось создать файл: {err}"))?;
     file.write_all(&reader.pending).map_err(|err| format!("Запись файла: {err}"))?;
@@ -528,13 +603,20 @@ fn save_raw(hub: &HubHandle, reader: &mut BodyReader<'_>, save_dir: &Path) -> Re
         file.write_all(&buf[..read]).map_err(|err| format!("Запись файла: {err}"))?;
         reader.remaining -= read as u64;
         size += read as u64;
+        note_transfer(hub, "Входящий файл", total.saturating_sub(reader.remaining), total);
     }
     file.flush().map_err(|err| format!("Запись файла: {err}"))?;
     remember_file(hub, &path, size, "SUCCESS");
     Ok(())
 }
 
-fn save_multipart(hub: &HubHandle, reader: &mut BodyReader<'_>, save_dir: &Path, boundary: &str) -> Result<(), String> {
+fn save_multipart(
+    hub: &HubHandle,
+    reader: &mut BodyReader<'_>,
+    save_dir: &Path,
+    boundary: &str,
+    total: u64,
+) -> Result<(), String> {
     let open = format!("--{boundary}").into_bytes();
     let next_mark = format!("\r\n--{boundary}").into_bytes();
     reader.fill_until(256 * 1024, |buf| find_slice(buf, &open).is_some())?;
@@ -556,7 +638,8 @@ fn save_multipart(hub: &HubHandle, reader: &mut BodyReader<'_>, save_dir: &Path,
         if let Some(name) = filename_from_disposition(&head) {
             let filename = sanitize_filename(&name);
             let path = unique_path(save_dir, &filename);
-            match write_until_mark(reader, &path, &next_mark) {
+            note_transfer(hub, &filename, total.saturating_sub(reader.remaining), total);
+            match write_until_mark(hub, reader, &path, &next_mark, &filename, total) {
                 Ok(size) => {
                     remember_file(hub, &path, size, "SUCCESS");
                     saved += 1;
@@ -587,7 +670,14 @@ fn save_multipart(hub: &HubHandle, reader: &mut BodyReader<'_>, save_dir: &Path,
     Ok(())
 }
 
-fn write_until_mark(reader: &mut BodyReader<'_>, path: &Path, mark: &[u8]) -> Result<u64, String> {
+fn write_until_mark(
+    hub: &HubHandle,
+    reader: &mut BodyReader<'_>,
+    path: &Path,
+    mark: &[u8],
+    filename: &str,
+    total: u64,
+) -> Result<u64, String> {
     let mut file = fs::File::create(path).map_err(|err| format!("Не удалось создать файл: {err}"))?;
     let mut tail = Vec::new();
     let mut written = 0u64;
@@ -613,6 +703,7 @@ fn write_until_mark(reader: &mut BodyReader<'_>, path: &Path, mark: &[u8]) -> Re
             file.write_all(&data[..cut]).map_err(|err| format!("Запись файла: {err}"))?;
             written += cut as u64;
             tail = data[cut..].to_vec();
+            note_transfer(hub, filename, total.saturating_sub(reader.remaining), total);
         } else {
             tail = data;
         }
@@ -865,12 +956,12 @@ fn render_qr_svg(url: &str) -> Result<String, String> {
     let code = QrCode::new(url.as_bytes()).map_err(|err| format!("Не удалось построить QR: {err}"))?;
     let size = code.width();
     let mut svg = format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {size} {size}\" shape-rendering=\"crispEdges\"><rect width=\"{size}\" height=\"{size}\" fill=\"#111722\"/>"
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {size} {size}\" shape-rendering=\"crispEdges\"><rect width=\"{size}\" height=\"{size}\" fill=\"#ffffff\"/>"
     );
     for y in 0..size {
         for x in 0..size {
             if code[(x, y)] == Color::Dark {
-                svg.push_str(&format!("<rect x=\"{x}\" y=\"{y}\" width=\"1\" height=\"1\" fill=\"#e8edf4\"/>"));
+                svg.push_str(&format!("<rect x=\"{x}\" y=\"{y}\" width=\"1\" height=\"1\" fill=\"#111722\"/>"));
             }
         }
     }
@@ -989,6 +1080,7 @@ fn idle_info() -> DropSessionInfo {
         url: String::new(),
         save_dir: default_save_dir().display().to_string(),
         qr_svg: String::new(),
+        transfer: None,
     }
 }
 

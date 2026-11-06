@@ -105,6 +105,7 @@ export function useNexusController() {
 
   // Состояние модуля управления питанием
   const [restartMode, setRestartMode] = useState<boolean>(false);
+  const [timerSleep, setTimerSleep] = useState<boolean>(false);
   const [customMinutes, setCustomMinutes] = useState<string>("");
   const [timerState, setTimerState] = useState<StoredTimerState | null>(() => {
     try {
@@ -574,9 +575,15 @@ export function useNexusController() {
     const updateRemaining = () => {
       const diff = Math.ceil((timerState.endTime - Date.now()) / 1000);
       if (diff <= 0) {
+        const shouldSleep = timerState.sleep === true;
         setRemainingSeconds(0);
         setTimerState(null);
         localStorage.removeItem(TIMER_STORAGE_KEY);
+        if (shouldSleep) {
+          void invoke("system_power_action", { action: "sleep" }).catch((err) => {
+            setPowerError(String(err));
+          });
+        }
       } else {
         setRemainingSeconds(diff);
       }
@@ -595,16 +602,22 @@ export function useNexusController() {
     }
 
     const seconds = Math.round(minutes * 60);
+    const sleep = timerSleep && !restartMode;
     try {
-      await invoke("schedule_shutdown", {
-        seconds,
-        restart: restartMode,
-      });
+      if (sleep) {
+        await invoke("cancel_shutdown");
+      } else {
+        await invoke("schedule_shutdown", {
+          seconds,
+          restart: restartMode,
+        });
+      }
 
       const newState: StoredTimerState = {
         endTime: Date.now() + seconds * 1000,
         totalSeconds: seconds,
-        restart: restartMode,
+        restart: sleep ? false : restartMode,
+        sleep,
       };
       setTimerState(newState);
       setRemainingSeconds(seconds);
@@ -904,6 +917,8 @@ export function useNexusController() {
     processMenuRef,
     restartMode,
     setRestartMode,
+    timerSleep,
+    setTimerSleep,
     customMinutes,
     setCustomMinutes,
     timerState,

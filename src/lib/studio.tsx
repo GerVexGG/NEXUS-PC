@@ -211,6 +211,7 @@ export interface StoredTimerState {
   endTime: number;
   totalSeconds: number;
   restart: boolean;
+  sleep?: boolean;
 }
 
 export const TIMER_STORAGE_KEY = "nexus_power_timer";

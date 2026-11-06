@@ -1,8 +1,15 @@
 import { useCallback, useEffect, useState } from "react";
 import { motion } from "framer-motion";
 import { invoke } from "@tauri-apps/api/core";
-import { Copy, FolderOpen, Smartphone, Square } from "lucide-react";
+import { Archive, Copy, FileText, FolderOpen, Image, Smartphone, Square } from "lucide-react";
 import { copyTextToClipboard, formatBytes } from "../../lib/studio";
+
+interface DropTransfer {
+  filename: string;
+  received_bytes: number;
+  total_bytes: number;
+  speed_bps: number;
+}
 
 interface DropSessionInfo {
   is_running: boolean;
@@ -12,6 +19,7 @@ interface DropSessionInfo {
   url: string;
   save_dir: string;
   qr_svg: string;
+  transfer?: DropTransfer | null;
 }
 
 interface DroppedFileItem {
@@ -37,7 +45,22 @@ const idleSession: DropSessionInfo = {
   url: "",
   save_dir: "",
   qr_svg: "",
+  transfer: null,
 };
+
+function fileIcon(name: string) {
+  const ext = name.split(".").pop()?.toLowerCase() ?? "";
+  if (["png", "jpg", "jpeg", "gif", "webp", "heic", "bmp"].includes(ext)) return Image;
+  if (["zip", "rar", "7z", "tar", "gz", "bz2"].includes(ext)) return Archive;
+  return FileText;
+}
+
+function formatSpeed(bps: number): string {
+  if (!Number.isFinite(bps) || bps <= 0) return "0 MB/s";
+  const mb = bps / (1024 * 1024);
+  if (mb >= 0.1) return `${mb.toFixed(1)} MB/s`;
+  return `${(bps / 1024).toFixed(0)} KB/s`;
+}
 
 export function DropModule() {
   const [session, setSession] = useState<DropSessionInfo>(idleSession);
@@ -64,7 +87,7 @@ export function DropModule() {
 
   useEffect(() => {
     void refresh();
-    const timer = window.setInterval(() => void refresh(), 1500);
+    const timer = window.setInterval(() => void refresh(), 800);
     return () => window.clearInterval(timer);
   }, [refresh]);
 
@@ -101,6 +124,12 @@ export function DropModule() {
     window.setTimeout(() => setCopied(""), 1400);
   };
 
+  const transfer = session.transfer;
+  const progress =
+    transfer && transfer.total_bytes > 0
+      ? Math.min(100, Math.max(0, (transfer.received_bytes / transfer.total_bytes) * 100))
+      : 0;
+
   return (
     <motion.div
       key="drop"
@@ -108,186 +137,176 @@ export function DropModule() {
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0, y: -6 }}
       transition={{ duration: 0.18, ease: "easeOut" }}
-      className="space-y-4 max-w-6xl w-full"
+      className="w-full max-w-6xl space-y-4"
     >
-      <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4 border-b border-[#222b38] pb-3.5">
+      <div className="flex flex-col justify-between gap-4 border-b border-[#222b38] pb-3.5 lg:flex-row lg:items-end">
         <div>
-          <h2 className="text-2xl font-semibold tracking-tight text-slate-100">Защищённая передача</h2>
-          <p className="mt-0.5 text-sm text-slate-400">
-            Файлы, фото и ссылки со смартфона на этот компьютер по Wi-Fi
-          </p>
+          <h2 className="text-2xl font-semibold tracking-tight text-slate-100">NEXUS Drop</h2>
+          <p className="mt-0.5 text-sm text-slate-400">Локальная передача файлов без интернета и проводов</p>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <span
-            className={`px-2.5 py-1.5 rounded-lg border font-mono text-[11px] tracking-wide ${
-              session.is_running
-                ? "bg-sky-500/15 text-sky-300 border-sky-500/35"
-                : "bg-[#151c27] text-[#8793a5] border-[#222b38]"
-            }`}
-          >
-            {session.is_running ? "СЕССИЯ АКТИВНА" : "ОЖИДАНИЕ ЗАПУСКА"}
-          </span>
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => void (session.is_running ? stop() : start())}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-sky-500/35 bg-sky-500/15 text-sky-300 font-mono text-[11px] cursor-pointer disabled:opacity-50"
-          >
-            {session.is_running ? <Square size={12} /> : <Smartphone size={12} />}
-            {session.is_running ? "Остановить" : "Запустить прием"}
-          </button>
-          <button
-            type="button"
-            onClick={() => void invoke("open_drop_folder").catch((err) => setError(String(err)))}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-[#222b38] bg-[#151c27] text-[#e8edf4] font-mono text-[11px] cursor-pointer"
-          >
-            <FolderOpen size={12} />
-            Открыть папку загрузок
-          </button>
-        </div>
-      </div>
-
-      {error && (
-        <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs font-mono text-rose-300">
-          {error}
-        </div>
-      )}
-
-      {session.is_running ? (
-        <div className="grid grid-cols-1 lg:grid-cols-[220px_1fr] gap-4">
-          <div className="rounded-2xl border border-[#222b38] bg-[#111722] p-3">
-            <div
-              className="aspect-square rounded-xl overflow-hidden border border-[#222b38] bg-[#111722] [&_svg]:h-full [&_svg]:w-full"
-              dangerouslySetInnerHTML={{ __html: session.qr_svg }}
-            />
+        {session.is_running ? (
+          <div className="flex items-center gap-2">
+            <span className="inline-flex items-center gap-2 rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-3 py-1.5 text-xs text-emerald-400">
+              <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+              Сервер активен
+            </span>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => void stop()}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-[#222b38] bg-[#111722] px-3 py-1.5 text-xs text-slate-300 hover:text-slate-100 disabled:opacity-50"
+            >
+              <Square size={12} />
+              Остановить
+            </button>
           </div>
-          <div className="rounded-2xl border border-[#222b38] bg-[#111722] p-4 flex flex-col justify-between gap-4">
-            <div>
-              <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-[#8793a5] mb-2">
-                Подключение в локальной сети
-              </div>
-              <div className="flex flex-wrap items-center gap-2 mb-3">
-                <span className="px-2.5 py-1 rounded-lg bg-[#151c27] border border-[#222b38] font-mono text-sm text-[#e8edf4]">
-                  {session.local_ip}:{session.port}
-                </span>
-                <span className="px-2.5 py-1 rounded-lg bg-sky-500/15 border border-sky-500/35 font-mono text-sm text-sky-300 tracking-[0.18em]">
-                  {session.token}
-                </span>
-              </div>
-              <p className="text-sm text-[#8793a5] leading-relaxed max-w-xl">
-                Наведите камеру смартфона на QR-код для моментальной отправки фото, файлов или ссылок без проводов.
-              </p>
-            </div>
-            <div className="flex items-center gap-2">
-              <code className="flex-1 truncate rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2 text-[11px] font-mono text-[#d5dde8]">
-                {session.url}
-              </code>
-              <button
-                type="button"
-                onClick={() => void copyValue(session.url, "url")}
-                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-[#222b38] bg-[#151c27] text-[#e8edf4] font-mono text-[11px] cursor-pointer"
-              >
-                <Copy size={12} />
-                {copied === "url" ? "Скопировано" : "Копировать"}
-              </button>
-            </div>
-          </div>
-        </div>
-      ) : (
-        <div className="rounded-2xl border border-[#222b38] bg-[#111722] px-6 py-10 text-center">
-          <Smartphone size={28} className="mx-auto text-sky-400 mb-3" />
-          <div className="font-mono text-sm tracking-[0.16em] text-[#e8edf4] mb-1">STANDBY</div>
-          <p className="text-xs text-[#8793a5] max-w-md mx-auto mb-4">
-            Приём выключен. Запустите сессию, чтобы открыть одноразовый адрес в локальной сети.
-          </p>
+        ) : (
           <button
             type="button"
             disabled={busy}
             onClick={() => void start()}
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg border border-sky-500/35 bg-sky-500/15 text-sky-300 font-mono text-xs cursor-pointer disabled:opacity-50"
+            className="inline-flex items-center gap-2 rounded-lg border border-sky-500/30 bg-sky-500/20 px-3 py-2 text-xs font-medium text-sky-300 hover:bg-sky-500/30 disabled:opacity-50"
           >
             <Smartphone size={14} />
-            Запустить прием
+            Запустить сервер
           </button>
-        </div>
-      )}
-
-      <div className="rounded-2xl border border-[#222b38] bg-[#111722] overflow-hidden">
-        <div className="px-4 py-3 border-b border-[#222b38] text-[10px] font-mono uppercase tracking-[0.18em] text-[#8793a5]">
-          Принятые файлы
-        </div>
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-xs">
-            <thead className="text-[10px] font-mono uppercase tracking-wider text-[#8793a5]">
-              <tr className="border-b border-[#222b38]">
-                <th className="px-4 py-2 font-medium">Имя файла</th>
-                <th className="px-4 py-2 font-medium">Размер</th>
-                <th className="px-4 py-2 font-medium">Время получения</th>
-                <th className="px-4 py-2 font-medium">Действие</th>
-              </tr>
-            </thead>
-            <tbody>
-              {files.length === 0 ? (
-                <tr>
-                  <td colSpan={4} className="px-4 py-6 text-[#8793a5] font-mono">
-                    В этой сессии файлов пока нет
-                  </td>
-                </tr>
-              ) : (
-                files.map((file) => (
-                  <tr key={file.id} className="border-b border-[#222b38]/80 last:border-0">
-                    <td className="px-4 py-2.5 text-[#e8edf4]">
-                      <div className="truncate max-w-[280px]">{file.filename}</div>
-                      <div className={`text-[10px] font-mono ${file.status === "SUCCESS" ? "text-sky-400" : "text-rose-300"}`}>
-                        {file.status}
-                      </div>
-                    </td>
-                    <td className="px-4 py-2.5 font-mono text-[#8793a5] tabular-nums">{formatBytes(file.size_bytes)}</td>
-                    <td className="px-4 py-2.5 font-mono text-[#8793a5]">{file.received_at}</td>
-                    <td className="px-4 py-2.5">
-                      <button
-                        type="button"
-                        disabled={!file.path}
-                        onClick={() => void invoke("open_item_location", { path: file.path }).catch((err) => setError(String(err)))}
-                        className="px-2.5 py-1 rounded-lg border border-[#222b38] bg-[#151c27] text-[#e8edf4] font-mono text-[10px] cursor-pointer disabled:opacity-40"
-                      >
-                        Показать в Проводнике
-                      </button>
-                    </td>
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
+        )}
       </div>
 
-      <div className="rounded-2xl border border-[#222b38] bg-[#111722] p-4">
-        <div className="text-[10px] font-mono uppercase tracking-[0.18em] text-[#8793a5] mb-3">
-          Текст и ссылки
-        </div>
-        {texts.length === 0 ? (
-          <p className="text-xs font-mono text-[#8793a5]">Смартфон ещё ничего не отправил</p>
-        ) : (
-          <div className="space-y-2">
-            {texts.map((item) => (
-              <div key={item.id} className="flex items-start gap-3 rounded-xl border border-[#222b38] bg-[#151c27] px-3 py-2.5">
-                <div className="min-w-0 flex-1">
-                  <div className="text-[10px] font-mono text-[#8793a5] mb-1">{item.received_at}</div>
-                  <div className="text-sm text-[#e8edf4] break-all">{item.body}</div>
-                </div>
+      {error && (
+        <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">{error}</div>
+      )}
+
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <div className="rounded-xl border border-[#222b38] bg-[#111722] p-4">
+          <h3 className="text-sm font-semibold text-slate-100">Точка подключения</h3>
+          <div className="mt-3 w-fit rounded-lg bg-white p-2.5">
+            {session.is_running && session.qr_svg ? (
+              <div
+                className="h-44 w-44 [&_svg]:h-full [&_svg]:w-full"
+                dangerouslySetInnerHTML={{ __html: session.qr_svg }}
+              />
+            ) : (
+              <div className="flex h-44 w-44 items-center justify-center text-slate-400">
+                <Smartphone size={28} />
+              </div>
+            )}
+          </div>
+          {session.is_running && (
+            <div className="mt-3 space-y-2">
+              <div className="flex items-center gap-2">
+                <code className="min-w-0 flex-1 truncate rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2 font-mono text-xs text-slate-200">
+                  {session.url || `http://${session.local_ip}:${session.port}`}
+                </code>
                 <button
                   type="button"
-                  onClick={() => void copyValue(item.body, item.id)}
-                  className="shrink-0 inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-[#222b38] text-[#e8edf4] font-mono text-[10px] cursor-pointer"
+                  onClick={() => void copyValue(session.url, "url")}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-[#222b38] bg-[#151c27] px-2.5 py-2 text-xs text-slate-200"
                 >
-                  <Copy size={11} />
-                  {copied === item.id ? "Скопировано" : "Копировать"}
+                  <Copy size={12} />
+                  {copied === "url" ? "Скопировано" : "Копировать"}
                 </button>
               </div>
-            ))}
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-slate-400">PIN</span>
+                <span className="font-mono text-sm tracking-[0.18em] text-sky-300">{session.token}</span>
+                <button
+                  type="button"
+                  onClick={() => void copyValue(session.token, "token")}
+                  className="inline-flex items-center gap-1 rounded-lg border border-[#222b38] px-2 py-1 text-[11px] text-slate-300"
+                >
+                  <Copy size={11} />
+                  {copied === "token" ? "Скопировано" : "Копировать"}
+                </button>
+              </div>
+            </div>
+          )}
+          <ol className="mt-4 space-y-1 text-sm text-slate-400">
+            <li>1. Подключите телефон к тому же Wi-Fi.</li>
+            <li>2. Отсканируйте код камерой.</li>
+          </ol>
+        </div>
+
+        <div className="flex min-h-[320px] flex-col rounded-xl border border-[#222b38] bg-[#111722]">
+          <div className="flex items-center justify-between gap-2 border-b border-[#222b38] px-4 py-3">
+            <h3 className="text-sm font-semibold text-slate-100">История приёма</h3>
+            <button
+              type="button"
+              onClick={() => void invoke("open_drop_folder").catch((err) => setError(String(err)))}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-[#222b38] bg-[#151c27] px-2.5 py-1.5 text-xs text-slate-200"
+            >
+              <FolderOpen size={12} />
+              Открыть папку загрузок
+            </button>
           </div>
-        )}
+          {transfer && (
+            <div className="border-b border-[#222b38] px-4 py-3">
+              <div className="mb-1 flex items-center justify-between gap-2 text-xs text-slate-300">
+                <span className="truncate">{transfer.filename || "Входящий файл"}</span>
+                <span className="shrink-0 font-mono text-cyan-400">{formatSpeed(transfer.speed_bps)}</span>
+              </div>
+              <div className="h-1.5 overflow-hidden rounded-full bg-[#151c27]">
+                <div className="h-full rounded-full bg-cyan-400 transition-all" style={{ width: `${progress}%` }} />
+              </div>
+            </div>
+          )}
+          {files.length === 0 ? (
+            <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 py-10 text-center text-sm text-slate-400">
+              <Smartphone size={22} />
+              Ожидание отправки со смартфона
+            </div>
+          ) : (
+            <div className="divide-y divide-[#222b38]/50">
+              {files.map((file) => {
+                const Icon = fileIcon(file.filename);
+                return (
+                  <div key={file.id} className="flex items-center gap-3 px-4 py-3">
+                    <Icon size={16} className="shrink-0 text-slate-400" />
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-sm text-slate-100">{file.filename}</div>
+                      <div className="mt-0.5 flex items-center gap-2 text-[11px] text-slate-500">
+                        <span className="font-mono text-cyan-400">{formatBytes(file.size_bytes)}</span>
+                        <span>{file.received_at}</span>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={!file.path}
+                      onClick={() =>
+                        void invoke("open_item_location", { path: file.path }).catch((err) => setError(String(err)))
+                      }
+                      className="shrink-0 rounded-lg border border-[#222b38] bg-[#151c27] px-2.5 py-1.5 text-[11px] text-slate-200 disabled:opacity-40"
+                    >
+                      Показать в проводнике
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {texts.length > 0 && (
+            <div className="border-t border-[#222b38] px-4 py-3">
+              <div className="mb-2 text-xs text-slate-400">Текст и ссылки</div>
+              <div className="space-y-2">
+                {texts.map((item) => (
+                  <div key={item.id} className="flex items-start gap-2 rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2">
+                    <div className="min-w-0 flex-1">
+                      <div className="font-mono text-[10px] text-slate-500">{item.received_at}</div>
+                      <div className="text-sm break-all text-slate-100">{item.body}</div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void copyValue(item.body, item.id)}
+                      className="shrink-0 text-[11px] text-slate-300"
+                    >
+                      {copied === item.id ? "Скопировано" : "Копировать"}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     </motion.div>
   );

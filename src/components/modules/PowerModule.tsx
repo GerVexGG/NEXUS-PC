@@ -1,243 +1,270 @@
-import { motion, AnimatePresence } from "framer-motion";
-import {
-  Power,
-  Clock,
-  RotateCcw,
-  XCircle,
-  Play,
-} from "lucide-react";
-import {
-  PRESET_MINUTES,
-  SpotlightCard,
-  formatCountdown,
-} from "../../lib/studio";
+import { useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { AnimatePresence, motion } from "framer-motion";
+import { Lock, Moon, Play, Power, RotateCcw, XCircle } from "lucide-react";
+import { formatCountdown } from "../../lib/studio";
 import type { NexusController } from "../../hooks/useNexusController";
+
+const CHIPS = [
+  { label: "15 мин", minutes: 15 },
+  { label: "30 мин", minutes: 30 },
+  { label: "45 мин", minutes: 45 },
+  { label: "1 час", minutes: 60 },
+  { label: "1.5 часа", minutes: 90 },
+  { label: "2 часа", minutes: 120 },
+];
+
+type ImmediateAction = "shutdown" | "restart";
 
 export function PowerModule({ c }: { c: NexusController }) {
   const {
-    restartMode,
+    timerSleep,
+    setTimerSleep,
     setRestartMode,
     customMinutes,
     setCustomMinutes,
     timerState,
     remainingSeconds,
     powerError,
+    setPowerError,
     handleStartTimer,
     handleCancelTimer,
-    handleCustomSubmit,
     timerProgress,
   } = c;
+  const [confirmAction, setConfirmAction] = useState<ImmediateAction | null>(null);
+  const timerActive = Boolean(timerState && remainingSeconds > 0);
+
+  const runImmediate = async (action: "shutdown" | "restart" | "sleep" | "lock") => {
+    setPowerError(null);
+    try {
+      if (action === "shutdown" || action === "restart") {
+        await handleCancelTimer();
+      }
+      await invoke("system_power_action", { action });
+    } catch (err) {
+      setPowerError(String(err));
+    }
+  };
+
+  const plannedAt = timerState
+    ? new Date(timerState.endTime).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })
+    : "";
+  const plannedLabel = timerState?.sleep
+    ? `Переход в спящий режим запланирован на ${plannedAt}`
+    : timerState?.restart
+      ? `Перезагрузка запланирована на ${plannedAt}`
+      : `Выключение запланировано на ${plannedAt}`;
+
+  const actions = [
+    {
+      id: "shutdown" as const,
+      label: "Завершение работы",
+      icon: Power,
+      hover: "hover:border-rose-500/40 hover:bg-rose-500/10 hover:text-rose-300",
+      iconClass: "text-rose-300",
+    },
+    {
+      id: "restart" as const,
+      label: "Перезагрузка",
+      icon: RotateCcw,
+      hover: "hover:border-amber-500/40 hover:bg-amber-500/10 hover:text-amber-300",
+      iconClass: "text-amber-300",
+    },
+    {
+      id: "sleep" as const,
+      label: "Спящий режим",
+      icon: Moon,
+      hover: "hover:border-sky-500/40 hover:bg-sky-500/10 hover:text-sky-300",
+      iconClass: "text-sky-300",
+    },
+    {
+      id: "lock" as const,
+      label: "Блокировка",
+      icon: Lock,
+      hover: "hover:border-indigo-500/40 hover:bg-indigo-500/10 hover:text-indigo-300",
+      iconClass: "text-indigo-300",
+    },
+  ];
+
   return (
-            <motion.div
-              key="power"
-              initial={{ opacity: 0, y: 12 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -8 }}
-              transition={{ duration: 0.25, ease: "easeOut" }}
-              className="space-y-6 max-w-2xl w-full"
-            >
-              <div>
-                <h2 className="text-2xl font-semibold tracking-tight text-slate-100">
-                  Управление питанием
-                </h2>
-                <p className="text-sm text-[#8793a5] mt-1">
-                  Таймеры автоматического выключения и перезагрузки Windows
-                </p>
-              </div>
+    <motion.div
+      key="power"
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -6 }}
+      transition={{ duration: 0.18, ease: "easeOut" }}
+      className="w-full max-w-5xl space-y-4"
+    >
+      <div>
+        <h2 className="text-2xl font-semibold tracking-tight text-slate-100">Управление питанием</h2>
+        <p className="mt-0.5 text-sm text-slate-400">Таймеры автоматического выключения и системные действия</p>
+      </div>
 
-              <SpotlightCard
-                spotlightColor={
-                  restartMode
-                    ? "rgba(251, 191, 36, 0.12)"
-                    : "rgba(56, 189, 248, 0.12)"
+      <div className="grid grid-cols-4 gap-4">
+        {actions.map((action) => {
+          const Icon = action.icon;
+          return (
+            <button
+              key={action.id}
+              type="button"
+              onClick={() => {
+                if (action.id === "shutdown" || action.id === "restart") {
+                  setConfirmAction(action.id);
+                  return;
                 }
-                className="p-6"
+                void runImmediate(action.id);
+              }}
+              className={`flex flex-col items-start gap-3 rounded-xl border border-[#222b38] bg-[#111722] px-4 py-4 text-left text-slate-200 transition-colors ${action.hover}`}
+            >
+              <Icon size={18} className={action.iconClass} />
+              <span className="text-sm font-medium">{action.label}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="rounded-xl border border-[#222b38] bg-[#111722] p-4">
+        {timerActive && timerState ? (
+          <div className="space-y-4">
+            <div className="font-mono text-4xl font-bold text-slate-100">{formatCountdown(remainingSeconds)}</div>
+            <div className="h-1.5 overflow-hidden rounded-full bg-[#151c27]">
+              <div className="h-full rounded-full bg-sky-400 transition-all duration-500" style={{ width: `${timerProgress}%` }} />
+            </div>
+            <p className="text-sm text-slate-300">{plannedLabel}</p>
+            <button
+              type="button"
+              onClick={() => void handleCancelTimer()}
+              className="inline-flex items-center gap-2 rounded-lg border border-rose-500/30 bg-rose-500/20 px-3 py-2 text-xs font-medium text-rose-300 hover:bg-rose-500/30"
+            >
+              <XCircle size={14} />
+              Отменить таймер
+            </button>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setTimerSleep(false);
+                  setRestartMode(false);
+                }}
+                className={`rounded-lg border px-3 py-1.5 text-xs font-medium ${
+                  !timerSleep
+                    ? "border-sky-500/30 bg-sky-500/10 text-sky-300"
+                    : "border-[#222b38] bg-[#151c27] text-slate-400"
+                }`}
               >
-                <div className="space-y-6">
-                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-white/[0.06]">
-                    <div className="flex items-center gap-3 text-[#d5dde8]">
-                      <div className="p-2 rounded-xl bg-sky-500/10 border border-sky-500/20">
-                        <Clock className="text-sky-400 shrink-0" size={18} />
-                      </div>
-                      <span className="font-medium text-base">Режим действия</span>
-                    </div>
-
-                    <div className="inline-flex rounded-xl bg-zinc-950/80 p-1 border border-white/[0.06]">
-                      <motion.button
-                        type="button"
-                        whileTap={{ scale: 0.96 }}
-                        onClick={() => setRestartMode(false)}
-                        className={`relative flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
-                          !restartMode
-                            ? "text-sky-400"
-                            : "text-[#8793a5] hover:text-[#d5dde8]"
-                        }`}
-                      >
-                        {!restartMode && (
-                          <motion.div
-                            layoutId="powerModePill"
-                            transition={{ type: "spring", stiffness: 400, damping: 30 }}
-                            className="absolute inset-0 rounded-lg bg-sky-500/15 border border-sky-500/30 shadow-[0_0_14px_rgba(56,189,248,0.2)]"
-                          />
-                        )}
-                        <span className="relative z-10 flex items-center gap-2">
-                          <Power size={14} />
-                          <span>Выключение</span>
-                        </span>
-                      </motion.button>
-
-                      <motion.button
-                        type="button"
-                        whileTap={{ scale: 0.96 }}
-                        onClick={() => setRestartMode(true)}
-                        className={`relative flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
-                          restartMode
-                            ? "text-amber-400"
-                            : "text-[#8793a5] hover:text-[#d5dde8]"
-                        }`}
-                      >
-                        {restartMode && (
-                          <motion.div
-                            layoutId="powerModePill"
-                            transition={{ type: "spring", stiffness: 400, damping: 30 }}
-                            className="absolute inset-0 rounded-lg bg-amber-500/15 border border-amber-500/30 shadow-[0_0_14px_rgba(251,191,36,0.2)]"
-                          />
-                        )}
-                        <span className="relative z-10 flex items-center gap-2">
-                          <RotateCcw size={14} />
-                          <span>Перезагрузка</span>
-                        </span>
-                      </motion.button>
-                    </div>
-                  </div>
-
-                  <div className="space-y-2.5">
-                    <label className="block text-xs font-mono uppercase tracking-wider text-[#8793a5]">
-                      Быстрый запуск
-                    </label>
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                      {PRESET_MINUTES.map((mins) => (
-                        <motion.button
-                          key={mins}
-                          type="button"
-                          whileHover={{ y: -2 }}
-                          whileTap={{ scale: 0.96 }}
-                          transition={{ type: "spring", stiffness: 400, damping: 22 }}
-                          onClick={() => handleStartTimer(mins)}
-                          className="py-3 px-3 rounded-xl bg-zinc-800/60 hover:bg-sky-500/10 text-[#d5dde8] hover:text-sky-300 text-sm font-medium transition-colors border border-white/[0.06] hover:border-sky-500/35 hover:shadow-[0_0_20px_rgba(56,189,248,0.14)] cursor-pointer"
-                        >
-                          {mins} мин
-                        </motion.button>
-                      ))}
-                    </div>
-                  </div>
-
-                  <form onSubmit={handleCustomSubmit} className="space-y-2.5">
-                    <label className="block text-xs font-mono uppercase tracking-wider text-[#8793a5]">
-                      Произвольное время (в минутах)
-                    </label>
-                    <div className="flex flex-col sm:flex-row gap-3">
-                      <input
-                        type="number"
-                        min="1"
-                        max="525600"
-                        step="1"
-                        value={customMinutes}
-                        onChange={(e) => setCustomMinutes(e.target.value)}
-                        placeholder="Например: 90"
-                        className="flex-1 px-4 py-2.5 rounded-xl bg-zinc-950/80 border border-white/[0.07] text-[#e8edf4] placeholder-zinc-500 text-sm focus:outline-none focus:border-sky-500/50 focus:shadow-[0_0_16px_rgba(56,189,248,0.12)] transition-all"
-                      />
-                      <motion.button
-                        type="submit"
-                        whileHover={{ scale: 1.01 }}
-                        whileTap={{ scale: 0.97 }}
-                        className="inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-sky-500/20 to-teal-500/20 hover:from-sky-500/30 hover:to-teal-500/30 text-sky-300 border border-sky-500/30 shadow-[0_0_20px_rgba(56,189,248,0.15)] text-sm font-medium transition-all cursor-pointer"
-                      >
-                        <Play size={16} />
-                        <span>Запустить таймер</span>
-                      </motion.button>
-                    </div>
-                  </form>
-
-                  <AnimatePresence>
-                    {powerError && (
-                      <motion.div
-                        initial={{ opacity: 0, y: -6 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        exit={{ opacity: 0, y: -6 }}
-                        className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-400 text-xs font-mono"
-                      >
-                        {powerError}
-                      </motion.div>
-                    )}
-                  </AnimatePresence>
-
-                  <AnimatePresence>
-                    {timerState && remainingSeconds > 0 && (
-                      <motion.div
-                        initial={{ opacity: 0, scale: 0.97, y: 8 }}
-                        animate={{ opacity: 1, scale: 1, y: 0 }}
-                        exit={{ opacity: 0, scale: 0.97, y: 8 }}
-                        transition={{ type: "spring", stiffness: 320, damping: 26 }}
-                        className="p-5 rounded-2xl bg-zinc-950/85 border border-white/[0.08] space-y-4 shadow-[0_10px_30px_rgba(0,0,0,0.45)]"
-                      >
-                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                          <div>
-                            <div className="inline-flex items-center gap-2 px-2.5 py-1 rounded-full bg-zinc-900 border border-white/[0.06] text-xs font-mono">
-                              <span className="relative flex h-2 w-2">
-                                <span
-                                  className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${
-                                    timerState.restart ? "bg-amber-400" : "bg-sky-400"
-                                  }`}
-                                />
-                                <span
-                                  className={`relative inline-flex rounded-full h-2 w-2 ${
-                                    timerState.restart ? "bg-amber-400" : "bg-sky-400"
-                                  }`}
-                                />
-                              </span>
-                              <span className="text-[#8793a5]">Активный таймер:</span>
-                              <strong
-                                className={
-                                  timerState.restart ? "text-amber-400" : "text-sky-400"
-                                }
-                              >
-                                {timerState.restart ? "Перезагрузка" : "Выключение"}
-                              </strong>
-                            </div>
-
-                            <div className="text-3xl sm:text-4xl font-bold font-mono text-[#e8edf4] mt-2 tracking-tight drop-shadow-[0_0_14px_rgba(56,189,248,0.2)]">
-                              {formatCountdown(remainingSeconds)}
-                            </div>
-                          </div>
-
-                          <motion.button
-                            type="button"
-                            whileHover={{ scale: 1.02 }}
-                            whileTap={{ scale: 0.96 }}
-                            onClick={handleCancelTimer}
-                            className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl bg-rose-500/15 hover:bg-rose-500/25 text-rose-400 border border-rose-500/30 shadow-[0_0_20px_rgba(244,63,94,0.15)] text-sm font-medium transition-all cursor-pointer"
-                          >
-                            <XCircle size={16} />
-                            <span>Отменить таймер</span>
-                          </motion.button>
-                        </div>
-
-                        <div className="w-full bg-zinc-800/80 h-2 rounded-full overflow-hidden">
-                          <div
-                            className={`h-full rounded-full transition-all duration-500 ${
-                              timerState.restart
-                                ? "bg-gradient-to-r from-amber-500 via-orange-400 to-yellow-400 shadow-[0_0_12px_rgba(251,191,36,0.5)]"
-                                : "bg-gradient-to-r from-sky-500 via-teal-400 to-cyan-400 shadow-[0_0_12px_rgba(56,189,248,0.5)]"
-                            }`}
-                            style={{ width: `${timerProgress}%` }}
-                          ></div>
-                        </div>
-                      </motion.div>
-                    )}
-                  </AnimatePresence>
-                </div>
-              </SpotlightCard>
+                Выключить ПК
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setTimerSleep(true);
+                  setRestartMode(false);
+                }}
+                className={`rounded-lg border px-3 py-1.5 text-xs font-medium ${
+                  timerSleep
+                    ? "border-sky-500/30 bg-sky-500/10 text-sky-300"
+                    : "border-[#222b38] bg-[#151c27] text-slate-400"
+                }`}
+              >
+                Перейти в спящий режим
+              </button>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {CHIPS.map((chip) => {
+                const selected = customMinutes === String(chip.minutes);
+                return (
+                  <button
+                    key={chip.minutes}
+                    type="button"
+                    onClick={() => setCustomMinutes(String(chip.minutes))}
+                    className={`rounded-lg border px-3 py-1.5 text-xs ${
+                      selected
+                        ? "border-sky-500/30 bg-sky-500/10 text-sky-300"
+                        : "border-[#222b38] bg-[#151c27] text-slate-300 hover:text-slate-100"
+                    }`}
+                  >
+                    {chip.label}
+                  </button>
+                );
+              })}
+            </div>
+            <div className="flex flex-col gap-3 sm:flex-row">
+              <input
+                type="number"
+                min="1"
+                max="525600"
+                step="1"
+                value={customMinutes}
+                onChange={(event) => setCustomMinutes(event.target.value)}
+                placeholder="Минуты"
+                className="flex-1 rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2 font-mono text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:border-slate-500"
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  const mins = parseFloat(customMinutes);
+                  if (!Number.isNaN(mins) && mins > 0) void handleStartTimer(mins);
+                  else setPowerError("Укажите положительное количество минут");
+                }}
+                className="inline-flex items-center justify-center gap-2 rounded-lg border border-sky-500/30 bg-sky-500/20 px-4 py-2 text-sm font-medium text-sky-300 hover:bg-sky-500/30"
+              >
+                <Play size={15} />
+                Запустить таймер
+              </button>
+            </div>
+          </div>
+        )}
+        <AnimatePresence>
+          {powerError && (
+            <motion.div
+              initial={{ opacity: 0, y: -6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              className="mt-3 rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300"
+            >
+              {powerError}
             </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+
+      {confirmAction && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4">
+          <div className="w-full max-w-md rounded-xl border border-[#222b38] bg-[#111722] p-4 shadow-2xl">
+            <h3 className="text-base font-semibold text-slate-100">
+              {confirmAction === "restart" ? "Перезагрузка компьютера" : "Завершение работы"}
+            </h3>
+            <p className="mt-2 text-sm text-slate-300">
+              {confirmAction === "restart"
+                ? "Компьютер будет перезагружен сразу. Несохранённые данные могут быть потеряны."
+                : "Компьютер будет выключен сразу. Несохранённые данные могут быть потеряны."}
+            </p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setConfirmAction(null)}
+                className="rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2 text-xs font-medium text-slate-300 hover:bg-[#1a2332]"
+              >
+                Отмена
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const action = confirmAction;
+                  setConfirmAction(null);
+                  void runImmediate(action);
+                }}
+                className="rounded-lg border border-rose-500/30 bg-rose-500/20 px-3 py-2 text-xs font-medium text-rose-300 hover:bg-rose-500/30"
+              >
+                Продолжить
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </motion.div>
   );
 }

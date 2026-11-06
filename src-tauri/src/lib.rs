@@ -2310,6 +2310,37 @@ fn schedule_shutdown(seconds: u64, restart: bool) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn system_power_action(action: String) -> Result<(), String> {
+    match action.as_str() {
+        "shutdown" => run_power_command("shutdown", &["/s", "/t", "0"]),
+        "restart" => run_power_command("shutdown", &["/r", "/t", "0"]),
+        "sleep" => run_power_command("rundll32.exe", &["powrprof.dll,SetSuspendState 0,1,0"]),
+        "lock" => run_power_command("rundll32.exe", &["user32.dll,LockWorkStation"]),
+        _ => Err("Неизвестное действие питания".to_string()),
+    }
+}
+
+fn run_power_command(program: &str, args: &[&str]) -> Result<(), String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let output = cmd
+        .output()
+        .map_err(|err| format!("Не удалось выполнить действие питания: {err}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if stderr.is_empty() {
+            format!("Действие питания завершилось с кодом {:?}", output.status.code())
+        } else {
+            stderr
+        })
+    }
+}
+
+#[tauri::command]
 fn cancel_shutdown() -> Result<(), String> {
     let mut cmd = Command::new("shutdown");
     cmd.arg("/a");
@@ -4025,6 +4056,7 @@ pub fn run() {
             get_system_metrics,
             schedule_shutdown,
             cancel_shutdown,
+            system_power_action,
             get_startup_items,
             toggle_startup_item,
             remove_startup_entry,
