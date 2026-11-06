@@ -1,34 +1,50 @@
 import { motion } from "framer-motion";
-import { Check, Loader2, RefreshCw } from "lucide-react";
+import { Check, Loader2, RefreshCw, Shield } from "lucide-react";
 import { formatBytes } from "../../lib/studio";
 import type { NexusController } from "../../hooks/useNexusController";
 
-function cleanupSafety(id: string): { badge: string; badgeClass: string; description: string } | null {
-  if (id === "user_temp" || id === "system_temp" || id === "recycle_bin" || id === "thumbnails") {
+const lowRisk = {
+  badge: "Низкий риск",
+  badgeClass: "border-emerald-500/20 bg-emerald-500/10 text-emerald-400",
+};
+
+function cleanupSafety(
+  id: string,
+  isElevatedAdmin: boolean,
+): { badge: string; badgeClass: string; description: string; shield?: boolean } | null {
+  if (id === "recycle_bin") {
     return {
-      badge: "100% БЕЗОПАСНО",
-      badgeClass: "border-emerald-500/30 bg-emerald-500/10 text-emerald-300",
-      description: "Не затрагивает программы и личные файлы.",
+      badge: "Внимание: Безвозвратное удаление",
+      badgeClass: "border-amber-500/20 bg-amber-500/10 text-amber-400",
+      description: "Файлы из корзины нельзя будет восстановить.",
+    };
+  }
+  if (id === "windows_update" && !isElevatedAdmin) {
+    return {
+      badge: "Требуются права Администратора",
+      badgeClass: "border-amber-500/20 bg-amber-500/10 text-amber-300",
+      description: "Установочные пакеты уже применённых обновлений операционной системы.",
+      shield: true,
+    };
+  }
+  if (id === "user_temp" || id === "system_temp" || id === "thumbnails" || id === "windows_update") {
+    return {
+      ...lowRisk,
+      description:
+        id === "windows_update"
+          ? "Установочные пакеты уже применённых обновлений операционной системы."
+          : "Не затрагивает программы и личные файлы.",
     };
   }
   if (id === "browser_cache") {
     return {
-      badge: "100% БЕЗОПАСНО",
-      badgeClass: "border-emerald-500/30 bg-emerald-500/10 text-emerald-300",
+      ...lowRisk,
       description: "Временный кэш картинок, стилей и скриптов. Сессии и пароли сохраняются.",
-    };
-  }
-  if (id === "windows_update") {
-    return {
-      badge: "100% БЕЗОПАСНО",
-      badgeClass: "border-emerald-500/30 bg-emerald-500/10 text-emerald-300",
-      description: "Установочные пакеты уже применённых обновлений операционной системы.",
     };
   }
   if (id === "discord_cache") {
     return {
-      badge: "100% БЕЗОПАСНО",
-      badgeClass: "border-emerald-500/30 bg-emerald-500/10 text-emerald-300",
+      ...lowRisk,
       description: "Кэшированные превью медиафайлов и голосовых сообщений.",
     };
   }
@@ -68,6 +84,7 @@ export function CleanupModule({ c }: { c: NexusController }) {
     handleToggleCleanupCategory,
     handleExecuteCleanup,
     selectedCleanupBytes,
+    isElevatedAdmin,
   } = c;
 
   return (
@@ -117,7 +134,7 @@ export function CleanupModule({ c }: { c: NexusController }) {
         ) : (
           cleanupCategories.map((cat) => {
             const checked = selectedCleanupIds.includes(cat.id);
-            const safety = cleanupSafety(cat.id);
+            const safety = cleanupSafety(cat.id, isElevatedAdmin);
             return (
               <div key={cat.id} className="flex items-center gap-3 px-4 py-3">
                 <button
@@ -135,7 +152,8 @@ export function CleanupModule({ c }: { c: NexusController }) {
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="text-sm font-medium text-slate-100">{cat.name}</span>
                     {safety && (
-                      <span className={`rounded-md border px-1.5 py-0.5 text-[11px] ${safety.badgeClass}`}>
+                      <span className={`inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[11px] ${safety.badgeClass}`}>
+                        {safety.shield && <Shield size={11} />}
                         {safety.badge}
                       </span>
                     )}
@@ -160,7 +178,14 @@ export function CleanupModule({ c }: { c: NexusController }) {
             onClick={() => {
               setConfirmCleanupOpen(false);
               setSelectedCleanupIds(
-                cleanupCategories.filter((cat) => cleanupSafety(cat.id)?.badge === "100% БЕЗОПАСНО").map((cat) => cat.id),
+                cleanupCategories
+                  .filter(
+                    (cat) =>
+                      cat.id !== "recycle_bin" &&
+                      cat.id !== "windows_update" &&
+                      cleanupSafety(cat.id, isElevatedAdmin)?.badge === "Низкий риск",
+                  )
+                  .map((cat) => cat.id),
               );
             }}
             className="rounded-lg bg-[#151c27] px-3 py-2 text-xs font-medium text-slate-300"

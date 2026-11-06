@@ -334,11 +334,15 @@ export function useNexusController() {
       setCleanupCategories(categories);
       // По умолчанию отмечаем все непустые категории (кроме требующих прав админа, если нет админки)
       const autoSelect = categories
-        .filter((c) => c.size_bytes > 0 && (!c.requires_admin || isElevatedAdmin))
+        .filter(
+          (c) =>
+            c.size_bytes > 0 &&
+            c.id !== "recycle_bin" &&
+            c.id !== "windows_update" &&
+            (!c.requires_admin || isElevatedAdmin),
+        )
         .map((c) => c.id);
-      setSelectedCleanupIds(
-        autoSelect.length > 0 ? autoSelect : categories.map((c) => c.id)
-      );
+      setSelectedCleanupIds(autoSelect.length > 0 ? autoSelect : []);
     } catch (err) {
       console.error("Ошибка сканирования категорий очистки:", err);
       setCleanupError(String(err));

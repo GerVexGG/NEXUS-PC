@@ -23,8 +23,8 @@ const filters: { id: SensorFilter; label: string }[] = [
   { id: "fan", label: "Вентиляторы" },
 ];
 
-function formatSensor(value: number | null | undefined, digits: number, unit: string): { raw: number | null; text: string } {
-  if (value == null || !Number.isFinite(value) || value === 0) {
+function formatSensor(value: number | null | undefined | "", digits: number, unit: string): { raw: number | null; text: string } {
+  if (value == null || value === "" || !Number.isFinite(value)) {
     return { raw: null, text: "—" };
   }
   return { raw: value, text: `${value.toFixed(digits)} ${unit}` };
@@ -55,6 +55,9 @@ function buildRows(hw: HardwareTelemetry | null, ramGb: number, ramPct: number):
     push(`gpu-${index}-power`, "gpu", `${title} · мощность`, gpu.power_watts, 1, "W");
     push(`gpu-${index}-volt`, "gpu", `${title} · напряжение`, gpu.voltage_v, 3, "V");
     push(`gpu-${index}-fan`, "fan", `${title} · кулер`, gpu.fan_rpm, 0, "RPM");
+    if (gpu.fan_percent != null) {
+      push(`gpu-${index}-fan-pct`, "fan", `${title} · обороты`, gpu.fan_percent, 0, "%");
+    }
   });
 
   push("ram-used", "memory", "Оперативная память", ramGb, 1, "GB");
@@ -70,14 +73,24 @@ function buildRows(hw: HardwareTelemetry | null, ramGb: number, ramPct: number):
   });
 
   hw?.system_fans.forEach((fan, index) => {
-    push(`fan-${index}`, "fan", fan.name || `Вентилятор ${index + 1}`, fan.rpm, 0, "RPM");
+    const name = fan.name || `Вентилятор ${index + 1}`;
+    push(`fan-${index}`, "fan", name, fan.rpm, 0, "RPM");
+    if (fan.percent != null) {
+      push(`fan-${index}-pct`, "fan", `${name} · обороты`, fan.percent, 0, "%");
+    }
   });
 
   return rows;
 }
 
 export function HardwareModule({ c }: { c: NexusController }) {
-  const { hwData, metrics, thermalWarnings } = c;
+  const { hwData, metrics, thermalWarnings, metricsReady } = c;
+  const sidecarOnline = hwData?.sidecar_online === true;
+  const sidecarStatus = sidecarOnline && metricsReady
+    ? { label: "Служба активна", dot: "bg-emerald-400", chip: "border-emerald-500/20 bg-emerald-500/10 text-emerald-400" }
+    : sidecarOnline
+      ? { label: "Подключение...", dot: "bg-amber-400", chip: "border-amber-500/20 bg-amber-500/10 text-amber-300" }
+      : { label: "Служба недоступна", dot: "bg-slate-500", chip: "border-[#222b38] bg-[#151c27] text-slate-400" };
   const [filter, setFilter] = useState<SensorFilter>("all");
   const [extremes, setExtremes] = useState<Record<string, { min: number; max: number }>>({});
   const gpu = hwData?.gpus[0];
@@ -115,15 +128,9 @@ export function HardwareModule({ c }: { c: NexusController }) {
           <h2 className="text-2xl font-semibold text-slate-100">Аппаратный мониторинг</h2>
           <p className="mt-1 text-sm text-slate-400">Показатели температур, частот и напряжений</p>
         </div>
-        <span
-          className={`inline-flex items-center gap-2 self-start rounded-full border px-3 py-1 text-xs ${
-            hwData?.sidecar_online
-              ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-400"
-              : "border-[#222b38] bg-[#151c27] text-slate-400"
-          }`}
-        >
-          <span className={`h-1.5 w-1.5 rounded-full ${hwData?.sidecar_online ? "bg-emerald-400" : "bg-slate-500"}`} />
-          {hwData?.sidecar_online ? "Sidecar активен" : "Служба остановлена"}
+        <span className={`inline-flex items-center gap-2 self-start rounded-full border px-3 py-1 text-xs ${sidecarStatus.chip}`}>
+          <span className={`h-1.5 w-1.5 rounded-full ${sidecarStatus.dot}`} />
+          {sidecarStatus.label}
         </span>
       </div>
 
@@ -154,7 +161,7 @@ export function HardwareModule({ c }: { c: NexusController }) {
           </div>
           <div className="mt-2 grid grid-cols-3 gap-2 text-xs text-slate-400">
             <span>Hotspot <span className="block font-mono text-slate-100">{formatSensor(gpu?.hotspot_temp_c, 1, "°C").text}</span></span>
-            <span>VRAM <span className="block font-mono text-slate-100">Н/Д</span></span>
+            <span>VRAM <span className="block font-mono text-slate-100">{formatSensor(gpu?.memory_temp_c, 0, "°C").text}</span></span>
             <span>Кулер <span className="block font-mono text-slate-100">{formatSensor(gpu?.fan_rpm, 0, "RPM").text}</span></span>
           </div>
         </section>

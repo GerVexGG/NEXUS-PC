@@ -8,6 +8,7 @@ import {
   HardDrive,
   Loader2,
   Play,
+  Search,
 } from "lucide-react";
 import { TREEMAP_PALETTE, formatBytes } from "../../lib/studio";
 import type { NexusController } from "../../hooks/useNexusController";
@@ -77,22 +78,28 @@ export function StorageModule({ c }: { c: NexusController }) {
     handleOpenPathInExplorer,
     treemapRects,
     filteredTopFiles,
+    fileSearch,
+    setFileSearch,
     setScanResult,
     setTreemapStack,
   } = c;
 
   const [heavyMode, setHeavyMode] = useState<"groups" | "files">("groups");
   const heavyGroups = useMemo(() => {
-    const buckets = new Map<string, { kind: "game" | "program" | "folder"; title: string; folder: string; size: number }>();
-    for (const file of filteredTopFiles) {
-      const group = heavyGroup(file.path);
-      const key = group.folder.toLowerCase();
-      const current = buckets.get(key);
-      if (current) current.size += file.size_bytes;
-      else buckets.set(key, { ...group, size: file.size_bytes });
-    }
-    return [...buckets.values()].sort((a, b) => b.size - a.size);
-  }, [filteredTopFiles]);
+    const query = fileSearch.trim().toLowerCase();
+    return (scanResult?.root_node.children ?? [])
+      .map((node) => {
+        const group = heavyGroup(`${node.path}\\item`);
+        return {
+          kind: group.kind,
+          title: group.title || node.name,
+          folder: node.path || group.folder,
+          size: node.size_bytes,
+        };
+      })
+      .filter((group) => !query || group.title.toLowerCase().includes(query) || group.folder.toLowerCase().includes(query))
+      .sort((a, b) => b.size - a.size);
+  }, [scanResult, fileSearch]);
   const selectedLetter = selectedDriveOrPath.trim().slice(0, 2).toUpperCase();
   const showsSystemVolume = selectedLetter.startsWith("C") || selectedDriveOrPath.trim() === "";
   const freeGb = showsSystemVolume ? metrics.disk_free_gb : null;
@@ -162,14 +169,6 @@ export function StorageModule({ c }: { c: NexusController }) {
             >
               {isScanning ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />}
               {isScanning ? `Сканирование ${scanElapsedSec.toFixed(0)} с` : "Сканировать диск"}
-            </button>
-            <button
-              type="button"
-              disabled
-              title="Текущая команда сканирования завершается сама и не принимает отмену"
-              className="rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2 text-xs font-medium text-slate-500"
-            >
-              Отмена
             </button>
           </div>
         </div>
@@ -274,6 +273,16 @@ export function StorageModule({ c }: { c: NexusController }) {
             <div className="flex items-center justify-between gap-2">
               <h3 className="text-sm font-semibold text-slate-100">Тяжёлые файлы</h3>
             </div>
+            <div className="relative mt-2">
+              <Search size={13} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-500" />
+              <input
+                type="text"
+                value={fileSearch}
+                onChange={(event) => setFileSearch(event.target.value)}
+                placeholder="Поиск по имени или пути"
+                className="w-full rounded-lg border border-[#222b38] bg-[#151c27] py-1.5 pl-8 pr-2 text-xs text-slate-100 outline-none placeholder:text-slate-500 focus:border-slate-500"
+              />
+            </div>
             <div className="mb-3 mt-2 flex gap-1">
               {(
                 [
@@ -296,9 +305,10 @@ export function StorageModule({ c }: { c: NexusController }) {
               ))}
             </div>
             <div className="min-h-0 flex-1 space-y-2 overflow-y-auto">
-              {filteredTopFiles.length === 0 ? (
-                <p className="text-sm text-slate-400">Крупные файлы не найдены</p>
-              ) : heavyMode === "groups" ? (
+              {heavyMode === "groups" ? (
+                heavyGroups.length === 0 ? (
+                  <p className="text-sm text-slate-400">Крупные папки не найдены</p>
+                ) : (
                 heavyGroups.map((group) => (
                   <div key={group.folder} className="rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2">
                     <div className="flex items-start justify-between gap-2">
@@ -322,6 +332,9 @@ export function StorageModule({ c }: { c: NexusController }) {
                     </button>
                   </div>
                 ))
+                )
+              ) : filteredTopFiles.length === 0 ? (
+                <p className="text-sm text-slate-400">Крупные файлы не найдены</p>
               ) : (
                 filteredTopFiles.map((file, idx) => {
                   const group = heavyGroup(file.path);

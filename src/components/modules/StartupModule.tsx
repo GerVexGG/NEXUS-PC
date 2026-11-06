@@ -59,6 +59,7 @@ export function StartupModule({ c }: { c: NexusController }) {
   } = c;
   const [statusFilter, setStatusFilter] = useState<StartupFilter>("all");
   const [phantomsOnly, setPhantomsOnly] = useState(false);
+  const [pendingDelete, setPendingDelete] = useState<StartupItem | null>(null);
   const phantomCount = startupItems.filter((item) => item.phantom).length;
 
   const visibleItems = filteredStartupItems.filter((item) => {
@@ -187,9 +188,40 @@ export function StartupModule({ c }: { c: NexusController }) {
               item={item}
               onOpen={() => void handleOpenItemLocation(item)}
               onToggle={() => void handleToggleStartup(item)}
-              onRemove={() => void handleRemoveStartup(item)}
+              onRemove={() => setPendingDelete(item)}
             />
           ))}
+        </div>
+      )}
+      {pendingDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4">
+          <div className="w-full max-w-md rounded-xl border border-[#222b38] bg-[#111722] p-4 shadow-2xl">
+            <h3 className="text-base font-semibold text-slate-100">Удаление записи автозагрузки</h3>
+            <p className="mt-2 text-sm text-slate-300">
+              Вы действительно хотите удалить запись {pendingDelete.name} из {sourceBadge(pendingDelete.location)}? Путь:{" "}
+              <span className="font-mono text-xs text-slate-400">{pendingDelete.clean_path || pendingDelete.command || "не указан"}</span>
+            </p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setPendingDelete(null)}
+                className="rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2 text-xs font-medium text-slate-300 hover:bg-[#1a2332]"
+              >
+                Отмена
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const item = pendingDelete;
+                  setPendingDelete(null);
+                  void handleRemoveStartup(item);
+                }}
+                className="rounded-lg border border-rose-500/30 bg-rose-500/20 px-3 py-2 text-xs font-medium text-rose-300 hover:bg-rose-500/30"
+              >
+                Удалить
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </motion.div>
