@@ -8,6 +8,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::{Disks, Networks, System};
+mod drop_server;
+
 use tauri::{Manager, State};
 
 #[cfg(target_os = "windows")]
@@ -209,6 +211,7 @@ pub struct AppState {
     pub hw_telemetry: Arc<Mutex<Option<HardwareTelemetry>>>,
     pub hw_sidecar_child: Arc<Mutex<Option<Child>>>,
     pub icon_cache: Mutex<HashMap<String, String>>,
+    pub drop_hub: Arc<drop_server::DropHub>,
 }
 
 impl Drop for AppState {
@@ -2302,6 +2305,36 @@ fn collect_socket_rows() -> Result<Vec<(String, String, String, String, u32)>, S
 }
 
 #[tauri::command]
+fn start_drop_session(state: State<'_, AppState>) -> Result<drop_server::DropSessionInfo, String> {
+    state.drop_hub.start()
+}
+
+#[tauri::command]
+fn stop_drop_session(state: State<'_, AppState>) -> Result<(), String> {
+    state.drop_hub.stop()
+}
+
+#[tauri::command]
+fn get_drop_session(state: State<'_, AppState>) -> Result<drop_server::DropSessionInfo, String> {
+    Ok(state.drop_hub.session())
+}
+
+#[tauri::command]
+fn get_drop_history(state: State<'_, AppState>) -> Result<Vec<drop_server::DroppedFileItem>, String> {
+    Ok(state.drop_hub.history())
+}
+
+#[tauri::command]
+fn get_drop_texts(state: State<'_, AppState>) -> Result<Vec<drop_server::DropTextItem>, String> {
+    Ok(state.drop_hub.texts())
+}
+
+#[tauri::command]
+fn open_drop_folder(state: State<'_, AppState>) -> Result<(), String> {
+    state.drop_hub.open_folder()
+}
+
+#[tauri::command]
 fn get_network_connections(state: State<'_, AppState>) -> Result<Vec<NetworkConnection>, String> {
     let sockets = collect_socket_rows()?;
 
@@ -2407,6 +2440,7 @@ pub fn run() {
             hw_telemetry,
             hw_sidecar_child,
             icon_cache: Mutex::new(HashMap::new()),
+            drop_hub: Arc::new(drop_server::DropHub::new()),
         })
         .setup(|app| {
             #[cfg(target_os = "windows")]
@@ -2446,7 +2480,13 @@ pub fn run() {
             get_process_list,
             kill_process,
             suspend_process,
-            get_network_connections
+            get_network_connections,
+            start_drop_session,
+            stop_drop_session,
+            get_drop_session,
+            get_drop_history,
+            get_drop_texts,
+            open_drop_folder
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

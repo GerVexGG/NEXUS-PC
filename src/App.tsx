@@ -1,6 +1,6 @@
 import { motion, AnimatePresence } from "framer-motion";
 import {
-  LayoutDashboard, Power, Rocket, PieChart, Loader2, Gauge, Trash2, Layers, Globe,
+  LayoutDashboard, Power, Rocket, PieChart, Loader2, Gauge, Trash2, Layers, Globe, Smartphone,
 } from "lucide-react";
 import { useNexusController } from "./hooks/useNexusController";
 import {
@@ -15,6 +15,7 @@ import { CleanupModule } from "./components/modules/CleanupModule";
 import { PowerModule } from "./components/modules/PowerModule";
 import { ProcessModule } from "./components/modules/ProcessModule";
 import { NetworkModule } from "./components/modules/NetworkModule";
+import { DropModule } from "./components/modules/DropModule";
 import "./App.css";
 
 export default function App() {
@@ -313,6 +314,33 @@ export default function App() {
               </span>
               <span className="relative z-10 text-[10px] text-[#8793a5]">08</span>
             </motion.button>
+
+            {/* 9. Кнопка вкладки NEXUS Drop */}
+            <motion.button
+              type="button"
+              whileTap={{ scale: 0.97 }}
+              onClick={() => c.setActiveTab("drop")}
+              className={`relative w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-mono tracking-wide transition-colors cursor-pointer ${
+                c.activeTab === "drop"
+                  ? "text-sky-300 font-semibold"
+                  : "text-[#8793a5] hover:text-[#d5dde8]"
+              }`}
+            >
+              {c.activeTab === "drop" && (
+                <motion.div
+                  layoutId="activeTabPill"
+                  transition={{ type: "spring", stiffness: 460, damping: 32 }}
+                  className="absolute inset-0 rounded-lg bg-gradient-to-r from-sky-500/20 via-sky-500/[0.07] to-transparent border border-sky-500/30 shadow-[0_0_18px_rgba(56,189,248,0.12)]"
+                >
+                  <span className="absolute left-0 top-1.5 bottom-1.5 w-0.5 bg-sky-400 shadow-[0_0_8px_#38bdf8]" />
+                </motion.div>
+              )}
+              <span className="relative z-10 flex items-center gap-2.5">
+                <Smartphone size={15} />
+                <span>NEXUS DROP</span>
+              </span>
+              <span className="relative z-10 text-[10px] text-[#8793a5]">09</span>
+            </motion.button>
           </nav>
         </div>
 
@@ -348,6 +376,7 @@ export default function App() {
           {c.activeTab === "power" && <PowerModule c={c} />}
           {c.activeTab === "processes" && <ProcessModule c={c} />}
           {c.activeTab === "network" && <NetworkModule c={c} />}
+          {c.activeTab === "drop" && <DropModule />}
         </AnimatePresence>
       </main>
       </div>

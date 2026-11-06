@@ -26,6 +26,7 @@ sysinfo = "0.33"
 winreg = "0.52"
 jwalk = "0.8"
 png = "0.18"
+qrcode = "0.14"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

@@ -32,7 +32,7 @@ import {
 
 export function useNexusController() {
   const [activeTab, setActiveTab] = useState<
-    "dashboard" | "startup" | "storage" | "hardware" | "cleanup" | "power" | "processes" | "network"
+    "dashboard" | "startup" | "storage" | "hardware" | "cleanup" | "power" | "processes" | "network" | "drop"
   >("dashboard");
   const [metrics, setMetrics] = useState<Metrics>({
     cpu_usage: 0,
