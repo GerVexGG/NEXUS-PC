@@ -37,9 +37,7 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../hwmon-sidecar/bin/publish/nexus-hwmon.exe": "nexus-hwmon.exe",
-      "../hwmon-sidecar/bin/publish/*.dll": "",
-      "../hwmon-sidecar/bin/publish/*.json": ""
+      "../hwmon-sidecar/bin/publish/nexus-hwmon.exe": "nexus-hwmon.exe"
     }
   }
 }

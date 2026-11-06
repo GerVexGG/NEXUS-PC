@@ -103,13 +103,10 @@ export function ProcessModule({ c }: { c: NexusController }) {
               {/* Шапка Process Explorer */}
               <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4 border-b border-white/[0.06] pb-3.5">
                 <div>
-                  <div className="text-[10px] font-mono uppercase tracking-[0.2em] text-sky-400/90 mb-0.5">
-                    PROCESS EXPLORER // LIVE TASK MATRIX
-                  </div>
-                  <h2 className="text-2xl font-bold text-[#e8edf4] tracking-tight">
+                  <h2 className="text-2xl font-semibold tracking-tight text-slate-100">
                     Диспетчер процессов
                   </h2>
-                  <p className="text-xs text-[#8793a5] font-mono mt-0.5">
+                  <p className="mt-0.5 text-sm text-slate-400">
                     ПКМ по строке — действия с процессом • Клик по заголовку — сортировка
                   </p>
                 </div>

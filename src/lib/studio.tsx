@@ -547,10 +547,8 @@ export function getLoadBarStyles(
   };
 }
 
-// Сегментированный индикатор приборной шкалы Obsidian Cyber-HUD
 export function SegmentedHudBar({
   percentage,
-  segments = 20,
   theme = "emerald",
 }: {
   percentage: number;
@@ -558,22 +556,14 @@ export function SegmentedHudBar({
   theme?: "emerald" | "cyan";
 }) {
   const clamped = Math.min(100, Math.max(0, percentage));
-  const activeCount = Math.round((clamped / 100) * segments);
   const styles = getLoadBarStyles(clamped, theme);
 
   return (
-    <div className="grid gap-1" style={{ gridTemplateColumns: `repeat(${segments}, minmax(0, 1fr))` }}>
-      {Array.from({ length: segments }, (_, i) => {
-        const isActive = i < activeCount;
-        return (
-          <div
-            key={i}
-            className={`h-2 rounded-[2px] transition-all duration-300 ${
-              isActive ? styles.activeSegmentClass : "bg-white/[0.06]"
-            }`}
-          />
-        );
-      })}
+    <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/[0.06]">
+      <div
+        className={`h-full rounded-full transition-[width] duration-500 ease-out ${styles.barClass}`}
+        style={{ width: `${clamped}%` }}
+      />
     </div>
   );
 }
@@ -588,7 +578,6 @@ export function getLocationBadgeStyles(location: string): string {
   return "bg-sky-500/10 text-sky-400 border-sky-500/25";
 }
 
-// Приборный модуль Obsidian Cyber-HUD с угловыми метками (HUD corner brackets) и Spotlight-свечением
 export interface SpotlightCardProps {
   children: ReactNode;
   className?: string;
@@ -600,64 +589,35 @@ export interface SpotlightCardProps {
 export function SpotlightCard({
   children,
   className = "",
-  spotlightColor = "rgba(56, 189, 248, 0.12)",
+  spotlightColor = "rgba(148, 163, 184, 0.55)",
   variants,
-  accentColor = "emerald",
 }: SpotlightCardProps) {
   const handleMouseMove = (e: MouseEvent<HTMLDivElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    e.currentTarget.style.setProperty("--mouse-x", `${x}px`);
-    e.currentTarget.style.setProperty("--mouse-y", `${y}px`);
+    e.currentTarget.style.setProperty("--mouse-x", `${e.clientX - rect.left}px`);
+    e.currentTarget.style.setProperty("--mouse-y", `${e.clientY - rect.top}px`);
   };
-
-  const cornerClass =
-    accentColor === "cyan"
-      ? "border-cyan-400/40 group-hover:border-cyan-300/80"
-      : accentColor === "amber"
-      ? "border-amber-400/45 group-hover:border-amber-300/85"
-      : accentColor === "rose"
-      ? "border-rose-400/50 group-hover:border-rose-300/90"
-      : "border-sky-400/40 group-hover:border-sky-300/80";
 
   return (
     <motion.div
       variants={variants}
       onMouseMove={handleMouseMove}
-      style={
-        {
-          "--spotlight-color": spotlightColor,
-        } as React.CSSProperties
-      }
-      className={`group relative overflow-hidden rounded-xl backdrop-blur-2xl bg-[#111722]/95 border border-[#222b38] hover:border-sky-400/25 transition-all duration-300 shadow-[0_12px_36px_rgba(0,0,0,0.65)] ${className}`}
+      style={{ "--spotlight-color": spotlightColor } as React.CSSProperties}
+      className={`group relative rounded-xl border border-[#222b38] bg-[#111722] ${className}`}
     >
-      {/* Направленный радиальный свет за курсором */}
       <div
-        className="pointer-events-none absolute -inset-px opacity-0 group-hover:opacity-100 transition-opacity duration-300"
+        className="pointer-events-none absolute inset-0 rounded-xl opacity-0 transition-opacity duration-300 group-hover:opacity-100"
         style={{
+          padding: "1px",
           background:
-            "radial-gradient(360px circle at var(--mouse-x, 0px) var(--mouse-y, 0px), var(--spotlight-color), transparent 80%)",
+            "radial-gradient(140px circle at var(--mouse-x, 50%) var(--mouse-y, 0px), var(--spotlight-color), transparent 72%)",
+          mask: "linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0)",
+          maskComposite: "exclude",
+          WebkitMask: "linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0)",
+          WebkitMaskComposite: "xor",
         }}
       />
-      {/* Верхний металлический лазерный блик */}
-      <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/20 to-transparent" />
-
-      {/* Неоновые угловые метки приборного модуля (HUD Corner Brackets) */}
-      <span
-        className={`pointer-events-none absolute top-1.5 left-1.5 w-2.5 h-2.5 border-t border-l transition-colors duration-300 ${cornerClass}`}
-      />
-      <span
-        className={`pointer-events-none absolute top-1.5 right-1.5 w-2.5 h-2.5 border-t border-r transition-colors duration-300 ${cornerClass}`}
-      />
-      <span
-        className={`pointer-events-none absolute bottom-1.5 left-1.5 w-2.5 h-2.5 border-b border-l transition-colors duration-300 ${cornerClass}`}
-      />
-      <span
-        className={`pointer-events-none absolute bottom-1.5 right-1.5 w-2.5 h-2.5 border-b border-r transition-colors duration-300 ${cornerClass}`}
-      />
-
-      <div className="relative z-10 h-full flex flex-col justify-between">{children}</div>
+      <div className="relative z-10 flex h-full flex-col justify-between">{children}</div>
     </motion.div>
   );
 }
@@ -731,21 +691,20 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
               <h3 className="text-base font-semibold text-[#e8edf4] tracking-tight">
                 История нагрузки (последние 60 сек)
               </h3>
-              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-mono bg-sky-500/10 text-sky-400 border border-sky-500/20">
-                <Sparkles size={10} /> LIVE
+              <span className="inline-flex items-center gap-1 rounded-full border border-sky-500/20 bg-sky-500/10 px-2 py-0.5 text-xs text-sky-400">
+                <Sparkles size={10} /> Live
               </span>
             </div>
-            <p className="text-xs text-[#8793a5] font-mono mt-0.5">
-              Интервал обновления: 1 сек • Отметка: {activePoint?.timestamp ?? "—"}
+            <p className="mt-0.5 text-sm text-slate-400">
+              Обновление каждую секунду · <span className="font-mono">{activePoint?.timestamp ?? "—"}</span>
             </p>
           </div>
 
-          {/* Легенда */}
-          <div className="flex items-center gap-5 text-xs font-mono bg-zinc-950/60 px-3.5 py-2 rounded-xl border border-white/5">
+          <div className="flex items-center gap-5 rounded-xl border border-white/5 bg-[#0e1118] px-3.5 py-2 text-xs">
             <div className="flex items-center gap-2">
               <span className="h-2.5 w-2.5 rounded-full bg-sky-400 shadow-[0_0_10px_rgba(56,189,248,0.85)]"></span>
               <span className="text-[#8793a5]">CPU:</span>
-              <span className="text-sky-400 font-semibold w-12 text-right">
+              <span className="w-12 text-right font-mono font-semibold text-sky-400">
                 {activePoint ? `${activePoint.cpu.toFixed(1)}%` : "0.0%"}
               </span>
             </div>
@@ -753,7 +712,7 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
             <div className="flex items-center gap-2">
               <span className="h-2.5 w-2.5 rounded-full bg-cyan-400 shadow-[0_0_10px_rgba(34,211,238,0.85)]"></span>
               <span className="text-[#8793a5]">RAM:</span>
-              <span className="text-cyan-400 font-semibold w-12 text-right">
+              <span className="w-12 text-right font-mono font-semibold text-cyan-400">
                 {activePoint ? `${activePoint.ram.toFixed(1)}%` : "0.0%"}
               </span>
             </div>
@@ -762,7 +721,7 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
 
         {/* Область SVG-графика */}
         <div className="relative h-52 w-full select-none">
-          <div className="pointer-events-none absolute inset-y-0 left-2 flex flex-col justify-between text-[10px] font-mono text-[#8793a5]/80 py-2 z-10">
+          <div className="pointer-events-none absolute inset-y-0 left-2 z-10 flex flex-col justify-between py-2 font-mono text-xs text-slate-500">
             <span>100%</span>
             <span>75%</span>
             <span>50%</span>
@@ -780,7 +739,7 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
                 style={{
                   left: `${Math.min(86, Math.max(14, hoverPercentX))}%`,
                 }}
-                className="pointer-events-none absolute top-2.5 -translate-x-1/2 z-20 px-3 py-1.5 rounded-xl backdrop-blur-md bg-zinc-950/90 border border-white/10 shadow-[0_8px_24px_rgba(0,0,0,0.6)] text-[11px] font-mono flex items-center gap-3 whitespace-nowrap"
+                className="pointer-events-none absolute top-2.5 z-20 flex -translate-x-1/2 items-center gap-3 whitespace-nowrap rounded-xl border border-[#222b38] bg-[#111722] px-3 py-1.5 font-mono text-xs shadow-lg"
               >
                 <span className="text-[#8793a5]">{history[hoverIndex].timestamp}</span>
                 <span className="text-sky-400 font-semibold">
@@ -896,7 +855,7 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
             )}
           </svg>
 
-          <div className="flex justify-between text-[10px] font-mono text-[#8793a5] mt-1.5 px-1">
+          <div className="mt-1.5 flex justify-between px-1 text-xs text-slate-500">
             <span>-60 сек</span>
             <span>-30 сек</span>
             <span>Сейчас</span>

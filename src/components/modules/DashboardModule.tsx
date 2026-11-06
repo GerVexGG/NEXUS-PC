@@ -45,10 +45,7 @@ export function DashboardModule({ c }: { c: NexusController }) {
             >
               <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-3 border-b border-white/[0.06] pb-3.5">
                 <div>
-                  <div className="text-[10px] font-mono uppercase tracking-[0.2em] text-sky-400/90 mb-0.5">
-                    OBSIDIAN CYBER-HUD // REALTIME TELEMETRY
-                  </div>
-                  <h2 className="text-2xl font-bold text-[#e8edf4] tracking-tight">
+                  <h2 className="text-2xl font-semibold tracking-tight text-slate-100">
                     Приборная панель системы
                   </h2>
                 </div>
@@ -82,10 +79,7 @@ export function DashboardModule({ c }: { c: NexusController }) {
                   <div>
                     <div className="flex items-center justify-between mb-3 gap-2">
                       <div>
-                        <span className="text-[10px] font-mono uppercase tracking-[0.16em] text-[#8793a5] block">
-                          SYS.MOD // 01
-                        </span>
-                        <span className="text-sm font-semibold text-[#d5dde8]">
+                        <span className="text-sm font-semibold text-slate-100">
                           Центральный процессор
                         </span>
                       </div>
@@ -133,10 +127,7 @@ export function DashboardModule({ c }: { c: NexusController }) {
                   <div>
                     <div className="flex items-center justify-between mb-3 gap-2">
                       <div>
-                        <span className="text-[10px] font-mono uppercase tracking-[0.16em] text-[#8793a5] block">
-                          SYS.MOD // 02
-                        </span>
-                        <span className="text-sm font-semibold text-[#d5dde8]">
+                        <span className="text-sm font-semibold text-slate-100">
                           Оперативная память
                         </span>
                       </div>
@@ -189,10 +180,7 @@ export function DashboardModule({ c }: { c: NexusController }) {
                   <div>
                     <div className="flex items-center justify-between mb-3 gap-2">
                       <div>
-                        <span className="text-[10px] font-mono uppercase tracking-[0.16em] text-[#8793a5] block">
-                          SYS.MOD // 03
-                        </span>
-                        <span className="text-sm font-semibold text-[#d5dde8]">
+                        <span className="text-sm font-semibold text-slate-100">
                           Системный накопитель
                         </span>
                       </div>
@@ -253,10 +241,7 @@ export function DashboardModule({ c }: { c: NexusController }) {
                         </div>
                         <div>
                           <div className="flex items-center gap-2">
-                            <span className="text-[10px] font-mono uppercase tracking-[0.18em] text-cyan-400">
-                              NET.HUD // TRIPLE TELEMETRY
-                            </span>
-                            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-white/[0.05] text-[#8793a5]">
+                            <span className="rounded bg-white/[0.05] px-1.5 py-0.5 font-mono text-xs text-slate-400">
                               TCP 1.1.1.1:53
                             </span>
                           </div>
@@ -300,7 +285,7 @@ export function DashboardModule({ c }: { c: NexusController }) {
                     {/* Тройная приборная сетка: 1. PING, 2. DOWNLOAD, 3. UPLOAD */}
                     <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                       {/* 1. PING (Задержка шлюза в мс) */}
-                      <div className="relative p-4 rounded-xl bg-[#151c27]/90 border border-white/[0.07] flex flex-col justify-between space-y-3 hud-dot-matrix">
+                      <div className="relative p-4 rounded-xl bg-[#151c27]/90 border border-white/[0.07] flex flex-col justify-between space-y-3">
                         <div className="flex items-center justify-between gap-2">
                           <span className="flex items-center gap-1.5 text-xs font-mono uppercase tracking-wider text-[#8793a5]">
                             <Radio size={14} className={pingStyle.colorClass} />
@@ -348,7 +333,7 @@ export function DashboardModule({ c }: { c: NexusController }) {
                       </div>
 
                       {/* 2. DOWNLOAD (Входящий поток) */}
-                      <div className="relative p-4 rounded-xl bg-[#151c27]/90 border border-white/[0.07] flex flex-col justify-between space-y-3 hud-dot-matrix">
+                      <div className="relative p-4 rounded-xl bg-[#151c27]/90 border border-white/[0.07] flex flex-col justify-between space-y-3">
                         <div className="flex items-center justify-between gap-2">
                           <span className="flex items-center gap-1.5 text-xs font-mono uppercase tracking-wider text-[#8793a5]">
                             <span className="p-1 rounded bg-sky-500/15 border border-sky-500/30 text-sky-400 shadow-[0_0_10px_rgba(56,189,248,0.3)]">
@@ -387,7 +372,7 @@ export function DashboardModule({ c }: { c: NexusController }) {
                       </div>
 
                       {/* 3. UPLOAD (Исходящий поток) */}
-                      <div className="relative p-4 rounded-xl bg-[#151c27]/90 border border-white/[0.07] flex flex-col justify-between space-y-3 hud-dot-matrix">
+                      <div className="relative p-4 rounded-xl bg-[#151c27]/90 border border-white/[0.07] flex flex-col justify-between space-y-3">
                         <div className="flex items-center justify-between gap-2">
                           <span className="flex items-center gap-1.5 text-xs font-mono uppercase tracking-wider text-[#8793a5]">
                             <span className="p-1 rounded bg-cyan-500/15 border border-cyan-500/30 text-cyan-400 shadow-[0_0_10px_rgba(34,211,238,0.3)]">

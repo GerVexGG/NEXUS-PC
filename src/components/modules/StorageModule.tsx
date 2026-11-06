@@ -50,7 +50,7 @@ export function StorageModule({ c }: { c: NexusController }) {
               className="space-y-6 max-w-6xl w-full"
             >
               <div>
-                <h2 className="text-2xl font-bold text-[#e8edf4] tracking-tight">
+                <h2 className="text-2xl font-semibold tracking-tight text-slate-100">
                   Анализатор накопителей (Storage Analyzer)
                 </h2>
                 <p className="text-sm text-[#8793a5] mt-1">

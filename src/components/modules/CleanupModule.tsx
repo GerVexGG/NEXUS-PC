@@ -82,10 +82,7 @@ export function CleanupModule({ c }: { c: NexusController }) {
               {/* Шапка Cleanup Center */}
               <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4 border-b border-white/[0.06] pb-3.5">
                 <div>
-                  <div className="text-[10px] font-mono uppercase tracking-[0.2em] text-sky-400/90 mb-0.5">
-                    CLEANUP CENTER // SAFE STORAGE SANITIZER
-                  </div>
-                  <h2 className="text-2xl font-bold text-[#e8edf4] tracking-tight">
+                  <h2 className="text-2xl font-semibold tracking-tight text-slate-100">
                     Безопасная очистка накопителя
                   </h2>
                   <p className="text-xs sm:text-sm text-[#8793a5] mt-0.5">
@@ -117,7 +114,7 @@ export function CleanupModule({ c }: { c: NexusController }) {
               >
                 <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 flex-1">
-                    <div className="p-3.5 rounded-xl bg-[#151c27]/90 border border-white/[0.06] hud-dot-matrix">
+                    <div className="p-3.5 rounded-xl bg-[#151c27]/90 border border-white/[0.06]">
                       <span className="text-[10px] font-mono uppercase tracking-wider text-[#8793a5] block">
                         ОБНАРУЖЕНО ВСЕГО
                       </span>
@@ -126,7 +123,7 @@ export function CleanupModule({ c }: { c: NexusController }) {
                       </div>
                     </div>
 
-                    <div className="p-3.5 rounded-xl bg-[#151c27]/90 border border-sky-500/25 hud-dot-matrix">
+                    <div className="p-3.5 rounded-xl bg-[#151c27]/90 border border-sky-500/25">
                       <span className="text-[10px] font-mono uppercase tracking-wider text-sky-400/90 block">
                         ВЫБРАНО К ОЧИСТКЕ
                       </span>
@@ -135,7 +132,7 @@ export function CleanupModule({ c }: { c: NexusController }) {
                       </div>
                     </div>
 
-                    <div className="p-3.5 rounded-xl bg-[#151c27]/90 border border-white/[0.06] hud-dot-matrix">
+                    <div className="p-3.5 rounded-xl bg-[#151c27]/90 border border-white/[0.06]">
                       <span className="text-[10px] font-mono uppercase tracking-wider text-[#8793a5] block">
                         ФАЙЛОВ В ВЫБОРКЕ
                       </span>
