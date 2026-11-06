@@ -1,427 +1,176 @@
+import { HardDrive, Power, Trash2 } from "lucide-react";
 import { motion } from "framer-motion";
-import {
-  HardDrive,
-  Cpu,
-  Activity,
-  Wifi,
-  ArrowDown,
-  ArrowUp,
-  Radio,
-} from "lucide-react";
-import {
-  LoadHistoryChart,
-  SegmentedHudBar,
-  SpotlightCard,
-  cardItemVariants,
-  cardsContainerVariants,
-} from "../../lib/studio";
+import { LoadHistoryChart, SegmentedHudBar } from "../../lib/studio";
 import type { NexusController } from "../../hooks/useNexusController";
+
+function pingTone(pingMs: number): { value: string; label: string; className: string } {
+  if (!Number.isFinite(pingMs) || pingMs <= 0 || pingMs >= 999) {
+    return { value: "—", label: "Нет связи", className: "text-slate-400" };
+  }
+  if (pingMs < 40) {
+    return { value: `${pingMs}`, label: "Отлично", className: "text-emerald-400" };
+  }
+  if (pingMs <= 80) {
+    return { value: `${pingMs}`, label: "Средне", className: "text-amber-400" };
+  }
+  return { value: `${pingMs}`, label: "Высокая задержка", className: "text-rose-400" };
+}
+
+function MetricCard({
+  label,
+  value,
+  detail,
+  percent,
+  theme,
+}: {
+  label: string;
+  value: string;
+  detail: string;
+  percent: number;
+  theme?: "emerald" | "cyan";
+}) {
+  return (
+    <div className="flex min-w-0 flex-col gap-3 rounded-xl border border-[#222b38] bg-[#111722] p-4">
+      <div className="text-sm text-slate-400">{label}</div>
+      <div className="font-mono text-2xl font-bold text-slate-100">{value}</div>
+      <div className="text-xs text-slate-500">{detail}</div>
+      <SegmentedHudBar percentage={percent} theme={theme} />
+    </div>
+  );
+}
 
 export function DashboardModule({ c }: { c: NexusController }) {
   const {
     metrics,
     history,
-    swapPercentage,
     diskUsedPercentage,
-    isNetworkActive,
     isGatewayOnline,
-    pingStyle,
     rxParts,
     txParts,
-    rxPulsePct,
-    txPulsePct,
-    cpuLoadStyles,
-    ramLoadStyles,
-    diskLoadStyles,
+    hwData,
+    setActiveTab,
   } = c;
+
+  const ping = pingTone(metrics.net_ping_ms);
+  const cpuName = hwData?.cpu.name?.trim();
+  const coreCount = hwData?.cpu.core_temps.length ?? 0;
+  const cpuDetail = cpuName
+    ? coreCount > 0
+      ? `${cpuName} · ${coreCount} ядер`
+      : cpuName
+    : "Текущая загрузка процессора";
+  const linkLabel = isGatewayOnline ? "Шлюз доступен" : "Шлюз не отвечает";
+
   return (
-            <motion.div
-              key="dashboard"
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -6 }}
-              transition={{ duration: 0.18, ease: "easeOut" }}
-              className="space-y-5 max-w-6xl w-full"
-            >
-              <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-3 border-b border-white/[0.06] pb-3.5">
-                <div>
-                  <h2 className="text-2xl font-semibold tracking-tight text-slate-100">
-                    Приборная панель системы
-                  </h2>
-                </div>
-                <div className="flex items-center gap-2 text-[11px] font-mono text-[#8793a5]">
-                  <span className="px-2.5 py-1 rounded bg-[#151c27] border border-white/[0.07] tabular-nums">
-                    ОПРОС: <strong className="text-sky-400">1000 MS</strong>
-                  </span>
-                  <span className="px-2.5 py-1 rounded bg-[#151c27] border border-white/[0.07] tabular-nums">
-                    ШЛЮЗ:{" "}
-                    <strong className={isGatewayOnline ? "text-emerald-400" : "text-rose-400"}>
-                      {isGatewayOnline ? "ONLINE" : "TIMEOUT"}
-                    </strong>
-                  </span>
-                </div>
+    <motion.div
+      key="dashboard"
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -6 }}
+      transition={{ duration: 0.18, ease: "easeOut" }}
+      className="w-full max-w-6xl"
+    >
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <h2 className="text-2xl font-semibold text-slate-100">Обзор системы</h2>
+          <p className="mt-1 text-sm text-slate-400">Состояние компьютера в реальном времени</p>
+        </div>
+        <div className="inline-flex items-center gap-2 self-start rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-xs text-emerald-400">
+          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+          Система активна
+        </div>
+      </div>
+
+      <div className="mt-4 grid grid-cols-4 gap-4">
+        <MetricCard
+          label="Процессор"
+          value={`${metrics.cpu_usage.toFixed(1)}%`}
+          detail={cpuDetail}
+          percent={metrics.cpu_usage}
+        />
+        <MetricCard
+          label="Память"
+          value={`${metrics.ram_used_gb.toFixed(1)} / ${metrics.ram_total_gb.toFixed(0)} GB`}
+          detail={`${metrics.ram_percentage.toFixed(0)}% занято`}
+          percent={metrics.ram_percentage}
+          theme="cyan"
+        />
+        <MetricCard
+          label="Системный накопитель"
+          value={`${metrics.disk_free_gb.toFixed(0)} GB свободно`}
+          detail={`${diskUsedPercentage.toFixed(0)}% заполнено из ${metrics.disk_total_gb.toFixed(0)} GB`}
+          percent={diskUsedPercentage}
+        />
+        <MetricCard
+          label="Сетевая активность"
+          value={`↓ ${rxParts.value} ${rxParts.unit}`}
+          detail={`↑ ${txParts.value} ${txParts.unit} · ${linkLabel}`}
+          percent={Math.min(100, (metrics.net_rx_kbps + metrics.net_tx_kbps) / 100)}
+          theme="cyan"
+        />
+      </div>
+
+      <div className="mt-4 grid grid-cols-12 gap-4">
+        <div className="col-span-8">
+          <LoadHistoryChart history={history} />
+        </div>
+
+        <div className="col-span-4 flex flex-col gap-4">
+          <div className="rounded-xl border border-[#222b38] bg-[#111722] p-4">
+            <div className="text-sm text-slate-400">Сетевое подключение</div>
+            <div className="mt-3 flex items-end justify-between gap-3">
+              <div>
+                <div className={`font-mono text-xl font-bold ${ping.className}`}>{ping.value}</div>
+                <div className="mt-1 text-xs text-slate-500">мс · {ping.label}</div>
               </div>
+            </div>
+            <div className="mt-4 space-y-2 text-sm">
+              <div className="flex items-center justify-between rounded-lg bg-[#151c27] px-3 py-2">
+                <span className="text-slate-400">Приём</span>
+                <span className="font-mono text-slate-100">
+                  {rxParts.value} {rxParts.unit}
+                </span>
+              </div>
+              <div className="flex items-center justify-between rounded-lg bg-[#151c27] px-3 py-2">
+                <span className="text-slate-400">Отдача</span>
+                <span className="font-mono text-slate-100">
+                  {txParts.value} {txParts.unit}
+                </span>
+              </div>
+            </div>
+          </div>
 
-              {/* Верхний ряд: 3 главных системных прибора (CPU, RAM+Swap, Накопитель) */}
-              <motion.div
-                variants={cardsContainerVariants}
-                initial="hidden"
-                animate="show"
-                className="grid grid-cols-1 md:grid-cols-3 gap-4"
+          <div className="rounded-xl border border-[#222b38] bg-[#111722] p-4">
+            <div className="mb-3 text-sm text-slate-400">Быстрые действия</div>
+            <div className="flex flex-col gap-2">
+              <button
+                type="button"
+                onClick={() => setActiveTab("cleanup")}
+                className="flex items-center justify-between rounded-lg border border-[#222b38] bg-[#151c27] p-2.5 text-xs font-medium text-slate-200 transition-colors hover:bg-[#1a2332]"
               >
-                {/* 1. CPU HUD Module */}
-                <SpotlightCard
-                  variants={cardItemVariants}
-                  spotlightColor="rgba(56, 189, 248, 0.14)"
-                  accentColor="emerald"
-                  className="min-w-0 p-5"
-                >
-                  <div>
-                    <div className="flex items-center justify-between mb-3 gap-2">
-                      <div>
-                        <span className="text-sm font-semibold text-slate-100">
-                          Центральный процессор
-                        </span>
-                      </div>
-                      <div className="p-2 rounded-lg bg-sky-500/10 border border-sky-500/25">
-                        <Cpu size={16} className={cpuLoadStyles.badgeTextClass} />
-                      </div>
-                    </div>
-
-                    <div className="flex items-baseline gap-2 my-3">
-                      <span className="text-3xl sm:text-4xl font-extrabold font-mono tabular-nums text-[#e8edf4] tracking-tight">
-                        {metrics.cpu_usage.toFixed(1)}
-                      </span>
-                      <span className="text-xs font-mono font-bold px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-300 border border-sky-500/30">
-                        % LOAD
-                      </span>
-                    </div>
-                  </div>
-
-                  <div className="space-y-2.5">
-                    <SegmentedHudBar
-                      percentage={metrics.cpu_usage}
-                      segments={20}
-                      theme="emerald"
-                    />
-                    <div className="flex items-center justify-between text-[11px] text-[#8793a5] font-mono pt-1 border-t border-white/[0.05]">
-                      <span>СТАТУС ЯДРА</span>
-                      <span className={`font-bold ${cpuLoadStyles.badgeTextClass}`}>
-                        {metrics.cpu_usage > 90
-                          ? "CRITICAL LOAD"
-                          : metrics.cpu_usage > 70
-                          ? "HIGH LOAD"
-                          : "NOMINAL"}
-                      </span>
-                    </div>
-                  </div>
-                </SpotlightCard>
-
-                {/* 2. RAM + Swap HUD Module */}
-                <SpotlightCard
-                  variants={cardItemVariants}
-                  spotlightColor="rgba(34, 211, 238, 0.14)"
-                  accentColor="cyan"
-                  className="min-w-0 p-5"
-                >
-                  <div>
-                    <div className="flex items-center justify-between mb-3 gap-2">
-                      <div>
-                        <span className="text-sm font-semibold text-slate-100">
-                          Оперативная память
-                        </span>
-                      </div>
-                      <div className="p-2 rounded-lg bg-cyan-500/10 border border-cyan-500/25">
-                        <Activity size={16} className={ramLoadStyles.badgeTextClass} />
-                      </div>
-                    </div>
-
-                    <div className="flex items-baseline justify-between gap-2 my-3">
-                      <div className="flex items-baseline gap-1.5">
-                        <span className="text-3xl sm:text-4xl font-extrabold font-mono tabular-nums text-[#e8edf4] tracking-tight">
-                          {metrics.ram_used_gb.toFixed(1)}
-                        </span>
-                        <span className="text-sm font-mono text-[#8793a5] tabular-nums">
-                          / {metrics.ram_total_gb.toFixed(0)}
-                        </span>
-                        <span className="text-xs font-mono font-bold px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
-                          GB
-                        </span>
-                      </div>
-                      <span className={`text-xs font-mono font-bold tabular-nums ${ramLoadStyles.badgeTextClass}`}>
-                        {metrics.ram_percentage.toFixed(0)}%
-                      </span>
-                    </div>
-                  </div>
-
-                  <div className="space-y-2.5">
-                    <SegmentedHudBar
-                      percentage={metrics.ram_percentage}
-                      segments={20}
-                      theme="cyan"
-                    />
-                    <div className="flex items-center justify-between text-[11px] font-mono pt-1 border-t border-white/[0.05]">
-                      <span className="text-[#8793a5]">SWAP БУФЕР:</span>
-                      <span className="text-[#c5d0de] tabular-nums">
-                        {metrics.swap_used_gb.toFixed(1)} / {metrics.swap_total_gb.toFixed(1)}{" "}
-                        <span className="text-cyan-400">GB</span> ({swapPercentage.toFixed(0)}%)
-                      </span>
-                    </div>
-                  </div>
-                </SpotlightCard>
-
-                {/* 3. Primary Storage HUD Module */}
-                <SpotlightCard
-                  variants={cardItemVariants}
-                  spotlightColor="rgba(56, 189, 248, 0.14)"
-                  accentColor="emerald"
-                  className="min-w-0 p-5"
-                >
-                  <div>
-                    <div className="flex items-center justify-between mb-3 gap-2">
-                      <div>
-                        <span className="text-sm font-semibold text-slate-100">
-                          Системный накопитель
-                        </span>
-                      </div>
-                      <div className="p-2 rounded-lg bg-sky-500/10 border border-sky-500/25">
-                        <HardDrive size={16} className={diskLoadStyles.badgeTextClass} />
-                      </div>
-                    </div>
-
-                    <div className="flex items-baseline justify-between gap-2 my-3">
-                      <div className="flex items-baseline gap-2">
-                        <span className="text-3xl sm:text-4xl font-extrabold font-mono tabular-nums text-[#e8edf4] tracking-tight">
-                          {metrics.disk_free_gb}
-                        </span>
-                        <span className="text-xs font-mono font-bold px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-300 border border-sky-500/30">
-                          GB FREE
-                        </span>
-                      </div>
-                      <span className="text-xs font-mono text-[#8793a5] tabular-nums">
-                        {diskUsedPercentage.toFixed(0)}% ИСП.
-                      </span>
-                    </div>
-                  </div>
-
-                  <div className="space-y-2.5">
-                    <SegmentedHudBar
-                      percentage={diskUsedPercentage}
-                      segments={20}
-                      theme="emerald"
-                    />
-                    <div className="flex items-center justify-between text-[11px] text-[#8793a5] font-mono pt-1 border-t border-white/[0.05]">
-                      <span>ОБЩИЙ ОБЪЕМ</span>
-                      <span className="text-[#c5d0de] tabular-nums">
-                        {metrics.disk_total_gb} <span className="text-sky-400">GB</span>
-                      </span>
-                    </div>
-                  </div>
-                </SpotlightCard>
-              </motion.div>
-
-              {/* Второй ряд: Полноценная тройная панель сетевой телеметрии (Network HUD) */}
-              <motion.div
-                variants={cardsContainerVariants}
-                initial="hidden"
-                animate="show"
+                <span>Очистка системы</span>
+                <Trash2 size={14} />
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveTab("storage")}
+                className="flex items-center justify-between rounded-lg border border-[#222b38] bg-[#151c27] p-2.5 text-xs font-medium text-slate-200 transition-colors hover:bg-[#1a2332]"
               >
-                <SpotlightCard
-                  variants={cardItemVariants}
-                  spotlightColor="rgba(34, 211, 238, 0.12)"
-                  accentColor="cyan"
-                  className="p-5 sm:p-6"
-                >
-                  <div className="space-y-4">
-                    {/* Шапка Network HUD со шлюзом и общим статусом подключения */}
-                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3.5 border-b border-white/[0.06]">
-                      <div className="flex items-center gap-3">
-                        <div className="p-2 rounded-lg bg-cyan-500/10 border border-cyan-500/30 text-cyan-400 shadow-[0_0_15px_rgba(34,211,238,0.18)]">
-                          <Wifi size={18} />
-                        </div>
-                        <div>
-                          <div className="flex items-center gap-2">
-                            <span className="rounded bg-white/[0.05] px-1.5 py-0.5 font-mono text-xs text-slate-400">
-                              TCP 1.1.1.1:53
-                            </span>
-                          </div>
-                          <h3 className="text-base font-bold text-[#e8edf4] tracking-tight">
-                            Сетевой контур и задержка канала (Network HUD)
-                          </h3>
-                        </div>
-                      </div>
-
-                      <div className="flex items-center gap-2.5 self-start sm:self-auto font-mono text-xs">
-                        <div className="px-3 py-1.5 rounded-lg bg-[#07090d] border border-white/[0.07] flex items-center gap-2">
-                          <span
-                            className={`h-2 w-2 rounded-full ${
-                              isNetworkActive
-                                ? "bg-sky-400 shadow-[0_0_8px_#38bdf8] animate-pulse"
-                                : isGatewayOnline
-                                ? "bg-cyan-400"
-                                : "bg-zinc-600"
-                            }`}
-                          />
-                          <span className="text-[#8793a5]">КАНАЛ:</span>
-                          <span
-                            className={
-                              isNetworkActive
-                                ? "text-sky-400 font-bold"
-                                : isGatewayOnline
-                                ? "text-cyan-300 font-semibold"
-                                : "text-[#8793a5]"
-                            }
-                          >
-                            {isNetworkActive
-                              ? "АКТИВНЫЙ ТРАФИК"
-                              : isGatewayOnline
-                              ? " В СЕТИ (STANDBY)"
-                              : "НЕТ ОТВЕТА"}
-                          </span>
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Тройная приборная сетка: 1. PING, 2. DOWNLOAD, 3. UPLOAD */}
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                      {/* 1. PING (Задержка шлюза в мс) */}
-                      <div className="relative p-4 rounded-xl bg-[#151c27]/90 border border-white/[0.07] flex flex-col justify-between space-y-3">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="flex items-center gap-1.5 text-xs font-mono uppercase tracking-wider text-[#8793a5]">
-                            <Radio size={14} className={pingStyle.colorClass} />
-                            1. PING / ЗАДЕРЖКА
-                          </span>
-                          <span
-                            className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded border ${pingStyle.badgeClass}`}
-                          >
-                            {pingStyle.statusLabel}
-                          </span>
-                        </div>
-
-                        <div className="flex items-baseline gap-2">
-                          <span
-                            className={`text-3xl sm:text-4xl font-extrabold font-mono tabular-nums tracking-tight ${pingStyle.colorClass}`}
-                          >
-                            {pingStyle.valueText}
-                          </span>
-                          <span className="text-xs font-mono font-bold px-1.5 py-0.5 rounded bg-white/[0.06] text-[#c5d0de] border border-white/[0.08]">
-                            MS
-                          </span>
-                        </div>
-
-                        <div className="space-y-1.5">
-                          <div className="w-full h-1.5 bg-zinc-900 rounded-full overflow-hidden border border-white/[0.05]">
-                            <div
-                              style={{ width: `${pingStyle.barPercent}%` }}
-                              className={`h-full rounded-full transition-all duration-500 ${
-                                metrics.net_ping_ms === 0 || metrics.net_ping_ms >= 999
-                                  ? "bg-zinc-700"
-                                  : metrics.net_ping_ms < 40
-                                  ? "bg-gradient-to-r from-sky-500 to-teal-400 shadow-[0_0_10px_#38bdf8]"
-                                  : metrics.net_ping_ms <= 90
-                                  ? "bg-gradient-to-r from-amber-500 to-yellow-400 shadow-[0_0_10px_#fbbf24]"
-                                  : "bg-gradient-to-r from-rose-500 to-red-400 shadow-[0_0_10px_#f43f5e]"
-                              }`}
-                            />
-                          </div>
-                          <div className="flex justify-between text-[10px] font-mono text-[#8793a5]">
-                            <span>&lt;40ms Идеально</span>
-                            <span>40-90ms Средне</span>
-                            <span>&gt;90ms Пик</span>
-                          </div>
-                        </div>
-                      </div>
-
-                      {/* 2. DOWNLOAD (Входящий поток) */}
-                      <div className="relative p-4 rounded-xl bg-[#151c27]/90 border border-white/[0.07] flex flex-col justify-between space-y-3">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="flex items-center gap-1.5 text-xs font-mono uppercase tracking-wider text-[#8793a5]">
-                            <span className="p-1 rounded bg-sky-500/15 border border-sky-500/30 text-sky-400 shadow-[0_0_10px_rgba(56,189,248,0.3)]">
-                              <ArrowDown size={13} />
-                            </span>
-                            2. DOWNLOAD / ПРИЕМ
-                          </span>
-                          <span className="text-[10px] font-mono text-sky-400/90 uppercase">
-                            RX STREAM
-                          </span>
-                        </div>
-
-                        <div className="flex items-baseline gap-2">
-                          <span className="text-3xl sm:text-4xl font-extrabold font-mono tabular-nums text-[#e8edf4] tracking-tight">
-                            {rxParts.value}
-                          </span>
-                          <span className="text-xs font-mono font-bold px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-300 border border-sky-500/30">
-                            {rxParts.unit}
-                          </span>
-                        </div>
-
-                        <div className="space-y-1.5">
-                          <div className="w-full h-1.5 bg-zinc-900 rounded-full overflow-hidden border border-white/[0.05]">
-                            <div
-                              style={{ width: `${rxPulsePct}%` }}
-                              className="h-full rounded-full bg-gradient-to-r from-sky-500 via-teal-400 to-sky-300 shadow-[0_0_12px_rgba(56,189,248,0.65)] transition-all duration-300"
-                            />
-                          </div>
-                          <div className="flex justify-between text-[10px] font-mono text-[#8793a5]">
-                            <span>Входящий импульс</span>
-                            <span className="text-sky-400 tabular-nums">
-                              {metrics.net_rx_kbps.toFixed(1)} KB/S
-                            </span>
-                          </div>
-                        </div>
-                      </div>
-
-                      {/* 3. UPLOAD (Исходящий поток) */}
-                      <div className="relative p-4 rounded-xl bg-[#151c27]/90 border border-white/[0.07] flex flex-col justify-between space-y-3">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="flex items-center gap-1.5 text-xs font-mono uppercase tracking-wider text-[#8793a5]">
-                            <span className="p-1 rounded bg-cyan-500/15 border border-cyan-500/30 text-cyan-400 shadow-[0_0_10px_rgba(34,211,238,0.3)]">
-                              <ArrowUp size={13} />
-                            </span>
-                            3. UPLOAD / ОТДАЧА
-                          </span>
-                          <span className="text-[10px] font-mono text-cyan-400/90 uppercase">
-                            TX STREAM
-                          </span>
-                        </div>
-
-                        <div className="flex items-baseline gap-2">
-                          <span className="text-3xl sm:text-4xl font-extrabold font-mono tabular-nums text-[#e8edf4] tracking-tight">
-                            {txParts.value}
-                          </span>
-                          <span className="text-xs font-mono font-bold px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
-                            {txParts.unit}
-                          </span>
-                        </div>
-
-                        <div className="space-y-1.5">
-                          <div className="w-full h-1.5 bg-zinc-900 rounded-full overflow-hidden border border-white/[0.05]">
-                            <div
-                              style={{ width: `${txPulsePct}%` }}
-                              className="h-full rounded-full bg-gradient-to-r from-cyan-500 via-sky-400 to-cyan-300 shadow-[0_0_12px_rgba(34,211,238,0.65)] transition-all duration-300"
-                            />
-                          </div>
-                          <div className="flex justify-between text-[10px] font-mono text-[#8793a5]">
-                            <span>Исходящий импульс</span>
-                            <span className="text-cyan-400 tabular-nums">
-                              {metrics.net_tx_kbps.toFixed(1)} KB/S
-                            </span>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                </SpotlightCard>
-              </motion.div>
-
-              {/* Третий ряд: 60-секундный живой неоновый график */}
-              <motion.div
-                variants={cardsContainerVariants}
-                initial="hidden"
-                animate="show"
+                <span>Анализ диска</span>
+                <HardDrive size={14} />
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveTab("power")}
+                className="flex items-center justify-between rounded-lg border border-[#222b38] bg-[#151c27] p-2.5 text-xs font-medium text-slate-200 transition-colors hover:bg-[#1a2332]"
               >
-                <LoadHistoryChart history={history} />
-              </motion.div>
-            </motion.div>
+                <span>Таймер питания</span>
+                <Power size={14} />
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </motion.div>
   );
 }

@@ -688,8 +688,8 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
             <div className="flex items-center gap-2">
-              <h3 className="text-base font-semibold text-[#e8edf4] tracking-tight">
-                История нагрузки (последние 60 сек)
+              <h3 className="text-base font-semibold tracking-tight text-slate-100">
+                Производительность (последние 60 сек)
               </h3>
               <span className="inline-flex items-center gap-1 rounded-full border border-sky-500/20 bg-sky-500/10 px-2 py-0.5 text-xs text-sky-400">
                 <Sparkles size={10} /> Live
@@ -720,7 +720,7 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
         </div>
 
         {/* Область SVG-графика */}
-        <div className="relative h-52 w-full select-none">
+        <div className="relative h-[260px] w-full select-none">
           <div className="pointer-events-none absolute inset-y-0 left-2 z-10 flex flex-col justify-between py-2 font-mono text-xs text-slate-500">
             <span>100%</span>
             <span>75%</span>
