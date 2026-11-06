@@ -2155,6 +2155,7 @@ name = "nexus"
 version = "0.1.0"
 dependencies = [
  "jwalk",
+ "png",
  "serde",
  "serde_json",
  "sysinfo",

@@ -8,7 +8,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::{Disks, Networks, System};
-use tauri::State;
+use tauri::{Manager, State};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -186,6 +186,7 @@ pub struct ProcessItem {
     pub disk_read_bytes_sec: u64,
     pub disk_write_bytes_sec: u64,
     pub run_time_sec: u64,
+    pub icon_base64: Option<String>,
 }
 
 // Хранилище состояния приложения
@@ -196,6 +197,7 @@ pub struct AppState {
     pub process_last_refresh: Mutex<Option<Instant>>,
     pub hw_telemetry: Arc<Mutex<Option<HardwareTelemetry>>>,
     pub hw_sidecar_child: Arc<Mutex<Option<Child>>>,
+    pub icon_cache: Mutex<HashMap<String, String>>,
 }
 
 impl Drop for AppState {
@@ -1678,11 +1680,273 @@ fn get_process_list(state: State<'_, AppState>) -> Result<Vec<ProcessItem>, Stri
                 disk_read_bytes_sec: (disk.read_bytes as f64 / elapsed_secs) as u64,
                 disk_write_bytes_sec: (disk.written_bytes as f64 / elapsed_secs) as u64,
                 run_time_sec: p.run_time(),
+                icon_base64: None,
             }
         })
         .collect();
 
+    drop(sys);
+
+    let mut list: Vec<ProcessItem> = list;
+    for item in &mut list {
+        item.icon_base64 = cached_process_icon(&state.icon_cache, &item.exe_path);
+    }
+
     Ok(list)
+}
+
+fn cached_process_icon(cache: &Mutex<HashMap<String, String>>, path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let key = trimmed.to_lowercase();
+
+    if let Ok(guard) = cache.lock() {
+        if let Some(hit) = guard.get(&key) {
+            return if hit.is_empty() {
+                None
+            } else {
+                Some(hit.clone())
+            };
+        }
+    }
+
+    let encoded = extract_exe_icon_png_base64(trimmed).unwrap_or_default();
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key, encoded.clone());
+    }
+    if encoded.is_empty() {
+        None
+    } else {
+        Some(encoded)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn extract_exe_icon_png_base64(_path: &str) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn extract_exe_icon_png_base64(path: &str) -> Option<String> {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    struct ShFileInfoW {
+        h_icon: isize,
+        i_icon: i32,
+        dw_attributes: u32,
+        sz_display_name: [u16; 260],
+        sz_type_name: [u16; 80],
+    }
+
+    #[repr(C)]
+    struct IconInfo {
+        f_icon: i32,
+        x_hotspot: u32,
+        y_hotspot: u32,
+        hbm_mask: isize,
+        hbm_color: isize,
+    }
+
+    #[repr(C)]
+    struct Bitmap {
+        bm_type: i32,
+        bm_width: i32,
+        bm_height: i32,
+        bm_width_bytes: i32,
+        bm_planes: u16,
+        bm_bits_pixel: u16,
+        bm_bits: *mut c_void,
+    }
+
+    #[repr(C)]
+    struct BitmapInfoHeader {
+        bi_size: u32,
+        bi_width: i32,
+        bi_height: i32,
+        bi_planes: u16,
+        bi_bit_count: u16,
+        bi_compression: u32,
+        bi_size_image: u32,
+        bi_x_pels_per_meter: i32,
+        bi_y_pels_per_meter: i32,
+        bi_clr_used: u32,
+        bi_clr_important: u32,
+    }
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn SHGetFileInfoW(
+            path: *const u16,
+            file_attributes: u32,
+            info: *mut ShFileInfoW,
+            info_size: u32,
+            flags: u32,
+        ) -> usize;
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn DestroyIcon(icon: isize) -> i32;
+        fn GetIconInfo(icon: isize, info: *mut IconInfo) -> i32;
+        fn GetDC(hwnd: isize) -> isize;
+        fn ReleaseDC(hwnd: isize, hdc: isize) -> i32;
+    }
+
+    #[link(name = "gdi32")]
+    unsafe extern "system" {
+        fn GetObjectW(handle: isize, size: i32, out: *mut c_void) -> i32;
+        fn CreateCompatibleDC(hdc: isize) -> isize;
+        fn DeleteDC(hdc: isize) -> i32;
+        fn GetDIBits(
+            hdc: isize,
+            bitmap: isize,
+            start: u32,
+            lines: u32,
+            bits: *mut c_void,
+            info: *mut BitmapInfoHeader,
+            usage: u32,
+        ) -> i32;
+        fn DeleteObject(handle: isize) -> i32;
+    }
+
+    const SHGFI_ICON: u32 = 0x0000_0100;
+    const SHGFI_SMALLICON: u32 = 0x0000_0001;
+
+    let mut wide: Vec<u16> = path.encode_utf16().collect();
+    wide.push(0);
+
+    unsafe {
+        let mut info: ShFileInfoW = std::mem::zeroed();
+        let ok = SHGetFileInfoW(
+            wide.as_ptr(),
+            0,
+            &mut info,
+            std::mem::size_of::<ShFileInfoW>() as u32,
+            SHGFI_ICON | SHGFI_SMALLICON,
+        );
+        if ok == 0 || info.h_icon == 0 {
+            return None;
+        }
+
+        let mut icon_info: IconInfo = std::mem::zeroed();
+        if GetIconInfo(info.h_icon, &mut icon_info) == 0 || icon_info.hbm_color == 0 {
+            if icon_info.hbm_mask != 0 {
+                DeleteObject(icon_info.hbm_mask);
+            }
+            if icon_info.hbm_color != 0 {
+                DeleteObject(icon_info.hbm_color);
+            }
+            DestroyIcon(info.h_icon);
+            return None;
+        }
+
+        let mut bitmap: Bitmap = std::mem::zeroed();
+        let got = GetObjectW(
+            icon_info.hbm_color,
+            std::mem::size_of::<Bitmap>() as i32,
+            &mut bitmap as *mut Bitmap as *mut c_void,
+        );
+        let width = bitmap.bm_width;
+        let height = bitmap.bm_height.abs();
+        if got == 0 || width <= 0 || height <= 0 || width > 256 || height > 256 {
+            DeleteObject(icon_info.hbm_color);
+            if icon_info.hbm_mask != 0 {
+                DeleteObject(icon_info.hbm_mask);
+            }
+            DestroyIcon(info.h_icon);
+            return None;
+        }
+
+        let screen = GetDC(0);
+        let mem_dc = CreateCompatibleDC(screen);
+        let mut header = BitmapInfoHeader {
+            bi_size: std::mem::size_of::<BitmapInfoHeader>() as u32,
+            bi_width: width,
+            bi_height: -height,
+            bi_planes: 1,
+            bi_bit_count: 32,
+            bi_compression: 0,
+            bi_size_image: 0,
+            bi_x_pels_per_meter: 0,
+            bi_y_pels_per_meter: 0,
+            bi_clr_used: 0,
+            bi_clr_important: 0,
+        };
+        let mut pixels = vec![0u8; (width as usize) * (height as usize) * 4];
+        let lines = GetDIBits(
+            mem_dc,
+            icon_info.hbm_color,
+            0,
+            height as u32,
+            pixels.as_mut_ptr() as *mut c_void,
+            &mut header,
+            0,
+        );
+        DeleteDC(mem_dc);
+        ReleaseDC(0, screen);
+        DeleteObject(icon_info.hbm_color);
+        if icon_info.hbm_mask != 0 {
+            DeleteObject(icon_info.hbm_mask);
+        }
+        DestroyIcon(info.h_icon);
+
+        if lines == 0 {
+            return None;
+        }
+
+        for px in pixels.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+
+        encode_rgba_png_base64(width as u32, height as u32, &pixels)
+    }
+}
+
+fn encode_rgba_png_base64(width: u32, height: u32, rgba: &[u8]) -> Option<String> {
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    let mut encoder = png::Encoder::new(&mut cursor, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().ok()?;
+    writer.write_image_data(rgba).ok()?;
+    drop(writer);
+    Some(base64_encode(&cursor.into_inner()))
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut index = 0;
+    while index + 3 <= data.len() {
+        let n = ((data[index] as u32) << 16)
+            | ((data[index + 1] as u32) << 8)
+            | (data[index + 2] as u32);
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(TABLE[((n >> 6) & 63) as usize] as char);
+        out.push(TABLE[(n & 63) as usize] as char);
+        index += 3;
+    }
+    if index < data.len() {
+        let remain = data.len() - index;
+        let mut n = (data[index] as u32) << 16;
+        if remain == 2 {
+            n |= (data[index + 1] as u32) << 8;
+        }
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        if remain == 2 {
+            out.push(TABLE[((n >> 6) & 63) as usize] as char);
+            out.push('=');
+        } else {
+            out.push('=');
+            out.push('=');
+        }
+    }
+    out
 }
 
 // Защита от завершения критичных узлов (System Idle, System) и самого NEXUS PC
@@ -1810,6 +2074,35 @@ fn suspend_process(pid: u32, suspend: bool) -> Result<(), String> {
     }
 }
 
+fn hwnd_to_isize<T: Copy>(hwnd: T) -> isize {
+    assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<isize>());
+    unsafe { std::mem::transmute_copy(&hwnd) }
+}
+
+#[cfg(target_os = "windows")]
+fn apply_dwm_rounded_corners(hwnd: isize) {
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmSetWindowAttribute(hwnd: isize, attribute: u32, value: *const u32, size: u32)
+            -> i32;
+    }
+
+    const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+    const DWMWCP_ROUND: u32 = 2;
+    let preference = DWMWCP_ROUND;
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &preference,
+            std::mem::size_of::<u32>() as u32,
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_dwm_rounded_corners(_hwnd: isize) {}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut sys = System::new_all();
@@ -1832,6 +2125,16 @@ pub fn run() {
             process_last_refresh: Mutex::new(None),
             hw_telemetry,
             hw_sidecar_child,
+            icon_cache: Mutex::new(HashMap::new()),
+        })
+        .setup(|app| {
+            #[cfg(target_os = "windows")]
+            if let Some(window) = app.get_webview_window("main") {
+                if let Ok(hwnd) = window.hwnd() {
+                    apply_dwm_rounded_corners(hwnd_to_isize(hwnd));
+                }
+            }
+            Ok(())
         })
         .on_window_event(move |window, event| {
             if let tauri::WindowEvent::Destroyed = event {
