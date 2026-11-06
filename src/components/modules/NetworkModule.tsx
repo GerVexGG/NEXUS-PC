@@ -66,6 +66,7 @@ export function NetworkModule({ c }: { c: NexusController }) {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [menu, setMenu] = useState<{ x: number; y: number; conn: NetworkConnection } | null>(null);
+  const [view, setView] = useState<"sockets" | "toolkit">("sockets");
 
   const fetchConnections = async () => {
     try {
@@ -163,18 +164,46 @@ export function NetworkModule({ c }: { c: NexusController }) {
         <div className="flex flex-col justify-between gap-4 border-b border-[#222b38] pb-3.5 lg:flex-row lg:items-end">
           <div>
             <h2 className="text-2xl font-semibold tracking-tight text-slate-100">Сетевой монитор</h2>
-            <p className="mt-0.5 text-sm text-slate-400">Активные сетевые сокеты и соединения процессов</p>
+            <p className="mt-0.5 text-sm text-slate-400">
+              {view === "sockets" ? "Активные сетевые сокеты и соединения процессов" : "Диагностика сети (Toolkit)"}
+            </p>
           </div>
-          <button
-            type="button"
-            onClick={() => void fetchConnections()}
-            className="inline-flex items-center gap-2 rounded-lg border border-[#222b38] bg-[#111722] px-3 py-2 text-xs font-medium text-slate-200 hover:bg-[#151c27]"
-          >
-            <RefreshCw size={13} className={loading ? "animate-spin" : ""} />
-            Обновить
-          </button>
+          {view === "sockets" && (
+            <button
+              type="button"
+              onClick={() => void fetchConnections()}
+              className="inline-flex items-center gap-2 rounded-lg border border-[#222b38] bg-[#111722] px-3 py-2 text-xs font-medium text-slate-200 hover:bg-[#151c27]"
+            >
+              <RefreshCw size={13} className={loading ? "animate-spin" : ""} />
+              Обновить
+            </button>
+          )}
         </div>
 
+        <div className="flex flex-wrap gap-2">
+          {([
+            ["sockets", "Активные соединения"],
+            ["toolkit", "Диагностика сети"],
+          ] as const).map(([id, label]) => (
+            <button
+              key={id}
+              type="button"
+              onClick={() => setView(id)}
+              className={`rounded-full border px-3 py-1 text-xs font-medium ${
+                view === id
+                  ? "border-sky-500/30 bg-sky-500/10 text-sky-300"
+                  : "border-[#222b38] bg-[#111722] text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {view === "toolkit" ? (
+          <NetworkToolkit />
+        ) : (
+        <div className="space-y-4">
         <div className="grid gap-3 sm:grid-cols-3">
           {kpis.map((item) => (
             <div key={item.label} className="rounded-xl border border-[#222b38] bg-[#111722] px-4 py-3">
@@ -320,6 +349,8 @@ export function NetworkModule({ c }: { c: NexusController }) {
             )}
           </div>
         </div>
+        </div>
+        )}
       </motion.div>
 
       <AnimatePresence>
@@ -383,5 +414,181 @@ export function NetworkModule({ c }: { c: NexusController }) {
         )}
       </AnimatePresence>
     </>
+  );
+}
+
+const PROBE_TARGETS = [
+  { label: "СНГ / Москва", host: "162.159.135.234" },
+  { label: "Европа / Cloudflare", host: "1.0.0.1" },
+  { label: "DNS 1.1.1.1", host: "1.1.1.1" },
+];
+
+interface StabilityReport {
+  sent: number;
+  received: number;
+  loss_percent: number;
+  min_ms: number;
+  avg_ms: number;
+  max_ms: number;
+  jitter_ms: number;
+}
+
+interface DnsBenchRow {
+  name: string;
+  server: string;
+  ms: number | null;
+}
+
+function NetworkToolkit() {
+  const [host, setHost] = useState(PROBE_TARGETS[0].host);
+  const [running, setRunning] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [report, setReport] = useState<StabilityReport | null>(null);
+  const [probeError, setProbeError] = useState("");
+  const [dnsRows, setDnsRows] = useState<DnsBenchRow[]>([]);
+  const [dnsBusy, setDnsBusy] = useState(false);
+  const [dnsError, setDnsError] = useState("");
+
+  const fastest = dnsRows.reduce<number | null>((best, row) => {
+    if (row.ms == null) return best;
+    return best == null ? row.ms : Math.min(best, row.ms);
+  }, null);
+
+  const lossClass = !report
+    ? "text-slate-300"
+    : report.loss_percent === 0
+      ? "text-emerald-400"
+      : report.loss_percent < 5
+        ? "text-amber-300"
+        : "text-rose-300";
+
+  return (
+    <div className="space-y-4">
+      <section className="rounded-xl border border-[#222b38] bg-[#111722] p-4">
+        <h3 className="text-sm font-semibold text-slate-100">Стресс-тест канала (Packet Loss & Jitter)</h3>
+        <div className="mt-3 flex flex-wrap gap-2">
+          {PROBE_TARGETS.map((target) => (
+            <button
+              key={target.host}
+              type="button"
+              onClick={() => setHost(target.host)}
+              className={`rounded-full border px-3 py-1 text-xs ${
+                host === target.host ? "border-sky-500/30 bg-sky-500/10 text-sky-300" : "border-[#222b38] bg-[#151c27] text-slate-400"
+              }`}
+            >
+              {target.label}
+            </button>
+          ))}
+        </div>
+        <button
+          type="button"
+          disabled={running}
+          onClick={() => {
+            setRunning(true);
+            setProgress(0);
+            setProbeError("");
+            setReport(null);
+            const timer = window.setInterval(() => {
+              void invoke<number>("get_stability_progress").then(setProgress).catch(() => undefined);
+            }, 250);
+            void invoke<StabilityReport>("run_stability_probe", { host })
+              .then((next) => {
+                setReport(next);
+                setProgress(next.sent);
+              })
+              .catch((err) => setProbeError(String(err)))
+              .finally(() => {
+                window.clearInterval(timer);
+                setRunning(false);
+              });
+          }}
+          className="mt-3 rounded-lg border border-sky-500/30 bg-sky-500/20 px-3 py-2 text-xs font-medium text-sky-300 hover:bg-sky-500/30 disabled:opacity-50"
+        >
+          {running ? "Тест выполняется..." : "Запустить тест стабильности"}
+        </button>
+        {(running || progress > 0) && (
+          <div className="mt-3">
+            <div className="mb-1 font-mono text-[11px] text-slate-400">{Math.min(progress, 30)} / 30</div>
+            <div className="h-1.5 overflow-hidden rounded-full bg-[#151c27]">
+              <div className="h-full bg-cyan-400" style={{ width: `${Math.min(100, (progress / 30) * 100)}%` }} />
+            </div>
+          </div>
+        )}
+        {probeError && <p className="mt-2 text-xs text-rose-300">{probeError}</p>}
+        {report && (
+          <div className="mt-3 grid gap-2 sm:grid-cols-4">
+            <div className="rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2">
+              <div className="text-[11px] text-slate-400">Минимум</div>
+              <div className="font-mono text-sm text-slate-100">{report.min_ms} мс</div>
+            </div>
+            <div className="rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2">
+              <div className="text-[11px] text-slate-400">Средний</div>
+              <div className="font-mono text-sm text-slate-100">{report.avg_ms.toFixed(1)} мс</div>
+            </div>
+            <div className="rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2">
+              <div className="text-[11px] text-slate-400">Максимум</div>
+              <div className="font-mono text-sm text-slate-100">{report.max_ms} мс</div>
+            </div>
+            <div className="rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2">
+              <div className="text-[11px] text-slate-400">Потери</div>
+              <div className={`font-mono text-sm ${lossClass}`}>Packet Loss: {report.loss_percent.toFixed(1)}%</div>
+              <div className="font-mono text-[11px] text-slate-400">Jitter {report.jitter_ms.toFixed(1)} мс</div>
+            </div>
+          </div>
+        )}
+      </section>
+
+      <section className="overflow-hidden rounded-xl border border-[#222b38] bg-[#111722]">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#222b38] px-4 py-3">
+          <h3 className="text-sm font-semibold text-slate-100">DNS Benchmark</h3>
+          <button
+            type="button"
+            disabled={dnsBusy}
+            onClick={() => {
+              setDnsBusy(true);
+              setDnsError("");
+              void invoke<DnsBenchRow[]>("benchmark_dns")
+                .then(setDnsRows)
+                .catch((err) => setDnsError(String(err)))
+                .finally(() => setDnsBusy(false));
+            }}
+            className="rounded-lg border border-sky-500/30 bg-sky-500/20 px-3 py-1.5 text-xs text-sky-300 hover:bg-sky-500/30 disabled:opacity-50"
+          >
+            {dnsBusy ? "Измерение..." : "Тестировать скорость DNS"}
+          </button>
+        </div>
+        {dnsError && <p className="px-4 py-2 text-xs text-rose-300">{dnsError}</p>}
+        <table className="w-full text-left text-xs">
+          <thead className="text-slate-500">
+            <tr className="border-b border-[#222b38]">
+              <th className="px-4 py-2 font-medium">Сервер</th>
+              <th className="px-4 py-2 font-medium">Адрес</th>
+              <th className="px-4 py-2 font-medium">google.com</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(dnsRows.length > 0 ? dnsRows : [
+              { name: "Cloudflare DNS", server: "1.1.1.1", ms: null },
+              { name: "Google Public DNS", server: "8.8.8.8", ms: null },
+              { name: "Quad9", server: "9.9.9.9", ms: null },
+              { name: "Текущий провайдер", server: "Системный", ms: null },
+            ]).map((row) => (
+              <tr key={row.name} className="border-b border-[#222b38]/50 last:border-0">
+                <td className="px-4 py-2 text-slate-100">
+                  {row.name}
+                  {fastest != null && row.ms === fastest && (
+                    <span className="ml-2 rounded-md border border-emerald-500/20 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] text-emerald-400">
+                      Самый быстрый
+                    </span>
+                  )}
+                </td>
+                <td className="px-4 py-2 font-mono text-slate-400">{row.server}</td>
+                <td className="px-4 py-2 font-mono text-slate-100">{row.ms == null ? "—" : `${row.ms} мс`}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </section>
+    </div>
   );
 }

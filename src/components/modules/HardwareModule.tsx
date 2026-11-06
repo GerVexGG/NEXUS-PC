@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
-import type { HardwareTelemetry } from "../../lib/studio";
+import { Download } from "lucide-react";
+import type { DiagnosticsReport, HardwareTelemetry, TelemetrySnapshot } from "../../lib/studio";
 import type { NexusController } from "../../hooks/useNexusController";
 
 type SensorGroup = "cpu" | "gpu" | "memory" | "disk" | "fan";
@@ -91,6 +92,13 @@ export function HardwareModule({ c }: { c: NexusController }) {
     : sidecarOnline
       ? { label: "Подключение...", dot: "bg-amber-400", chip: "border-amber-500/20 bg-amber-500/10 text-amber-300" }
       : { label: "Служба недоступна", dot: "bg-slate-500", chip: "border-[#222b38] bg-[#151c27] text-slate-400" };
+  const [mode, setMode] = useState<"live" | "history">("live");
+  const [minutes, setMinutes] = useState(60);
+  const [history, setHistory] = useState<TelemetrySnapshot[]>([]);
+  const [report, setReport] = useState<DiagnosticsReport | null>(null);
+  const [thresholds, setThresholds] = useState({ cpu: 85, gpu: 83 });
+  const [exportPath, setExportPath] = useState("");
+  const [exportError, setExportError] = useState("");
   const [filter, setFilter] = useState<SensorFilter>("all");
   const [extremes, setExtremes] = useState<Record<string, { min: number; max: number }>>({});
   const gpu = hwData?.gpus[0];
@@ -114,6 +122,32 @@ export function HardwareModule({ c }: { c: NexusController }) {
     });
   }, [rows]);
 
+  useEffect(() => {
+    if (mode !== "history") return;
+    let alive = true;
+    const pull = () => {
+      void c.loadTelemetryBundle(minutes).then((bundle) => {
+        if (!alive) return;
+        setHistory(bundle.history);
+        setReport(bundle.report);
+        setThresholds({ cpu: bundle.cpuThreshold, gpu: bundle.gpuThreshold });
+      }).catch(() => {
+        if (alive) setReport(null);
+      });
+    };
+    pull();
+    const timer = window.setInterval(pull, 2000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [mode, minutes, c.loadTelemetryBundle]);
+
+  const spikes = useMemo(
+    () => [...history].sort((a, b) => Math.max(b.cpu_usage, b.top_process_cpu) - Math.max(a.cpu_usage, a.top_process_cpu)).slice(0, 5),
+    [history],
+  );
+
   return (
     <motion.div
       key="hardware"
@@ -134,6 +168,45 @@ export function HardwareModule({ c }: { c: NexusController }) {
         </span>
       </div>
 
+      <div className="flex flex-wrap gap-2">
+        {([
+          ["live", "Датчики в реальном времени"],
+          ["history", "История и Диагностика"],
+        ] as const).map(([id, label]) => (
+          <button
+            key={id}
+            type="button"
+            onClick={() => setMode(id)}
+            className={`rounded-full border px-3 py-1 text-xs font-medium ${
+              mode === id
+                ? "border-sky-500/30 bg-sky-500/10 text-sky-300"
+                : "border-[#222b38] bg-[#111722] text-slate-400 hover:text-slate-200"
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {mode === "history" ? (
+        <HistoryPanel
+          minutes={minutes}
+          onMinutes={setMinutes}
+          history={history}
+          report={report}
+          thresholds={thresholds}
+          spikes={spikes}
+          exportPath={exportPath}
+          exportError={exportError}
+          onExport={() => {
+            setExportError("");
+            void c.exportTelemetryCsv()
+              .then((path) => setExportPath(path))
+              .catch((err) => setExportError(String(err)));
+          }}
+        />
+      ) : (
+      <>
       {thermalWarnings.length > 0 && (
         <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
           {thermalWarnings.join(" · ")}
@@ -222,6 +295,209 @@ export function HardwareModule({ c }: { c: NexusController }) {
           </tbody>
         </table>
       </div>
+      </>
+      )}
     </motion.div>
+  );
+}
+
+function clock(timestamp: number): string {
+  return new Date(timestamp * 1000).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function SeriesChart({
+  history,
+  series,
+  ceiling,
+  marks,
+}: {
+  history: TelemetrySnapshot[];
+  series: { key: "cpu_usage" | "gpu_usage" | "ram_used_percent" | "cpu_temp" | "gpu_temp"; color: string; label: string }[];
+  ceiling: number;
+  marks: { value: number; color: string }[];
+}) {
+  const width = 640;
+  const height = 168;
+  const count = Math.max(history.length, 2);
+  const pathFor = (key: (typeof series)[number]["key"]) => {
+    let started = false;
+    return history
+      .map((point, index) => {
+        const raw = point[key];
+        if (raw == null || !Number.isFinite(raw)) return "";
+        const x = (index / (count - 1)) * width;
+        const y = height - (Math.min(ceiling, raw) / ceiling) * (height - 16) - 8;
+        const command = started ? "L" : "M";
+        started = true;
+        return `${command}${x.toFixed(1)},${y.toFixed(1)}`;
+      })
+      .join(" ");
+  };
+  return (
+    <div className="rounded-xl border border-[#222b38] bg-[#111722] p-4">
+      <div className="mb-2 flex flex-wrap gap-3 text-[11px] text-slate-400">
+        {series.map((item) => (
+          <span key={item.key} className="inline-flex items-center gap-1.5">
+            <span className="h-1.5 w-1.5 rounded-full" style={{ background: item.color }} />
+            {item.label}
+          </span>
+        ))}
+      </div>
+      <svg viewBox={`0 0 ${width} ${height}`} className="h-40 w-full">
+        {marks.map((mark) => {
+          const y = height - (Math.min(ceiling, mark.value) / ceiling) * (height - 16) - 8;
+          return (
+            <line
+              key={mark.value}
+              x1="0"
+              x2={width}
+              y1={y}
+              y2={y}
+              stroke={mark.color}
+              strokeDasharray="4 4"
+              strokeWidth="1"
+            />
+          );
+        })}
+        {series.map((item) => (
+          <path key={item.key} d={pathFor(item.key)} fill="none" stroke={item.color} strokeWidth="1.6" />
+        ))}
+      </svg>
+      <div className="mt-1 flex justify-between font-mono text-[10px] text-slate-500">
+        <span>{history[0] ? clock(history[0].timestamp) : "—"}</span>
+        <span>{history.length > 0 ? clock(history[history.length - 1].timestamp) : "—"}</span>
+      </div>
+    </div>
+  );
+}
+
+function HistoryPanel({
+  minutes,
+  onMinutes,
+  history,
+  report,
+  thresholds,
+  spikes,
+  exportPath,
+  exportError,
+  onExport,
+}: {
+  minutes: number;
+  onMinutes: (value: number) => void;
+  history: TelemetrySnapshot[];
+  report: DiagnosticsReport | null;
+  thresholds: { cpu: number; gpu: number };
+  spikes: TelemetrySnapshot[];
+  exportPath: string;
+  exportError: string;
+  onExport: () => void;
+}) {
+  const badge = report?.stability === "Критично"
+    ? "border-rose-500/30 bg-rose-500/10 text-rose-300"
+    : report?.stability === "Отлично"
+      ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-400"
+      : "border-amber-500/20 bg-amber-500/10 text-amber-300";
+  const tempCeiling = Math.max(100, thresholds.cpu, thresholds.gpu, ...history.flatMap((point) => [point.cpu_temp ?? 0, point.gpu_temp ?? 0]));
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap gap-2">
+          {[15, 30, 60].map((value) => (
+            <button
+              key={value}
+              type="button"
+              onClick={() => onMinutes(value)}
+              className={`rounded-full border px-3 py-1 text-xs ${
+                minutes === value ? "border-sky-500/30 bg-sky-500/10 text-sky-300" : "border-[#222b38] bg-[#111722] text-slate-400"
+              }`}
+            >
+              {value} минут
+            </button>
+          ))}
+        </div>
+        <button
+          type="button"
+          onClick={onExport}
+          className="inline-flex items-center gap-1.5 rounded-lg border border-sky-500/30 bg-sky-500/20 px-3 py-1.5 text-xs text-sky-300 hover:bg-sky-500/30"
+        >
+          <Download size={13} />
+          Экспорт в CSV
+        </button>
+      </div>
+      {exportPath && <p className="font-mono text-[11px] text-emerald-400">Сохранено: {exportPath}</p>}
+      {exportError && <p className="text-xs text-rose-300">{exportError}</p>}
+
+      <section className="rounded-xl border border-[#222b38] bg-[#111722] p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 className="text-sm font-semibold text-slate-100">Диагностика узких мест (Bottleneck & Throttling)</h3>
+          <span className={`rounded-full border px-2.5 py-1 text-[11px] ${badge}`}>{report?.status ?? "Сбор данных"}</span>
+        </div>
+        <p className="mt-3 text-sm text-slate-300">{report?.verdict ?? "Ожидание первых точек истории."}</p>
+        {report && report.incidents.length > 0 && (
+          <ul className="mt-3 space-y-1 text-xs text-slate-400">
+            {report.incidents.map((item) => (
+              <li key={item.message}>{item.message}</li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <div className="grid gap-4 xl:grid-cols-2">
+        <div>
+          <div className="mb-2 text-xs text-slate-400">Загрузка CPU, GPU и RAM</div>
+          <SeriesChart
+            history={history}
+            ceiling={100}
+            marks={[]}
+            series={[
+              { key: "cpu_usage", color: "#38bdf8", label: "CPU" },
+              { key: "gpu_usage", color: "#22d3ee", label: "GPU" },
+              { key: "ram_used_percent", color: "#34d399", label: "RAM" },
+            ]}
+          />
+        </div>
+        <div>
+          <div className="mb-2 text-xs text-slate-400">Температуры</div>
+          <SeriesChart
+            history={history}
+            ceiling={tempCeiling}
+            marks={[
+              { value: thresholds.cpu, color: "#f59e0b" },
+              { value: thresholds.gpu, color: "#fb7185" },
+            ]}
+            series={[
+              { key: "cpu_temp", color: "#f59e0b", label: "CPU" },
+              { key: "gpu_temp", color: "#fb7185", label: "GPU" },
+            ]}
+          />
+        </div>
+      </div>
+
+      <section className="overflow-hidden rounded-xl border border-[#222b38] bg-[#111722]">
+        <div className="border-b border-[#222b38] px-4 py-3 text-sm font-semibold text-slate-100">Хроника спайков</div>
+        {spikes.length === 0 ? (
+          <p className="px-4 py-6 text-sm text-slate-400">Пиковых точек пока нет</p>
+        ) : (
+          <table className="w-full text-left text-xs">
+            <thead className="text-slate-500">
+              <tr className="border-b border-[#222b38]">
+                <th className="px-4 py-2 font-medium">Время</th>
+                <th className="px-4 py-2 font-medium">Пик</th>
+                <th className="px-4 py-2 font-medium">Процесс</th>
+              </tr>
+            </thead>
+            <tbody>
+              {spikes.map((point) => (
+                <tr key={point.timestamp} className="border-b border-[#222b38]/50 last:border-0">
+                  <td className="px-4 py-2 font-mono text-slate-300">{clock(point.timestamp)}</td>
+                  <td className="px-4 py-2 font-mono text-slate-100">{Math.max(point.cpu_usage, point.top_process_cpu).toFixed(0)}%</td>
+                  <td className="px-4 py-2 text-slate-200">{point.top_process_name || "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </section>
+    </div>
   );
 }

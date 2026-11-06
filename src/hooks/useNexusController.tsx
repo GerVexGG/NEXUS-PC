@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, type MouseEvent } from "react";
+import { useState, useEffect, useRef, useCallback, type MouseEvent } from "react";
 import {
   ChevronDown,
   ChevronUp,
@@ -19,7 +19,9 @@ import {
   ProcessSortKey,
   ScanResult,
   StartupItem,
+  DiagnosticsReport,
   StoredTimerState,
+  TelemetrySnapshot,
   TIMER_STORAGE_KEY,
   computeTreemapRects,
   copyTextToClipboard,
@@ -853,6 +855,17 @@ export function useNexusController() {
     );
   };
 
+  const loadTelemetryBundle = useCallback(async (minutes: number) => {
+    const [history, report, settings] = await Promise.all([
+      invoke<TelemetrySnapshot[]>("get_telemetry_history", { minutes }),
+      invoke<DiagnosticsReport>("get_diagnostics_verdict", { minutes }),
+      invoke<{ alert_cpu_temp: number; alert_gpu_temp: number }>("get_settings"),
+    ]);
+    return { history, report, cpuThreshold: settings.alert_cpu_temp, gpuThreshold: settings.alert_gpu_temp };
+  }, []);
+
+  const exportTelemetryCsv = useCallback(() => invoke<string>("export_telemetry_csv"), []);
+
   return {
     activeTab,
     setActiveTab,
@@ -1000,6 +1013,8 @@ export function useNexusController() {
     totalProcessMemoryGb,
     menuProcessSuspended,
     renderSortHeader,
+    loadTelemetryBundle,
+    exportTelemetryCsv,
   };
 }
 

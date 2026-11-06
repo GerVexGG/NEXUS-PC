@@ -301,7 +301,7 @@ export function SettingsModule() {
       <section className="rounded-xl border border-[#222b38] bg-[#111722] px-4 py-3">
         <h3 className="text-sm font-semibold text-slate-100">О программе</h3>
         <div className="mt-2 flex flex-wrap gap-x-6 gap-y-1 font-mono text-xs text-slate-400">
-          <span>v0.2.0-dev</span>
+          <span>v0.2.0</span>
           <span>x64</span>
           <span>Tauri 2 / Rust</span>
         </div>

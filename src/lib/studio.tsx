@@ -119,6 +119,29 @@ export interface HardwareTelemetry {
   storage_temps: StorageTempItem[];
 }
 
+export interface TelemetrySnapshot {
+  timestamp: number;
+  cpu_usage: number;
+  cpu_temp: number | null;
+  gpu_usage: number;
+  gpu_temp: number | null;
+  ram_used_percent: number;
+  top_process_name: string;
+  top_process_cpu: number;
+}
+
+export interface DiagnosticsIncident {
+  level: string;
+  message: string;
+}
+
+export interface DiagnosticsReport {
+  status: string;
+  stability: string;
+  incidents: DiagnosticsIncident[];
+  verdict: string;
+}
+
 export interface CleanupCategory {
   id: string;
   name: string;

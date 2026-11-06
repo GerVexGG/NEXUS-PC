@@ -94,6 +94,9 @@ public sealed class GpuTelemetryDto
 
     [JsonPropertyName("voltage_v")]
     public float? VoltageV { get; set; }
+
+    [JsonPropertyName("load_percent")]
+    public float? LoadPercent { get; set; }
 }
 
 public sealed class FanSensorDto
@@ -427,6 +430,13 @@ internal static class Program
                             if (sLower.Contains("package") || sLower.Contains("total") || sLower.Contains("gpu") || !gpu.PowerWatts.HasValue)
                             {
                                 gpu.PowerWatts = s.Value!.Value;
+                            }
+                        }
+                        else if (s.SensorType == SensorType.Load && IsValidPositive(s.Value))
+                        {
+                            if (sLower.Contains("core") || sLower.Contains("gpu") || sLower == "3d" || !gpu.LoadPercent.HasValue)
+                            {
+                                gpu.LoadPercent = s.Value!.Value;
                             }
                         }
                         else if (s.SensorType == SensorType.Voltage && IsValidPositive(s.Value))

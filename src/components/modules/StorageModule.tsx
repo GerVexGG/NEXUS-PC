@@ -1,4 +1,5 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { motion } from "framer-motion";
 import {
   ChevronRight,
@@ -12,6 +13,16 @@ import {
 } from "lucide-react";
 import { TREEMAP_PALETTE, formatBytes } from "../../lib/studio";
 import type { NexusController } from "../../hooks/useNexusController";
+
+interface DiskHealthInfo {
+  model: string;
+  kind: string;
+  health_percent: number | null;
+  health_label: string;
+  power_on_hours: number | null;
+  temp_c: number | null;
+  tbw_tb: number | null;
+}
 
 function driveLabel(drive: string): string {
   const letter = drive.replace(/[\\/]/g, "").toUpperCase();
@@ -85,6 +96,8 @@ export function StorageModule({ c }: { c: NexusController }) {
   } = c;
 
   const [heavyMode, setHeavyMode] = useState<"groups" | "files">("groups");
+  const [diskHealth, setDiskHealth] = useState<DiskHealthInfo[]>([]);
+  const [diskHealthError, setDiskHealthError] = useState("");
   const heavyGroups = useMemo(() => {
     const query = fileSearch.trim().toLowerCase();
     return (scanResult?.root_node.children ?? [])
@@ -100,6 +113,15 @@ export function StorageModule({ c }: { c: NexusController }) {
       .filter((group) => !query || group.title.toLowerCase().includes(query) || group.folder.toLowerCase().includes(query))
       .sort((a, b) => b.size - a.size);
   }, [scanResult, fileSearch]);
+  useEffect(() => {
+    void invoke<DiskHealthInfo[]>("get_disk_health_info")
+      .then((rows) => {
+        setDiskHealth(rows);
+        setDiskHealthError("");
+      })
+      .catch((err) => setDiskHealthError(String(err)));
+  }, []);
+
   const selectedLetter = selectedDriveOrPath.trim().slice(0, 2).toUpperCase();
   const showsSystemVolume = selectedLetter.startsWith("C") || selectedDriveOrPath.trim() === "";
   const freeGb = showsSystemVolume ? metrics.disk_free_gb : null;
@@ -178,6 +200,46 @@ export function StorageModule({ c }: { c: NexusController }) {
           </div>
         )}
       </div>
+
+      <section className="rounded-xl border border-[#222b38] bg-[#111722] p-4">
+        <h3 className="text-sm font-semibold text-slate-100">Физическое состояние накопителей</h3>
+        {diskHealthError && <p className="mt-2 text-xs text-rose-300">{diskHealthError}</p>}
+        {diskHealth.length === 0 && !diskHealthError ? (
+          <p className="mt-3 text-sm text-slate-400">Сведения S.M.A.R.T. ещё не получены</p>
+        ) : (
+          <div className="mt-3 grid gap-3 lg:grid-cols-2">
+            {diskHealth.map((disk) => {
+              const percent = disk.health_percent ?? 0;
+              const tone = percent >= 90 ? "bg-emerald-400" : percent >= 70 ? "bg-cyan-400" : percent >= 40 ? "bg-amber-400" : "bg-rose-400";
+              return (
+                <div key={disk.model + disk.kind} className="rounded-lg border border-[#222b38] bg-[#151c27] p-3">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0 truncate text-sm font-medium text-slate-100">{disk.model}</div>
+                    <span className="shrink-0 rounded-md border border-cyan-500/20 bg-cyan-500/10 px-1.5 py-0.5 text-[11px] text-cyan-300">
+                      {disk.kind}
+                    </span>
+                  </div>
+                  <div className="mt-2 text-xs text-slate-300">
+                    Здоровье:{" "}
+                    <span className="font-mono text-slate-100">
+                      {disk.health_percent == null ? "—" : `${disk.health_percent}%`}
+                    </span>{" "}
+                    ({disk.health_label})
+                  </div>
+                  <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-[#0e1118]">
+                    <div className={`h-full ${tone}`} style={{ width: `${disk.health_percent ?? 0}%` }} />
+                  </div>
+                  <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px] text-slate-400">
+                    <span>Наработка {disk.power_on_hours == null ? "—" : `${disk.power_on_hours} ч`}</span>
+                    <span>Температура {disk.temp_c == null ? "—" : `${disk.temp_c} °C`}</span>
+                    <span>Запись {disk.tbw_tb == null ? "—" : `${disk.tbw_tb.toFixed(2)} ТБ`}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
 
       {!scanResult && !isScanning && (
         <div className="flex flex-col items-center rounded-xl border border-[#222b38] bg-[#111722] px-6 py-16 text-center">

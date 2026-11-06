@@ -6,12 +6,14 @@ use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use sysinfo::{Disks, Networks, System};
 mod drop_server;
 mod settings;
+mod telemetry;
 
 use tauri::{Manager, State};
 
@@ -117,6 +119,8 @@ pub struct GpuTelemetry {
     pub fan_percent: Option<f32>,
     pub power_watts: Option<f32>,
     pub voltage_v: Option<f32>,
+    #[serde(default)]
+    pub load_percent: Option<f32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -219,6 +223,7 @@ pub struct AppState {
     pub icon_cache: Mutex<HashMap<String, String>>,
     pub drop_hub: Arc<drop_server::DropHub>,
     pub tray_ping_item: Mutex<Option<tauri::menu::MenuItem<tauri::Wry>>>,
+    pub history_buffer: Arc<RwLock<VecDeque<telemetry::TelemetrySnapshot>>>,
 }
 
 impl Drop for AppState {
@@ -2521,6 +2526,280 @@ fn probe_game_routes() -> Vec<RouteProbe> {
     })
 }
 
+#[derive(Serialize, Clone)]
+struct DiskHealthInfo {
+    model: String,
+    kind: String,
+    health_percent: Option<u32>,
+    health_label: String,
+    power_on_hours: Option<u64>,
+    temp_c: Option<u32>,
+    tbw_tb: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct RawDiskHealth {
+    model: Option<String>,
+    media: Option<String>,
+    bus: Option<String>,
+    health: Option<String>,
+    temp_c: Option<f64>,
+    power_on_hours: Option<f64>,
+    wear: Option<f64>,
+    bytes_written: Option<f64>,
+}
+
+fn disk_kind(media: &str, bus: &str) -> String {
+    let media = media.to_ascii_lowercase();
+    let bus = bus.to_ascii_lowercase();
+    if bus.contains("nvme") {
+        "NVMe M.2".to_string()
+    } else if media.contains("hdd") || media == "3" {
+        "HDD".to_string()
+    } else if media.contains("ssd") || media == "4" || bus.contains("sata") {
+        "SATA SSD".to_string()
+    } else if media.is_empty() && bus.is_empty() {
+        "Накопитель".to_string()
+    } else {
+        format!("{media} {bus}").trim().to_string()
+    }
+}
+
+fn health_label(percent: Option<u32>, status: &str) -> String {
+    if let Some(value) = percent {
+        if value >= 90 {
+            return "Отличное".to_string();
+        }
+        if value >= 70 {
+            return "Хорошее".to_string();
+        }
+        if value >= 40 {
+            return "Износ".to_string();
+        }
+        return "Критично".to_string();
+    }
+    match status.to_ascii_lowercase().as_str() {
+        "healthy" => "Отличное".to_string(),
+        "warning" => "Внимание".to_string(),
+        "unhealthy" => "Критично".to_string(),
+        _ => "Нет данных".to_string(),
+    }
+}
+
+#[tauri::command]
+fn get_disk_health_info() -> Result<Vec<DiskHealthInfo>, String> {
+    let script = r#"
+$ErrorActionPreference='SilentlyContinue'
+$rows = New-Object System.Collections.Generic.List[object]
+Get-PhysicalDisk | ForEach-Object {
+  $rel = $_ | Get-StorageReliabilityCounter
+  $written = $null
+  if ($null -ne $rel) {
+    foreach ($name in @('WriteBytesTotal','HostBytesWritten','NandBytesWritten')) {
+      $prop = $rel.PSObject.Properties[$name]
+      if ($null -ne $prop -and $null -ne $prop.Value) {
+        $number = 0.0
+        if ([double]::TryParse([string]$prop.Value, [ref]$number) -and $number -gt 0) { $written = $number; break }
+      }
+    }
+  }
+  $rows.Add([pscustomobject]@{
+    model = [string]$_.FriendlyName
+    media = [string]$_.MediaType
+    bus = [string]$_.BusType
+    health = [string]$_.HealthStatus
+    temp_c = if ($null -ne $rel) { $rel.Temperature } else { $null }
+    power_on_hours = if ($null -ne $rel) { $rel.PowerOnHours } else { $null }
+    wear = if ($null -ne $rel) { $rel.Wear } else { $null }
+    bytes_written = $written
+  }) | Out-Null
+}
+ConvertTo-Json -InputObject @($rows.ToArray()) -Compress
+"#;
+    let mut cmd = Command::new("powershell.exe");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let output = cmd.output().map_err(|err| format!("Не удалось опросить накопители: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(if stderr.trim().is_empty() {
+            "Windows не вернула сведения S.M.A.R.T.".to_string()
+        } else {
+            stderr.trim().to_string()
+        });
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<RawDiskHealth> = serde_json::from_str(trimmed).or_else(|_| {
+        serde_json::from_str::<RawDiskHealth>(trimmed).map(|row| vec![row])
+    }).map_err(|err| format!("Не удалось разобрать ответ накопителей: {err}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let status = row.health.unwrap_or_default();
+            let health_percent = row.wear.filter(|value| *value >= 0.0).map(|value| (100.0 - value.clamp(0.0, 100.0)).round() as u32).or_else(|| match status.to_ascii_lowercase().as_str() {
+                "healthy" => Some(100),
+                "warning" => Some(60),
+                "unhealthy" => Some(20),
+                _ => None,
+            });
+            let temp = row.temp_c.filter(|value| *value > 0.0 && *value < 120.0).map(|value| value.round() as u32);
+            DiskHealthInfo {
+                model: row.model.unwrap_or_else(|| "Накопитель".to_string()),
+                kind: disk_kind(row.media.as_deref().unwrap_or(""), row.bus.as_deref().unwrap_or("")),
+                health_label: health_label(health_percent, &status),
+                health_percent,
+                power_on_hours: row.power_on_hours.filter(|value| *value >= 0.0).map(|value| value.round() as u64),
+                temp_c: temp,
+                tbw_tb: row.bytes_written.filter(|value| *value > 0.0).map(|value| value / 1_000_000_000_000.0),
+            }
+        })
+        .collect())
+}
+
+#[derive(Serialize, Clone)]
+struct StabilityReport {
+    sent: u32,
+    received: u32,
+    loss_percent: f32,
+    min_ms: u32,
+    avg_ms: f32,
+    max_ms: u32,
+    jitter_ms: f32,
+}
+
+static STABILITY_DONE: AtomicU32 = AtomicU32::new(0);
+
+fn allowed_probe_host(host: &str) -> bool {
+    matches!(host, "162.159.135.234" | "1.0.0.1" | "1.1.1.1")
+}
+
+fn parse_ping_ms(stdout: &[u8]) -> Option<u32> {
+    let lower: Vec<u8> = stdout.iter().map(|byte| byte.to_ascii_lowercase()).collect();
+    let ttl = lower.windows(4).position(|window| window == b"ttl=")?;
+    if let Some(pos) = lower.windows(5).position(|window| window == b"time=") {
+        return Some(read_leading_u32(&lower[pos + 5..]).unwrap_or(1));
+    }
+    if lower.windows(5).any(|window| window == b"time<") {
+        return Some(1);
+    }
+    let head = &lower[..ttl];
+    let eq = head.iter().rposition(|byte| *byte == b'=')?;
+    read_leading_u32(&head[eq + 1..])
+}
+
+fn read_leading_u32(bytes: &[u8]) -> Option<u32> {
+    let digits: String = bytes.iter().copied().take_while(|byte| byte.is_ascii_digit()).map(char::from).collect();
+    if digits.is_empty() { None } else { digits.parse().ok() }
+}
+
+fn ping_once(host: &str) -> Option<u32> {
+    let mut cmd = Command::new("ping");
+    cmd.args(["-4", "-n", "1", "-w", "1000", host]);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let output = cmd.output().ok()?;
+    parse_ping_ms(&output.stdout)
+}
+
+#[tauri::command]
+fn get_stability_progress() -> u32 {
+    STABILITY_DONE.load(Ordering::Relaxed)
+}
+
+#[tauri::command]
+fn run_stability_probe(host: String) -> Result<StabilityReport, String> {
+    if !allowed_probe_host(&host) {
+        return Err("Неизвестный узел диагностики".to_string());
+    }
+    STABILITY_DONE.store(0, Ordering::Relaxed);
+    let mut samples = Vec::new();
+    let sent = 30u32;
+    for index in 1..=sent {
+        if let Some(ms) = ping_once(&host) {
+            samples.push(ms);
+        }
+        STABILITY_DONE.store(index, Ordering::Relaxed);
+    }
+    let received = samples.len() as u32;
+    let loss_percent = ((sent - received) as f32 / sent as f32) * 100.0;
+    if samples.is_empty() {
+        return Ok(StabilityReport {
+            sent,
+            received: 0,
+            loss_percent,
+            min_ms: 0,
+            avg_ms: 0.0,
+            max_ms: 0,
+            jitter_ms: 0.0,
+        });
+    }
+    let min_ms = *samples.iter().min().unwrap_or(&0);
+    let max_ms = *samples.iter().max().unwrap_or(&0);
+    let avg_ms = samples.iter().map(|value| *value as f32).sum::<f32>() / received as f32;
+    let variance = samples.iter().map(|value| {
+        let delta = *value as f32 - avg_ms;
+        delta * delta
+    }).sum::<f32>() / received as f32;
+    Ok(StabilityReport {
+        sent,
+        received,
+        loss_percent,
+        min_ms,
+        avg_ms,
+        max_ms,
+        jitter_ms: variance.sqrt(),
+    })
+}
+
+#[derive(Serialize, Clone)]
+struct DnsBenchRow {
+    name: String,
+    server: String,
+    ms: Option<u32>,
+}
+
+fn time_dns(server: Option<&str>) -> Option<u32> {
+    let mut cmd = Command::new("nslookup");
+    cmd.arg("-timeout=2").arg("google.com");
+    if let Some(server) = server {
+        cmd.arg(server);
+    }
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let started = Instant::now();
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    if text.contains("timed out") || text.contains("превышен") || !text.contains("google.com") {
+        return None;
+    }
+    Some(started.elapsed().as_millis().max(1) as u32)
+}
+
+#[tauri::command]
+fn benchmark_dns() -> Vec<DnsBenchRow> {
+    [
+        ("Cloudflare DNS", Some("1.1.1.1")),
+        ("Google Public DNS", Some("8.8.8.8")),
+        ("Quad9", Some("9.9.9.9")),
+        ("Текущий провайдер", None),
+    ]
+    .into_iter()
+    .map(|(name, server)| DnsBenchRow {
+        name: name.to_string(),
+        server: server.unwrap_or("Системный").to_string(),
+        ms: time_dns(server),
+    })
+    .collect()
+}
+
 #[cfg(target_os = "windows")]
 fn media_profile_key(writable: bool) -> Result<RegKey, String> {
     let flags = if writable {
@@ -3867,6 +4146,21 @@ fn clear_event_log() -> Result<(), String> {
 }
 
 #[tauri::command]
+fn get_telemetry_history(state: State<'_, AppState>, minutes: u32) -> Vec<telemetry::TelemetrySnapshot> {
+    telemetry::history_since(&state.history_buffer, minutes)
+}
+
+#[tauri::command]
+fn get_diagnostics_verdict(state: State<'_, AppState>, minutes: u32) -> telemetry::DiagnosticsReport {
+    telemetry::diagnose(&state.history_buffer, minutes)
+}
+
+#[tauri::command]
+fn export_telemetry_csv(state: State<'_, AppState>) -> Result<String, String> {
+    telemetry::export_csv(&state.history_buffer)
+}
+
+#[tauri::command]
 fn get_network_connections(state: State<'_, AppState>) -> Result<Vec<NetworkConnection>, String> {
     let sockets = collect_socket_rows()?;
 
@@ -3995,6 +4289,12 @@ pub fn run() {
     let disk_space = Arc::new(Mutex::new((0u64, 0u64)));
     let hw_telemetry = Arc::new(Mutex::new(None));
     let hw_sidecar_child = Arc::new(Mutex::new(None));
+    let history_buffer = Arc::new(RwLock::new(VecDeque::new()));
+    telemetry::start_sampler(
+        Arc::clone(&sys),
+        Arc::clone(&hw_telemetry),
+        Arc::clone(&history_buffer),
+    );
 
     start_background_services(
         Arc::clone(&sys),
@@ -4018,6 +4318,7 @@ pub fn run() {
             icon_cache: Mutex::new(HashMap::new()),
             drop_hub: Arc::new(drop_server::DropHub::new()),
             tray_ping_item: Mutex::new(None),
+            history_buffer,
         })
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
@@ -4130,7 +4431,14 @@ pub fn run() {
             get_settings,
             save_settings,
             get_event_log,
-            clear_event_log
+            clear_event_log,
+            get_telemetry_history,
+            get_diagnostics_verdict,
+            export_telemetry_csv,
+            get_disk_health_info,
+            get_stability_progress,
+            run_stability_probe,
+            benchmark_dns
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
