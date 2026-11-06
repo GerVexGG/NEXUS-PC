@@ -6,7 +6,7 @@ use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Serialize, Clone, Debug)]
 pub struct DropSessionInfo {
@@ -223,24 +223,30 @@ fn serve(listener: TcpListener, generation: u64, hub: HubHandle) {
     }
 }
 
+const BODY_CHUNK: usize = 128 * 1024;
+const READ_WAIT: Duration = Duration::from_secs(60);
+const MAX_UPLOAD: u64 = 200_000_000;
+
 fn handle_client(mut stream: TcpStream, generation: u64, hub: &HubHandle) -> Result<(), ()> {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(45)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(45)));
-    let (headers, body) = read_request(&mut stream).map_err(|_| ())?;
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(READ_WAIT));
+    let _ = stream.set_write_timeout(Some(READ_WAIT));
+
+    let (headers, pending) = match read_headers(&mut stream) {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
     let request_line = headers.lines().next().unwrap_or("");
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("/");
     let token = query_param(target, "token").unwrap_or_default();
     let path = target.split('?').next().unwrap_or("/");
-
-    if unsafe { &*hub.shutdown_gen }.load(Ordering::SeqCst) != generation {
-        let _ = respond(&mut stream, 403, "text/plain; charset=utf-8", b"stopped");
-        return Ok(());
-    }
+    let stopped = unsafe { &*hub.shutdown_gen }.load(Ordering::SeqCst) != generation;
 
     if method == "GET" && (path == "/" || path.is_empty()) {
-        if !session_token_ok(hub, &token) {
+        if stopped || !session_token_ok(hub, &token) {
             let _ = respond(&mut stream, 403, "text/plain; charset=utf-8", "Неверный или пустой токен сессии".as_bytes());
             return Ok(());
         }
@@ -249,15 +255,14 @@ fn handle_client(mut stream: TcpStream, generation: u64, hub: &HubHandle) -> Res
     }
 
     if method == "POST" && path == "/upload" {
-        if !session_token_ok(hub, &token) {
-            let _ = respond(&mut stream, 403, "text/plain; charset=utf-8", b"forbidden");
-            return Ok(());
-        }
-        match store_upload(hub, &headers, &body) {
-            Ok(()) => {
+        match receive_upload(&mut stream, hub, &headers, pending, &token, stopped) {
+            UploadOutcome::Ok => {
                 let _ = respond(&mut stream, 200, "text/plain; charset=utf-8", b"ok");
             }
-            Err(err) => {
+            UploadOutcome::Forbidden => {
+                let _ = respond(&mut stream, 403, "text/plain; charset=utf-8", b"forbidden");
+            }
+            UploadOutcome::Failed(err) => {
                 let _ = respond(&mut stream, 400, "text/plain; charset=utf-8", err.as_bytes());
             }
         }
@@ -265,37 +270,115 @@ fn handle_client(mut stream: TcpStream, generation: u64, hub: &HubHandle) -> Res
     }
 
     if method == "POST" && path == "/send_text" {
-        if !session_token_ok(hub, &token) {
-            let _ = respond(&mut stream, 403, "text/plain; charset=utf-8", b"forbidden");
-            return Ok(());
+        match receive_text(&mut stream, hub, &headers, pending, &token, stopped) {
+            UploadOutcome::Ok => {
+                let _ = respond(&mut stream, 200, "text/plain; charset=utf-8", b"ok");
+            }
+            UploadOutcome::Forbidden => {
+                let _ = respond(&mut stream, 403, "text/plain; charset=utf-8", b"forbidden");
+            }
+            UploadOutcome::Failed(err) => {
+                let _ = respond(&mut stream, 400, "text/plain; charset=utf-8", err.as_bytes());
+            }
         }
-        let text = String::from_utf8_lossy(&body).trim().to_string();
-        if text.is_empty() {
-            let _ = respond(&mut stream, 400, "text/plain; charset=utf-8", b"empty");
-            return Ok(());
-        }
-        let clipped = if text.chars().count() > 8000 {
-            text.chars().take(8000).collect()
-        } else {
-            text
-        };
-        let _ = copy_to_clipboard(&clipped);
-        let _ = append_text_log(hub, &clipped);
-        let item = DropTextItem {
-            id: next_seq(hub, "text"),
-            body: clipped,
-            received_at: local_now(),
-        };
-        if let Ok(mut guard) = unsafe { &*hub.files }.lock() {
-            guard.texts.insert(0, item);
-            guard.texts.truncate(40);
-        }
-        let _ = respond(&mut stream, 200, "text/plain; charset=utf-8", b"ok");
         return Ok(());
     }
 
     let _ = respond(&mut stream, 404, "text/plain; charset=utf-8", b"not found");
     Ok(())
+}
+
+enum UploadOutcome {
+    Ok,
+    Forbidden,
+    Failed(String),
+}
+
+fn receive_upload(
+    stream: &mut TcpStream,
+    hub: &HubHandle,
+    headers: &str,
+    pending: Vec<u8>,
+    token: &str,
+    stopped: bool,
+) -> UploadOutcome {
+    let Some(length) = content_length(headers) else {
+        return UploadOutcome::Failed("Нет заголовка Content-Length".to_string());
+    };
+    if length > MAX_UPLOAD {
+        let mut reader = BodyReader::new(stream, pending, MAX_UPLOAD);
+        let _ = reader.discard_rest();
+        return UploadOutcome::Failed("Файл больше 200 МБ".to_string());
+    }
+    let mut reader = BodyReader::new(stream, pending, length);
+    if stopped || !session_token_ok(hub, token) {
+        let _ = reader.discard_rest();
+        return UploadOutcome::Forbidden;
+    }
+    let save_dir = hub_save_dir(hub);
+    if let Err(err) = fs::create_dir_all(&save_dir) {
+        let _ = reader.discard_rest();
+        return UploadOutcome::Failed(format!("Папка недоступна: {err}"));
+    }
+    let saved = if let Some(boundary) = content_boundary(headers) {
+        save_multipart(hub, &mut reader, &save_dir, &boundary)
+    } else {
+        save_raw(hub, &mut reader, &save_dir)
+    };
+    let drained = reader.discard_rest();
+    match saved.and(drained) {
+        Ok(()) => UploadOutcome::Ok,
+        Err(err) => UploadOutcome::Failed(err),
+    }
+}
+
+fn receive_text(
+    stream: &mut TcpStream,
+    hub: &HubHandle,
+    headers: &str,
+    pending: Vec<u8>,
+    token: &str,
+    stopped: bool,
+) -> UploadOutcome {
+    let Some(length) = content_length(headers) else {
+        return UploadOutcome::Failed("Нет заголовка Content-Length".to_string());
+    };
+    if length > 1_000_000 {
+        let mut reader = BodyReader::new(stream, pending, 1_000_000);
+        let _ = reader.discard_rest();
+        return UploadOutcome::Failed("Слишком длинный текст".to_string());
+    }
+    let mut reader = BodyReader::new(stream, pending, length);
+    if stopped || !session_token_ok(hub, token) {
+        let _ = reader.discard_rest();
+        return UploadOutcome::Forbidden;
+    }
+    if let Err(err) = reader.pull_all() {
+        return UploadOutcome::Failed(err);
+    }
+    let text = String::from_utf8_lossy(&reader.pending).trim().to_string();
+    if text.is_empty() {
+        return UploadOutcome::Failed("Пустой текст".to_string());
+    }
+    let clipped = if text.chars().count() > 8000 {
+        text.chars().take(8000).collect()
+    } else {
+        text
+    };
+    let _ = copy_to_clipboard(&clipped);
+    let _ = append_text_log(hub, &clipped);
+    if let Ok(mut guard) = unsafe { &*hub.files }.lock() {
+        guard.texts.insert(
+            0,
+            DropTextItem {
+                id: next_seq(hub, "text"),
+                body: clipped,
+                received_at: local_now(),
+            },
+        );
+        guard.texts.truncate(40);
+    }
+    UploadOutcome::Ok
 }
 
 fn session_token_ok(hub: &HubHandle, token: &str) -> bool {
@@ -308,62 +391,290 @@ fn session_token_ok(hub: &HubHandle, token: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn store_upload(hub: &HubHandle, headers: &str, body: &[u8]) -> Result<(), String> {
-    let save_dir = unsafe { &*hub.files }
+fn hub_save_dir(hub: &HubHandle) -> PathBuf {
+    unsafe { &*hub.files }
         .lock()
         .map(|guard| PathBuf::from(&guard.info.save_dir))
-        .unwrap_or_else(|_| default_save_dir());
-    fs::create_dir_all(&save_dir).map_err(|err| format!("Папка недоступна: {err}"))?;
+        .unwrap_or_else(|_| default_save_dir())
+}
 
-    let files = if let Some(boundary) = content_boundary(headers) {
-        multipart_files(body, &boundary)
-    } else if !body.is_empty() {
-        vec![("upload.bin".to_string(), body.to_vec())]
-    } else {
-        Vec::new()
-    };
-    if files.is_empty() {
-        return Err("Файл не найден в запросе".to_string());
-    }
+struct BodyReader<'a> {
+    stream: &'a mut TcpStream,
+    pending: Vec<u8>,
+    remaining: u64,
+}
 
-    for (raw_name, bytes) in files {
-        let filename = sanitize_filename(&raw_name);
-        let path = unique_path(&save_dir, &filename);
-        let id = next_seq(hub, "file");
-        let stamp = local_now();
-        match fs::write(&path, &bytes) {
-            Ok(()) => {
-                push_file(
-                    hub,
-                    DroppedFileItem {
-                        id,
-                        filename: path
-                            .file_name()
-                            .map(|name| name.to_string_lossy().to_string())
-                            .unwrap_or(filename),
-                        size_bytes: bytes.len() as u64,
-                        received_at: stamp,
-                        status: "SUCCESS".to_string(),
-                        path: path.display().to_string(),
-                    },
-                );
-            }
-            Err(err) => {
-                push_file(
-                    hub,
-                    DroppedFileItem {
-                        id,
-                        filename,
-                        size_bytes: bytes.len() as u64,
-                        received_at: stamp,
-                        status: format!("ERROR: {err}"),
-                        path: String::new(),
-                    },
-                );
-                return Err(format!("Не удалось сохранить файл: {err}"));
-            }
+impl<'a> BodyReader<'a> {
+    fn new(stream: &'a mut TcpStream, pending: Vec<u8>, length: u64) -> Self {
+        let take = (pending.len() as u64).min(length) as usize;
+        Self {
+            stream,
+            pending: pending[..take].to_vec(),
+            remaining: length - take as u64,
         }
     }
+
+    fn pull(&mut self) -> Result<(), String> {
+        if self.remaining == 0 {
+            return Err("Тело запроса обрезано".to_string());
+        }
+        let want = BODY_CHUNK.min(self.remaining as usize);
+        let mut buf = vec![0u8; want];
+        let read = read_chunk(self.stream, &mut buf)?;
+        if read == 0 {
+            return Err("Соединение закрыто до конца файла".to_string());
+        }
+        self.pending.extend_from_slice(&buf[..read]);
+        self.remaining -= read as u64;
+        Ok(())
+    }
+
+    fn pull_all(&mut self) -> Result<(), String> {
+        while self.remaining > 0 {
+            self.pull()?;
+        }
+        Ok(())
+    }
+
+    fn ensure(&mut self, bytes: usize) -> Result<(), String> {
+        while self.pending.len() < bytes && self.remaining > 0 {
+            self.pull()?;
+        }
+        Ok(())
+    }
+
+    fn fill_until(&mut self, limit: usize, found: impl Fn(&[u8]) -> bool) -> Result<(), String> {
+        while !found(&self.pending) {
+            if self.pending.len() > limit {
+                return Err("Заголовок multipart слишком большой".to_string());
+            }
+            if self.remaining == 0 {
+                return Err("Тело запроса обрезано".to_string());
+            }
+            self.pull()?;
+        }
+        Ok(())
+    }
+
+    fn discard_rest(&mut self) -> Result<(), String> {
+        self.pending.clear();
+        let mut buf = vec![0u8; BODY_CHUNK];
+        while self.remaining > 0 {
+            let want = BODY_CHUNK.min(self.remaining as usize);
+            let read = read_chunk(self.stream, &mut buf[..want])?;
+            if read == 0 {
+                return Err("Соединение закрыто до конца файла".to_string());
+            }
+            self.remaining -= read as u64;
+        }
+        Ok(())
+    }
+}
+
+fn read_chunk(stream: &mut TcpStream, buf: &mut [u8]) -> Result<usize, String> {
+    let deadline = Instant::now() + READ_WAIT;
+    loop {
+        match stream.read(buf) {
+            Ok(read) => return Ok(read),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err("Таймаут чтения файла по Wi-Fi".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
+                return Err("Таймаут чтения файла по Wi-Fi".to_string());
+            }
+            Err(err) => return Err(format!("Чтение сокета: {err}")),
+        }
+    }
+}
+
+fn read_headers(stream: &mut TcpStream) -> Result<(String, Vec<u8>), String> {
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let read = read_chunk(stream, &mut buf)?;
+        if read == 0 {
+            break;
+        }
+        raw.extend_from_slice(&buf[..read]);
+        if let Some(pos) = find_slice(&raw, b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&raw[..pos]).to_string();
+            return Ok((headers, raw[pos + 4..].to_vec()));
+        }
+        if raw.len() > 128 * 1024 {
+            return Err("Слишком большие заголовки".to_string());
+        }
+    }
+    Err("Заголовки не завершены".to_string())
+}
+
+fn save_raw(hub: &HubHandle, reader: &mut BodyReader<'_>, save_dir: &Path) -> Result<(), String> {
+    let path = unique_path(save_dir, "upload.bin");
+    let mut file = fs::File::create(&path).map_err(|err| format!("Не удалось создать файл: {err}"))?;
+    file.write_all(&reader.pending).map_err(|err| format!("Запись файла: {err}"))?;
+    let mut size = reader.pending.len() as u64;
+    reader.pending.clear();
+    let mut buf = vec![0u8; BODY_CHUNK];
+    while reader.remaining > 0 {
+        let want = BODY_CHUNK.min(reader.remaining as usize);
+        let read = read_chunk(reader.stream, &mut buf[..want])?;
+        if read == 0 {
+            let _ = fs::remove_file(&path);
+            return Err("Соединение закрыто до конца файла".to_string());
+        }
+        file.write_all(&buf[..read]).map_err(|err| format!("Запись файла: {err}"))?;
+        reader.remaining -= read as u64;
+        size += read as u64;
+    }
+    file.flush().map_err(|err| format!("Запись файла: {err}"))?;
+    remember_file(hub, &path, size, "SUCCESS");
+    Ok(())
+}
+
+fn save_multipart(hub: &HubHandle, reader: &mut BodyReader<'_>, save_dir: &Path, boundary: &str) -> Result<(), String> {
+    let open = format!("--{boundary}").into_bytes();
+    let next_mark = format!("\r\n--{boundary}").into_bytes();
+    reader.fill_until(256 * 1024, |buf| find_slice(buf, &open).is_some())?;
+    let pos = find_slice(&reader.pending, &open).ok_or("Нет границы multipart")?;
+    reader.pending.drain(..pos + open.len());
+    let mut saved = 0u32;
+    loop {
+        reader.ensure(2)?;
+        if reader.pending.starts_with(b"--") {
+            break;
+        }
+        if reader.pending.starts_with(b"\r\n") {
+            reader.pending.drain(..2);
+        }
+        reader.fill_until(64 * 1024, |buf| find_slice(buf, b"\r\n\r\n").is_some())?;
+        let sep = find_slice(&reader.pending, b"\r\n\r\n").ok_or("Нет заголовка части")?;
+        let head = String::from_utf8_lossy(&reader.pending[..sep]).to_string();
+        reader.pending.drain(..sep + 4);
+        if let Some(name) = filename_from_disposition(&head) {
+            let filename = sanitize_filename(&name);
+            let path = unique_path(save_dir, &filename);
+            match write_until_mark(reader, &path, &next_mark) {
+                Ok(size) => {
+                    remember_file(hub, &path, size, "SUCCESS");
+                    saved += 1;
+                }
+                Err(err) => {
+                    let _ = fs::remove_file(&path);
+                    push_file(
+                        hub,
+                        DroppedFileItem {
+                            id: next_seq(hub, "file"),
+                            filename,
+                            size_bytes: 0,
+                            received_at: local_now(),
+                            status: format!("ERROR: {err}"),
+                            path: String::new(),
+                        },
+                    );
+                    return Err(err);
+                }
+            }
+        } else {
+            skip_until_mark(reader, &next_mark)?;
+        }
+    }
+    if saved == 0 {
+        return Err("Файл не найден в запросе".to_string());
+    }
+    Ok(())
+}
+
+fn write_until_mark(reader: &mut BodyReader<'_>, path: &Path, mark: &[u8]) -> Result<u64, String> {
+    let mut file = fs::File::create(path).map_err(|err| format!("Не удалось создать файл: {err}"))?;
+    let mut tail = Vec::new();
+    let mut written = 0u64;
+    loop {
+        if reader.pending.is_empty() {
+            if reader.remaining == 0 {
+                return Err("Файл обрезан до границы multipart".to_string());
+            }
+            reader.pull()?;
+        }
+        let mut data = std::mem::take(&mut tail);
+        data.append(&mut reader.pending);
+        if let Some(pos) = find_slice(&data, mark) {
+            file.write_all(&data[..pos]).map_err(|err| format!("Запись файла: {err}"))?;
+            written += pos as u64;
+            reader.pending = data[pos + mark.len()..].to_vec();
+            file.flush().map_err(|err| format!("Запись файла: {err}"))?;
+            return Ok(written);
+        }
+        let keep = mark.len().saturating_sub(1);
+        if data.len() > keep {
+            let cut = data.len() - keep;
+            file.write_all(&data[..cut]).map_err(|err| format!("Запись файла: {err}"))?;
+            written += cut as u64;
+            tail = data[cut..].to_vec();
+        } else {
+            tail = data;
+        }
+    }
+}
+
+fn skip_until_mark(reader: &mut BodyReader<'_>, mark: &[u8]) -> Result<(), String> {
+    let mut tail = Vec::new();
+    loop {
+        if reader.pending.is_empty() {
+            if reader.remaining == 0 {
+                return Err("Тело запроса обрезано".to_string());
+            }
+            reader.pull()?;
+        }
+        let mut data = std::mem::take(&mut tail);
+        data.append(&mut reader.pending);
+        if let Some(pos) = find_slice(&data, mark) {
+            reader.pending = data[pos + mark.len()..].to_vec();
+            return Ok(());
+        }
+        let keep = mark.len().saturating_sub(1);
+        if data.len() > keep {
+            tail = data[data.len() - keep..].to_vec();
+        } else {
+            tail = data;
+        }
+    }
+}
+
+fn remember_file(hub: &HubHandle, path: &Path, size: u64, status: &str) {
+    push_file(
+        hub,
+        DroppedFileItem {
+            id: next_seq(hub, "file"),
+            filename: path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| "nexus-file".to_string()),
+            size_bytes: size,
+            received_at: local_now(),
+            status: status.to_string(),
+            path: path.display().to_string(),
+        },
+    );
+}
+
+fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) -> Result<(), String> {
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        _ => "Error",
+    };
+    let header = format!(
+        "HTTP/1.1 {status} {reason}\r\nAccess-Control-Allow-Origin: *\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes()).map_err(|err| err.to_string())?;
+    stream.write_all(body).map_err(|err| err.to_string())?;
+    stream.flush().map_err(|err| err.to_string())?;
     Ok(())
 }
 
@@ -392,63 +703,7 @@ fn next_seq(hub: &HubHandle, prefix: &str) -> String {
     format!("{prefix}-{}", unsafe { &*hub.seq }.fetch_add(1, Ordering::SeqCst))
 }
 
-fn read_request(stream: &mut TcpStream) -> Result<(String, Vec<u8>), String> {
-    let mut raw = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        let read = stream.read(&mut chunk).map_err(|err| format!("Чтение запроса: {err}"))?;
-        if read == 0 {
-            break;
-        }
-        raw.extend_from_slice(&chunk[..read]);
-        if find_slice(&raw, b"\r\n\r\n").is_some() {
-            break;
-        }
-        if raw.len() > 128 * 1024 {
-            return Err("Слишком большие заголовки".to_string());
-        }
-    }
-    if raw.len() < 4 {
-        return Err("Пустой запрос".to_string());
-    }
-    let header_end = find_slice(&raw, b"\r\n\r\n").ok_or("Заголовки не завершены")?;
-    let header_text = String::from_utf8_lossy(&raw[..header_end]).to_string();
-    let mut body = raw[header_end + 4..].to_vec();
-    let length = content_length(&header_text).unwrap_or(0);
-    if length > 200_000_000 {
-        return Err("Файл больше 200 МБ".to_string());
-    }
-    while body.len() < length {
-        let read = stream.read(&mut chunk).map_err(|err| format!("Чтение тела: {err}"))?;
-        if read == 0 {
-            break;
-        }
-        body.extend_from_slice(&chunk[..read]);
-    }
-    if body.len() > length {
-        body.truncate(length);
-    }
-    Ok((header_text, body))
-}
-
-fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) -> Result<(), String> {
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        403 => "Forbidden",
-        404 => "Not Found",
-        _ => "Error",
-    };
-    let header = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(header.as_bytes()).map_err(|err| err.to_string())?;
-    stream.write_all(body).map_err(|err| err.to_string())?;
-    Ok(())
-}
-
-fn content_length(headers: &str) -> Option<usize> {
+fn content_length(headers: &str) -> Option<u64> {
     header_value(headers, "content-length")?.parse().ok()
 }
 
@@ -485,36 +740,6 @@ fn query_param(target: &str, key: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn multipart_files(body: &[u8], boundary: &str) -> Vec<(String, Vec<u8>)> {
-    let marker = format!("--{boundary}").into_bytes();
-    let mut files = Vec::new();
-    let mut cursor = 0;
-    while let Some(rel) = find_slice(&body[cursor..], &marker) {
-        let mut part_at = cursor + rel + marker.len();
-        if body.get(part_at..part_at + 2) == Some(b"--") {
-            break;
-        }
-        if body.get(part_at..part_at + 2) == Some(b"\r\n") {
-            part_at += 2;
-        }
-        let Some(next) = find_slice(&body[part_at..], &marker) else {
-            break;
-        };
-        let mut part = &body[part_at..part_at + next];
-        if part.ends_with(b"\r\n") {
-            part = &part[..part.len() - 2];
-        }
-        if let Some(sep) = find_slice(part, b"\r\n\r\n") {
-            let head = String::from_utf8_lossy(&part[..sep]);
-            if let Some(name) = filename_from_disposition(&head) {
-                files.push((name, part[sep + 4..].to_vec()));
-            }
-        }
-        cursor = part_at + next;
-    }
-    files
 }
 
 fn filename_from_disposition(headers: &str) -> Option<String> {
@@ -819,11 +1044,19 @@ function upload(file) {
     const data = new FormData();
     data.append("file", file, file.name);
     xhr.open("POST", "/upload?token=" + encodeURIComponent(token));
+    xhr.timeout = 180000;
     xhr.upload.onprogress = (event) => {
-      if (event.lengthComputable) bar.style.width = Math.round(event.loaded / event.total * 100) + "%";
+      if (!event.lengthComputable) return;
+      const pct = Math.round(event.loaded / event.total * 100);
+      bar.style.width = pct + "%";
+      setLog("Загрузка " + file.name + ": " + pct + "%");
     };
-    xhr.onload = () => xhr.status === 200 ? resolve() : reject(xhr.responseText || "Ошибка");
-    xhr.onerror = () => reject("Сеть недоступна");
+    xhr.onload = () => {
+      if (xhr.status === 200) resolve();
+      else reject(xhr.responseText || ("Ошибка " + xhr.status));
+    };
+    xhr.onerror = () => reject("Передача прервана: сеть недоступна");
+    xhr.ontimeout = () => reject("Передача прервана: таймаут Wi-Fi");
     xhr.send(data);
   });
 }
@@ -833,10 +1066,15 @@ async function sendFiles(list) {
   for (let i = 0; i < files.length; i++) {
     setLog("Отправка " + (i + 1) + " / " + files.length + ": " + files[i].name);
     bar.style.width = "0%";
-    try { await upload(files[i]); setLog("Сохранено: " + files[i].name); }
-    catch (err) { setLog(String(err)); break; }
+    try {
+      await upload(files[i]);
+      bar.style.width = "100%";
+      setLog("Файл успешно получен ПК: " + files[i].name);
+    } catch (err) {
+      setLog(String(err));
+      break;
+    }
   }
-  bar.style.width = "100%";
 }
 document.getElementById("file").addEventListener("change", (event) => sendFiles(event.target.files));
 zone.addEventListener("dragover", (event) => { event.preventDefault(); zone.style.background = "#151c27"; });
@@ -857,3 +1095,52 @@ document.getElementById("send").addEventListener("click", async () => {
 </body>
 </html>
 "####;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn upload_reads_full_body_before_response() {
+        let hub = DropHub::new();
+        let info = hub.start().expect("session");
+        let boundary = "nexusbound";
+        let payload = vec![0xA5u8; 5 * 1024 * 1024];
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"photo.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(&payload);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let mut stream = TcpStream::connect(("127.0.0.1", info.port)).expect("connect");
+        stream.set_write_timeout(Some(Duration::from_secs(20))).ok();
+        stream.set_read_timeout(Some(Duration::from_secs(20))).ok();
+        let header = format!(
+            "POST /upload?token={} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            info.token,
+            body.len()
+        );
+        stream.write_all(header.as_bytes()).expect("headers");
+        for chunk in body.chunks(4096) {
+            stream.write_all(chunk).expect("body chunk");
+        }
+        stream.flush().ok();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).expect("response");
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        assert!(text.contains("Access-Control-Allow-Origin: *"));
+
+        let files = hub.history();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].status, "SUCCESS");
+        assert_eq!(files[0].size_bytes, payload.len() as u64);
+        let saved = fs::read(&files[0].path).expect("saved file");
+        assert_eq!(saved, payload);
+        let _ = fs::remove_file(&files[0].path);
+        hub.stop().ok();
+    }
+}
