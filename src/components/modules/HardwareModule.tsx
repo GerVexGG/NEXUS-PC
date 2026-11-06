@@ -1,588 +1,220 @@
+import { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
-import {
-  HardDrive,
-  Cpu,
-  Activity,
-  Thermometer,
-  Fan,
-  ShieldCheck,
-  Flame,
-} from "lucide-react";
-import {
-  SegmentedHudBar,
-  SpotlightCard,
-  cardItemVariants,
-  cardsContainerVariants,
-  getTempBadgeStyle,
-} from "../../lib/studio";
+import type { HardwareTelemetry } from "../../lib/studio";
 import type { NexusController } from "../../hooks/useNexusController";
 
+type SensorGroup = "cpu" | "gpu" | "memory" | "disk" | "fan";
+type SensorFilter = "all" | SensorGroup;
+
+type SensorRow = {
+  id: string;
+  group: SensorGroup;
+  name: string;
+  raw: number | null;
+  text: string;
+};
+
+const filters: { id: SensorFilter; label: string }[] = [
+  { id: "all", label: "Все" },
+  { id: "cpu", label: "CPU" },
+  { id: "gpu", label: "GPU" },
+  { id: "memory", label: "Память" },
+  { id: "disk", label: "Диски" },
+  { id: "fan", label: "Вентиляторы" },
+];
+
+function formatSensor(value: number | null | undefined, digits: number, unit: string): { raw: number | null; text: string } {
+  if (value == null || !Number.isFinite(value) || value === 0) {
+    return { raw: null, text: "—" };
+  }
+  return { raw: value, text: `${value.toFixed(digits)} ${unit}` };
+}
+
+function buildRows(hw: HardwareTelemetry | null, ramGb: number, ramPct: number): SensorRow[] {
+  const rows: SensorRow[] = [];
+  const push = (id: string, group: SensorGroup, name: string, value: number | null | undefined, digits: number, unit: string) => {
+    const formatted = formatSensor(value, digits, unit);
+    rows.push({ id, group, name, raw: formatted.raw, text: formatted.text });
+  };
+
+  push("cpu-package", "cpu", "CPU Package", hw?.cpu.package_temp_c, 1, "°C");
+  push("cpu-clock", "cpu", "Средняя частота", hw?.cpu.avg_clock_mhz != null ? hw.cpu.avg_clock_mhz / 1000 : null, 2, "GHz");
+  push("cpu-power", "cpu", "Мощность CPU", hw?.cpu.power_watts, 1, "W");
+  push("cpu-voltage", "cpu", "Напряжение CPU", hw?.cpu.voltage_v, 3, "V");
+  hw?.cpu.core_temps.forEach((core, index) => {
+    push(`cpu-core-${index}`, "cpu", core.name || `Ядро ${index + 1}`, core.temp_c, 0, "°C");
+  });
+
+  hw?.gpus.forEach((gpu, index) => {
+    const title = gpu.name || `GPU ${index + 1}`;
+    push(`gpu-${index}-core`, "gpu", `${title} · температура`, gpu.core_temp_c, 1, "°C");
+    push(`gpu-${index}-hot`, "gpu", `${title} · Hotspot`, gpu.hotspot_temp_c, 1, "°C");
+    push(`gpu-${index}-mem`, "memory", `${title} · температура памяти`, gpu.memory_temp_c, 1, "°C");
+    push(`gpu-${index}-core-clk`, "gpu", `${title} · частота ядра`, gpu.core_clock_mhz, 0, "MHz");
+    push(`gpu-${index}-mem-clk`, "gpu", `${title} · частота памяти`, gpu.memory_clock_mhz, 0, "MHz");
+    push(`gpu-${index}-power`, "gpu", `${title} · мощность`, gpu.power_watts, 1, "W");
+    push(`gpu-${index}-volt`, "gpu", `${title} · напряжение`, gpu.voltage_v, 3, "V");
+    push(`gpu-${index}-fan`, "fan", `${title} · кулер`, gpu.fan_rpm, 0, "RPM");
+  });
+
+  push("ram-used", "memory", "Оперативная память", ramGb, 1, "GB");
+  push("ram-pct", "memory", "Занято памяти", ramPct, 0, "%");
+
+  hw?.storage_temps.forEach((disk, index) => {
+    push(`disk-${index}-temp`, "disk", disk.name || `Накопитель ${index + 1}`, disk.temp_c, 1, "°C");
+    push(`disk-${index}-used`, "disk", `${disk.name || "Накопитель"} · занято`, disk.used_percent, 0, "%");
+  });
+
+  hw?.motherboard_temps.forEach((sensor, index) => {
+    push(`board-${index}`, "cpu", sensor.name || `Плата ${index + 1}`, sensor.temp_c, 0, "°C");
+  });
+
+  hw?.system_fans.forEach((fan, index) => {
+    push(`fan-${index}`, "fan", fan.name || `Вентилятор ${index + 1}`, fan.rpm, 0, "RPM");
+  });
+
+  return rows;
+}
+
 export function HardwareModule({ c }: { c: NexusController }) {
-  const {
-    metrics,
-    hwData,
-    thermalWarnings,
-    cpuTempStyle,
-  } = c;
+  const { hwData, metrics, thermalWarnings } = c;
+  const [filter, setFilter] = useState<SensorFilter>("all");
+  const [extremes, setExtremes] = useState<Record<string, { min: number; max: number }>>({});
+  const gpu = hwData?.gpus[0];
+  const rows = useMemo(
+    () => buildRows(hwData, metrics.ram_used_gb, metrics.ram_percentage),
+    [hwData, metrics.ram_used_gb, metrics.ram_percentage],
+  );
+  const visible = filter === "all" ? rows : rows.filter((row) => row.group === filter);
+
+  useEffect(() => {
+    setExtremes((prev) => {
+      const next = { ...prev };
+      for (const row of rows) {
+        if (row.raw == null) continue;
+        const current = next[row.id];
+        next[row.id] = current
+          ? { min: Math.min(current.min, row.raw), max: Math.max(current.max, row.raw) }
+          : { min: row.raw, max: row.raw };
+      }
+      return next;
+    });
+  }, [rows]);
+
   return (
-            <motion.div
-              key="hardware"
-              initial={{ opacity: 0, y: 12 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -8 }}
-              transition={{ duration: 0.25, ease: "easeOut" }}
-              className="space-y-6 max-w-6xl w-full"
-            >
-              {/* Заголовок и статус LibreHardwareMonitor */}
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                <div>
-                  <h2 className="text-2xl font-semibold tracking-tight text-slate-100">
-                    Аппаратный мониторинг (Hardware Monitor)
-                  </h2>
-                  <p className="text-sm text-[#8793a5] mt-1">
-                    Глубокая телеметрия датчиков CPU, GPU Hotspot, кулеров и накопителей (LibreHardwareMonitor)
-                  </p>
-                </div>
+    <motion.div
+      key="hardware"
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -6 }}
+      transition={{ duration: 0.18, ease: "easeOut" }}
+      className="w-full max-w-6xl space-y-4"
+    >
+      <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-end">
+        <div>
+          <h2 className="text-2xl font-semibold text-slate-100">Аппаратный мониторинг</h2>
+          <p className="mt-1 text-sm text-slate-400">Показатели температур, частот и напряжений</p>
+        </div>
+        <span
+          className={`inline-flex items-center gap-2 self-start rounded-full border px-3 py-1 text-xs ${
+            hwData?.sidecar_online
+              ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-400"
+              : "border-[#222b38] bg-[#151c27] text-slate-400"
+          }`}
+        >
+          <span className={`h-1.5 w-1.5 rounded-full ${hwData?.sidecar_online ? "bg-emerald-400" : "bg-slate-500"}`} />
+          {hwData?.sidecar_online ? "Sidecar активен" : "Служба остановлена"}
+        </span>
+      </div>
 
-                <div className="flex items-center gap-2.5 self-start sm:self-auto">
-                  <span
-                    className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-mono border ${
-                      hwData?.sidecar_online
-                        ? "bg-sky-500/10 text-sky-400 border-sky-500/25"
-                        : "bg-amber-500/10 text-amber-400 border-amber-500/25"
-                    }`}
-                  >
-                    <span
-                      className={`h-2 w-2 rounded-full ${
-                        hwData?.sidecar_online
-                          ? "bg-sky-400 animate-pulse"
-                          : "bg-amber-400"
-                      }`}
-                    />
-                    {hwData?.sidecar_online ? "LHM Sidecar Online" : "Инициализация..."}
-                  </span>
+      {thermalWarnings.length > 0 && (
+        <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+          {thermalWarnings.join(" · ")}
+        </div>
+      )}
 
-                  <span
-                    className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-mono border ${
-                      hwData?.is_admin
-                        ? "bg-cyan-500/10 text-cyan-400 border-cyan-500/25"
-                        : "bg-zinc-900/80 text-[#8793a5] border-white/[0.07]"
-                    }`}
-                    title="Для чтения низкоуровневых датчиков кулеров SuperIO и температур ядер рекомендуется запуск от имени Администратора"
-                  >
-                    <ShieldCheck size={14} />
-                    {hwData?.is_admin ? "Admin Mode" : "Standard Mode"}
-                  </span>
-                </div>
-              </div>
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <section className="rounded-xl border border-[#222b38] bg-[#111722] p-4">
+          <div className="text-sm text-slate-400">Процессор</div>
+          <h3 className="mt-1 truncate text-base font-medium text-slate-100">{hwData?.cpu.name || "Модель не определена"}</h3>
+          <div className="mt-3 font-mono text-2xl font-bold text-slate-100">
+            {formatSensor(hwData?.cpu.package_temp_c, 1, "°C").text}
+          </div>
+          <div className="mt-2 flex gap-4 text-xs text-slate-400">
+            <span>Частота <span className="font-mono text-slate-100">{formatSensor(hwData?.cpu.avg_clock_mhz != null ? hwData.cpu.avg_clock_mhz / 1000 : null, 2, "GHz").text}</span></span>
+            <span>Мощность <span className="font-mono text-slate-100">{formatSensor(hwData?.cpu.power_watts, 1, "W").text}</span></span>
+          </div>
+        </section>
 
-              {/* 1. Блок предупреждений / Health Status */}
-              {thermalWarnings.length > 0 ? (
-                <motion.div
-                  initial={{ opacity: 0, scale: 0.98 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  className="p-4 sm:p-5 rounded-2xl backdrop-blur-xl bg-gradient-to-r from-rose-500/20 via-amber-500/15 to-zinc-900/80 border border-rose-500/40 shadow-[0_0_30px_rgba(244,63,94,0.25)] flex items-start gap-3.5"
-                >
-                  <div className="p-2.5 rounded-xl bg-rose-500/20 border border-rose-500/40 text-rose-400 shrink-0">
-                    <Flame size={20} className="animate-pulse" />
-                  </div>
-                  <div className="space-y-1">
-                    <h3 className="text-sm font-bold text-rose-300 uppercase tracking-wider font-mono">
-                      Внимание: критический температурный режим (&gt; 85°C)
-                    </h3>
-                    <ul className="text-xs sm:text-sm font-mono text-[#e8edf4] space-y-0.5">
-                      {thermalWarnings.map((warn, i) => (
-                        <li key={i}>• {warn}</li>
-                      ))}
-                    </ul>
-                  </div>
-                </motion.div>
-              ) : (
-                <div className="p-4 rounded-2xl backdrop-blur-xl bg-sky-500/[0.06] border border-sky-500/20 flex items-center justify-between gap-4">
-                  <div className="flex items-center gap-3">
-                    <div className="p-2 rounded-xl bg-sky-500/15 border border-sky-500/30 text-sky-400">
-                      <Thermometer size={18} />
-                    </div>
-                    <div>
-                      <div className="text-sm font-semibold text-[#e8edf4]">
-                        Температурный режим всех узлов в пределах нормы
-                      </div>
-                      <div className="text-xs font-mono text-[#8793a5]">
-                        Порог тревоги CPU Package / GPU Hotspot: 85.0°C • Плата:{" "}
-                        <span className="text-[#c5d0de]">
-                          {hwData?.motherboard_name || "Определяется..."}
-                        </span>
-                      </div>
-                    </div>
-                  </div>
-                  <span className="hidden sm:inline-flex text-xs font-mono px-2.5 py-1 rounded-lg bg-sky-500/15 text-sky-400 border border-sky-500/30">
-                    HEALTH OK
-                  </span>
-                </div>
-              )}
+        <section className="rounded-xl border border-[#222b38] bg-[#111722] p-4">
+          <div className="text-sm text-slate-400">Видеокарта</div>
+          <h3 className="mt-1 truncate text-base font-medium text-slate-100">{gpu?.name || "Адаптер не обнаружен"}</h3>
+          <div className="mt-3 font-mono text-2xl font-bold text-slate-100">
+            {formatSensor(gpu?.core_temp_c, 1, "°C").text}
+          </div>
+          <div className="mt-2 grid grid-cols-3 gap-2 text-xs text-slate-400">
+            <span>Hotspot <span className="block font-mono text-slate-100">{formatSensor(gpu?.hotspot_temp_c, 1, "°C").text}</span></span>
+            <span>VRAM <span className="block font-mono text-slate-100">Н/Д</span></span>
+            <span>Кулер <span className="block font-mono text-slate-100">{formatSensor(gpu?.fan_rpm, 0, "RPM").text}</span></span>
+          </div>
+        </section>
+      </div>
 
-              {/* Сетка карточек: CPU и GPU */}
-              <motion.div
-                variants={cardsContainerVariants}
-                initial="hidden"
-                animate="show"
-                className="grid grid-cols-1 lg:grid-cols-2 gap-5"
-              >
-                {/* 2. Карточка CPU */}
-                <SpotlightCard
-                  variants={cardItemVariants}
-                  spotlightColor="rgba(56, 189, 248, 0.14)"
-                  className="p-5 sm:p-6"
-                >
-                  <div className="space-y-5">
-                    <div className="flex items-start justify-between gap-3 pb-4 border-b border-white/[0.06]">
-                      <div className="flex items-center gap-3 min-w-0">
-                        <div className="p-2.5 rounded-xl bg-sky-500/10 border border-sky-500/25 text-sky-400 shrink-0">
-                          <Cpu size={20} />
-                        </div>
-                        <div className="min-w-0">
-                          <span className="text-[11px] font-mono uppercase tracking-wider text-[#8793a5]">
-                            Центральный процессор (CPU)
-                          </span>
-                          <h3 className="text-base font-bold text-[#e8edf4] truncate">
-                            {hwData?.cpu.name || "Определение модели CPU..."}
-                          </h3>
-                        </div>
-                      </div>
+      <div className="flex flex-wrap gap-2">
+        {filters.map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            onClick={() => setFilter(item.id)}
+            className={`rounded-full border px-3 py-1 text-xs font-medium ${
+              filter === item.id
+                ? "border-sky-500/30 bg-sky-500/10 text-sky-300"
+                : "border-[#222b38] bg-[#111722] text-slate-400 hover:text-slate-200"
+            }`}
+          >
+            {item.label}
+          </button>
+        ))}
+      </div>
 
-                      <span
-                        className={`text-xs font-mono px-2.5 py-1 rounded-lg border shrink-0 ${cpuTempStyle.badgeClass}`}
-                      >
-                        {hwData?.cpu.package_temp_c !== null &&
-                        hwData?.cpu.package_temp_c !== undefined
-                          ? `${hwData.cpu.package_temp_c.toFixed(1)}°C • ${cpuTempStyle.label}`
-                          : "Датчик Т°: Н/Д"}
-                      </span>
-                    </div>
-
-                    {/* Основные показатели CPU */}
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                      <div className="p-3 rounded-xl bg-zinc-950/70 border border-white/[0.05]">
-                        <span className="text-[11px] font-mono text-[#8793a5]">
-                          CPU Package
-                        </span>
-                        <div
-                          className={`text-xl font-bold font-mono mt-1 ${cpuTempStyle.textClass}`}
-                        >
-                          {hwData?.cpu.package_temp_c != null
-                            ? `${hwData.cpu.package_temp_c.toFixed(1)}°C`
-                            : `${metrics.cpu_usage.toFixed(0)}% исп.`}
-                        </div>
-                      </div>
-
-                      <div className="p-3 rounded-xl bg-zinc-950/70 border border-white/[0.05]">
-                        <span className="text-[11px] font-mono text-[#8793a5]">
-                          Частота ядер
-                        </span>
-                        <div className="text-xl font-bold font-mono text-[#e8edf4] mt-1">
-                          {hwData?.cpu.avg_clock_mhz != null
-                            ? `${(hwData.cpu.avg_clock_mhz / 1000).toFixed(2)} ГГц`
-                            : "—"}
-                        </div>
-                      </div>
-
-                      <div className="p-3 rounded-xl bg-zinc-950/70 border border-white/[0.05]">
-                        <span className="text-[11px] font-mono text-[#8793a5]">
-                          Потребление
-                        </span>
-                        <div className="text-xl font-bold font-mono text-sky-400 mt-1">
-                          {hwData?.cpu.power_watts != null
-                            ? `${hwData.cpu.power_watts.toFixed(1)} W`
-                            : "—"}
-                        </div>
-                      </div>
-
-                      <div className="p-3 rounded-xl bg-zinc-950/70 border border-white/[0.05]">
-                        <span className="text-[11px] font-mono text-[#8793a5]">
-                          Вольтаж (VID)
-                        </span>
-                        <div className="text-xl font-bold font-mono text-cyan-400 mt-1">
-                          {hwData?.cpu.voltage_v != null
-                            ? `${hwData.cpu.voltage_v.toFixed(3)} V`
-                            : "—"}
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Список температур по ядрам */}
-                    <div className="space-y-2">
-                      <div className="flex items-center justify-between text-xs font-mono text-[#8793a5]">
-                        <span>Датчики ядер процессора</span>
-                        {hwData?.cpu.max_core_temp_c != null && (
-                          <span>
-                            Пик:{" "}
-                            <strong className="text-[#d5dde8]">
-                              {hwData.cpu.max_core_temp_c.toFixed(1)}°C
-                            </strong>
-                          </span>
-                        )}
-                      </div>
-
-                      {hwData?.cpu.core_temps && hwData.cpu.core_temps.length > 0 ? (
-                        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-40 overflow-y-auto pr-1">
-                          {hwData.cpu.core_temps.map((core, idx) => {
-                            const cStyle = getTempBadgeStyle(core.temp_c);
-                            return (
-                              <div
-                                key={core.name + idx}
-                                className="px-3 py-2 rounded-lg bg-zinc-950/60 border border-white/[0.05] flex items-center justify-between text-xs font-mono"
-                              >
-                                <span className="text-[#8793a5] truncate mr-2">
-                                  {core.name}
-                                </span>
-                                <span className={`font-bold ${cStyle.textClass}`}>
-                                  {core.temp_c.toFixed(0)}°C
-                                </span>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      ) : (
-                        <div className="p-3 rounded-xl bg-zinc-950/50 border border-white/[0.04] text-xs font-mono text-[#8793a5]">
-                          {hwData?.is_admin
-                            ? "Индивидуальные датчики ядер не предоставлены драйвером CPU"
-                            : "Запустите приложение от имени Администратора для чтения температур отдельных ядер CPU Ring0"}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                </SpotlightCard>
-
-                {/* 3. Карточка GPU (с выделенным Hotspot и индикатором вертушек) */}
-                {hwData?.gpus && hwData.gpus.length > 0 ? (
-                  hwData.gpus.map((gpu, gIdx) => {
-                    const hotspotStyle = getTempBadgeStyle(
-                      gpu.hotspot_temp_c ?? gpu.core_temp_c
-                    );
-                    const coreStyle = getTempBadgeStyle(gpu.core_temp_c);
-                    const fanPct = Math.min(100, Math.max(0, gpu.fan_percent ?? 0));
-
-                    return (
-                      <SpotlightCard
-                        key={gpu.name + gIdx}
-                        variants={cardItemVariants}
-                        spotlightColor="rgba(34, 211, 238, 0.14)"
-                        className="p-5 sm:p-6"
-                      >
-                        <div className="space-y-5">
-                          <div className="flex items-start justify-between gap-3 pb-4 border-b border-white/[0.06]">
-                            <div className="flex items-center gap-3 min-w-0">
-                              <div className="p-2.5 rounded-xl bg-cyan-500/10 border border-cyan-500/25 text-cyan-400 shrink-0">
-                                <Activity size={20} />
-                              </div>
-                              <div className="min-w-0">
-                                <span className="text-[11px] font-mono uppercase tracking-wider text-[#8793a5]">
-                                  Графический адаптер (GPU #{gIdx + 1})
-                                </span>
-                                <h3 className="text-base font-bold text-[#e8edf4] truncate">
-                                  {gpu.name}
-                                </h3>
-                              </div>
-                            </div>
-
-                            <span
-                              className={`text-xs font-mono px-2.5 py-1 rounded-lg border shrink-0 ${hotspotStyle.badgeClass}`}
-                            >
-                              {hotspotStyle.label}
-                            </span>
-                          </div>
-
-                          {/* Крупный блок температур: Core, HOTSPOT, VRAM */}
-                          <div className="grid grid-cols-3 gap-3">
-                            <div className="p-3.5 rounded-xl bg-zinc-950/70 border border-white/[0.05]">
-                              <span className="text-[11px] font-mono text-[#8793a5]">
-                                Чип (GPU Core)
-                              </span>
-                              <div
-                                className={`text-2xl font-bold font-mono mt-1 ${coreStyle.textClass}`}
-                              >
-                                {gpu.core_temp_c != null
-                                  ? `${gpu.core_temp_c.toFixed(1)}°C`
-                                  : "—"}
-                              </div>
-                            </div>
-
-                            {/* Выделенный крупно GPU Hotspot */}
-                            <div className="p-3.5 rounded-xl bg-gradient-to-br from-amber-500/15 via-rose-500/10 to-zinc-950 border border-amber-500/35 shadow-[0_0_20px_rgba(245,158,11,0.12)]">
-                              <span className="text-[11px] font-mono uppercase tracking-wider text-amber-300 font-semibold flex items-center gap-1">
-                                <Flame size={12} /> HOTSPOT
-                              </span>
-                              <div
-                                className={`text-2xl sm:text-3xl font-extrabold font-mono mt-0.5 ${hotspotStyle.textClass}`}
-                              >
-                                {gpu.hotspot_temp_c != null
-                                  ? `${gpu.hotspot_temp_c.toFixed(1)}°C`
-                                  : gpu.core_temp_c != null
-                                  ? `${gpu.core_temp_c.toFixed(1)}°C`
-                                  : "—"}
-                              </div>
-                            </div>
-
-                            <div className="p-3.5 rounded-xl bg-zinc-950/70 border border-white/[0.05]">
-                              <span className="text-[11px] font-mono text-[#8793a5]">
-                                Память (VRAM)
-                              </span>
-                              <div className="text-2xl font-bold font-mono text-cyan-400 mt-1">
-                                {gpu.memory_temp_c != null
-                                  ? `${gpu.memory_temp_c.toFixed(1)}°C`
-                                  : "—"}
-                              </div>
-                            </div>
-                          </div>
-
-                          {/* Частоты, питание и вольтаж */}
-                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs font-mono">
-                            <div className="p-2.5 rounded-xl bg-zinc-950/60 border border-white/[0.04]">
-                              <span className="text-[#8793a5] block">Ядро МГц</span>
-                              <span className="text-[#e8edf4] font-bold text-sm">
-                                {gpu.core_clock_mhz != null
-                                  ? `${gpu.core_clock_mhz.toFixed(0)} MHz`
-                                  : "—"}
-                              </span>
-                            </div>
-                            <div className="p-2.5 rounded-xl bg-zinc-950/60 border border-white/[0.04]">
-                              <span className="text-[#8793a5] block">Память МГц</span>
-                              <span className="text-[#e8edf4] font-bold text-sm">
-                                {gpu.memory_clock_mhz != null
-                                  ? `${gpu.memory_clock_mhz.toFixed(0)} MHz`
-                                  : "—"}
-                              </span>
-                            </div>
-                            <div className="p-2.5 rounded-xl bg-zinc-950/60 border border-white/[0.04]">
-                              <span className="text-[#8793a5] block">Потребление</span>
-                              <span className="text-sky-400 font-bold text-sm">
-                                {gpu.power_watts != null
-                                  ? `${gpu.power_watts.toFixed(1)} W`
-                                  : "—"}
-                              </span>
-                            </div>
-                            <div className="p-2.5 rounded-xl bg-zinc-950/60 border border-white/[0.04]">
-                              <span className="text-[#8793a5] block">Вольтаж</span>
-                              <span className="text-cyan-400 font-bold text-sm">
-                                {gpu.voltage_v != null
-                                  ? `${gpu.voltage_v.toFixed(3)} V`
-                                  : "—"}
-                              </span>
-                            </div>
-                          </div>
-
-                          {/* Индикатор вертушек GPU (RPM и сегментированная шкала %) */}
-                          <div className="p-3.5 rounded-xl bg-[#151c27]/90 border border-white/[0.06] space-y-2.5">
-                            <div className="flex items-center justify-between text-xs font-mono">
-                              <span className="flex items-center gap-2 text-[#c5d0de]">
-                                <Fan
-                                  size={15}
-                                  className={
-                                    (gpu.fan_rpm ?? 0) > 0
-                                      ? "text-cyan-400 animate-spin"
-                                      : "text-[#8793a5]"
-                                  }
-                                />
-                                Охлаждение GPU (Кулеры)
-                              </span>
-                              <div className="flex items-center gap-2">
-                                <span className="text-[#e8edf4] font-bold tabular-nums">
-                                  {gpu.fan_rpm != null
-                                    ? gpu.fan_rpm.toFixed(0)
-                                    : "0"}
-                                </span>
-                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
-                                  RPM
-                                </span>
-                                <span className="text-cyan-400 font-semibold tabular-nums ml-1">
-                                  {gpu.fan_percent != null
-                                    ? `${gpu.fan_percent.toFixed(0)}%`
-                                    : "0%"}
-                                </span>
-                              </div>
-                            </div>
-                            <SegmentedHudBar
-                              percentage={fanPct}
-                              segments={24}
-                              theme="cyan"
-                            />
-                          </div>
-                        </div>
-                      </SpotlightCard>
-                    );
-                  })
-                ) : (
-                  <SpotlightCard
-                    variants={cardItemVariants}
-                    spotlightColor="rgba(34, 211, 238, 0.12)"
-                    className="p-6 flex flex-col justify-center items-center text-center"
-                  >
-                    <Activity size={28} className="text-cyan-400 mb-2 opacity-80" />
-                    <div className="text-sm font-semibold text-[#d5dde8]">
-                      Датчики дискретной видеокарты (GPU)
-                    </div>
-                    <p className="text-xs font-mono text-[#8793a5] mt-1 max-w-sm">
-                      Ожидание ответа от LibreHardwareMonitor или в системе используется встроенное видеоядро без открытых термодатчиков.
-                    </p>
-                  </SpotlightCard>
-                )}
-              </motion.div>
-
-              {/* 4. Карточка системных вентиляторов и температур накопителей SSD/HDD */}
-              <motion.div
-                variants={cardsContainerVariants}
-                initial="hidden"
-                animate="show"
-                className="grid grid-cols-1 lg:grid-cols-2 gap-5"
-              >
-                {/* Системные вентиляторы и датчики материнской платы */}
-                <SpotlightCard
-                  variants={cardItemVariants}
-                  spotlightColor="rgba(56, 189, 248, 0.12)"
-                  className="p-5 sm:p-6"
-                >
-                  <div className="space-y-4">
-                    <div className="flex items-center justify-between border-b border-white/[0.06] pb-3">
-                      <div className="flex items-center gap-2.5">
-                        <Fan size={18} className="text-sky-400" />
-                        <h3 className="text-base font-semibold text-[#e8edf4]">
-                          Вентиляторы корпуса и датчики платы
-                        </h3>
-                      </div>
-                      <span className="text-xs font-mono text-[#8793a5]">
-                        Кулеров: {hwData?.system_fans.length ?? 0}
-                      </span>
-                    </div>
-
-                    {hwData?.system_fans && hwData.system_fans.length > 0 ? (
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                        {hwData.system_fans.map((fan, fIdx) => (
-                          <div
-                            key={fan.name + fIdx}
-                            className="p-3 rounded-xl bg-zinc-950/70 border border-white/[0.05] flex items-center justify-between"
-                          >
-                            <div className="flex items-center gap-2.5 min-w-0">
-                              <Fan
-                                size={15}
-                                className={
-                                  fan.rpm > 0
-                                    ? "text-sky-400 animate-spin shrink-0"
-                                    : "text-zinc-600 shrink-0"
-                                }
-                              />
-                              <span className="text-xs font-mono text-[#c5d0de] truncate">
-                                {fan.name}
-                              </span>
-                            </div>
-                            <span className="text-sm font-mono font-bold text-sky-400 shrink-0">
-                              {fan.rpm.toFixed(0)} RPM
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="p-4 rounded-xl bg-zinc-950/50 border border-white/[0.04] text-xs font-mono text-[#8793a5]">
-                        Обороты корпусных вентиляторов (SuperIO) недоступны без прав Администратора или управляются напрямую через BIOS.
-                      </div>
-                    )}
-
-                    {hwData?.motherboard_temps &&
-                      hwData.motherboard_temps.length > 0 && (
-                        <div className="pt-2 space-y-2">
-                          <span className="text-xs font-mono text-[#8793a5] block">
-                            Термодатчики системной платы:
-                          </span>
-                          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-                            {hwData.motherboard_temps.slice(0, 6).map((t, idx) => {
-                              const st = getTempBadgeStyle(t.temp_c);
-                              return (
-                                <div
-                                  key={t.name + idx}
-                                  className="px-3 py-2 rounded-lg bg-zinc-950/60 border border-white/[0.05] flex items-center justify-between text-xs font-mono"
-                                >
-                                  <span className="text-[#8793a5] truncate mr-2">
-                                    {t.name}
-                                  </span>
-                                  <span className={`font-bold ${st.textClass}`}>
-                                    {t.temp_c.toFixed(0)}°C
-                                  </span>
-                                </div>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      )}
-                  </div>
-                </SpotlightCard>
-
-                {/* Температуры накопителей SSD / HDD */}
-                <SpotlightCard
-                  variants={cardItemVariants}
-                  spotlightColor="rgba(34, 211, 238, 0.12)"
-                  className="p-5 sm:p-6"
-                >
-                  <div className="space-y-4">
-                    <div className="flex items-center justify-between border-b border-white/[0.06] pb-3">
-                      <div className="flex items-center gap-2.5">
-                        <HardDrive size={18} className="text-cyan-400" />
-                        <h3 className="text-base font-semibold text-[#e8edf4]">
-                          Температуры накопителей (SSD / NVMe / HDD)
-                        </h3>
-                      </div>
-                      <span className="text-xs font-mono text-[#8793a5]">
-                        Устройств: {hwData?.storage_temps.length ?? 0}
-                      </span>
-                    </div>
-
-                    {hwData?.storage_temps && hwData.storage_temps.length > 0 ? (
-                      <div className="space-y-2.5">
-                        {hwData.storage_temps.map((st, idx) => {
-                          const tempBadge = getTempBadgeStyle(st.temp_c);
-                          return (
-                            <div
-                              key={st.name + idx}
-                              className="p-3.5 rounded-xl bg-zinc-950/70 border border-white/[0.05] flex items-center justify-between gap-4"
-                            >
-                              <div className="min-w-0 flex-1">
-                                <div className="text-sm font-medium text-[#e8edf4] truncate">
-                                  {st.name}
-                                </div>
-                                {st.used_percent != null && (
-                                  <div className="flex items-center gap-2 mt-1.5">
-                                    <div className="w-28 h-1 bg-zinc-800 rounded-full overflow-hidden">
-                                      <div
-                                        style={{
-                                          width: `${Math.min(100, st.used_percent)}%`,
-                                        }}
-                                        className="h-full bg-cyan-400 rounded-full"
-                                      />
-                                    </div>
-                                    <span className="text-[11px] font-mono text-[#8793a5]">
-                                      Занято: {st.used_percent.toFixed(0)}%
-                                    </span>
-                                  </div>
-                                )}
-                              </div>
-
-                              <span
-                                className={`text-xs font-mono font-bold px-2.5 py-1 rounded-lg border shrink-0 ${tempBadge.badgeClass}`}
-                              >
-                                {st.temp_c != null
-                                  ? `${st.temp_c.toFixed(1)}°C`
-                                  : "SMART Н/Д"}
-                              </span>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    ) : (
-                      <div className="p-4 rounded-xl bg-zinc-950/50 border border-white/[0.04] text-xs font-mono text-[#8793a5]">
-                        Опрос SMART-датчиков накопителей...
-                      </div>
-                    )}
-                  </div>
-                </SpotlightCard>
-              </motion.div>
-            </motion.div>
+      <div className="overflow-hidden rounded-xl border border-[#222b38] bg-[#111722]">
+        <table className="w-full text-left text-sm">
+          <thead className="text-xs text-slate-500">
+            <tr className="border-b border-[#222b38]">
+              <th className="px-4 py-2 font-medium">Датчик</th>
+              <th className="px-4 py-2 font-medium">Текущее значение</th>
+              <th className="px-4 py-2 font-medium">Минимум</th>
+              <th className="px-4 py-2 font-medium">Максимум</th>
+            </tr>
+          </thead>
+          <tbody>
+            {visible.length === 0 ? (
+              <tr>
+                <td colSpan={4} className="px-4 py-8 text-center text-sm text-slate-400">
+                  Датчики этой категории ещё не ответили
+                </td>
+              </tr>
+            ) : (
+              visible.map((row) => {
+                const range = extremes[row.id];
+                const unit = row.text.includes(" ") ? row.text.slice(row.text.lastIndexOf(" ") + 1) : "";
+                return (
+                  <tr key={row.id} className="border-b border-[#222b38]/70 last:border-0">
+                    <td className="px-4 py-2.5 text-slate-200">{row.name}</td>
+                    <td className="px-4 py-2.5 font-mono text-slate-100">{row.text}</td>
+                    <td className="px-4 py-2.5 font-mono text-slate-400">
+                      {range ? `${range.min.toFixed(row.text.includes("GHz") || row.text.includes(" V") ? 2 : 0)} ${unit}` : "—"}
+                    </td>
+                    <td className="px-4 py-2.5 font-mono text-slate-400">
+                      {range ? `${range.max.toFixed(row.text.includes("GHz") || row.text.includes(" V") ? 2 : 0)} ${unit}` : "—"}
+                    </td>
+                  </tr>
+                );
+              })
+            )}
+          </tbody>
+        </table>
+      </div>
+    </motion.div>
   );
 }
