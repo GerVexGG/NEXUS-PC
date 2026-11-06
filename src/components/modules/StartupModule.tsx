@@ -1,18 +1,43 @@
-import { motion, AnimatePresence } from "framer-motion";
+import { useState } from "react";
+import { motion } from "framer-motion";
 import {
-  FolderOpen,
-  Search,
   AlertTriangle,
-  RefreshCw,
   AppWindow,
+  FolderOpen,
+  RefreshCw,
+  Search,
+  SearchX,
+  ShieldCheck,
 } from "lucide-react";
-import {
-  SpotlightCard,
-  cardItemVariants,
-  cardsContainerVariants,
-  getLocationBadgeStyles,
-} from "../../lib/studio";
+import type { StartupItem } from "../../lib/studio";
 import type { NexusController } from "../../hooks/useNexusController";
+
+type StartupFilter = "all" | "on" | "off";
+
+function sourceBadge(location: string): string {
+  const value = location.toLowerCase();
+  if (value.includes("hkcu")) return "HKCU Run";
+  if (value.includes("hklm")) return "HKLM Run";
+  if (value.includes("папк")) return "Папка Автозапуск";
+  return location;
+}
+
+function folderHint(path: string): string {
+  const parts = path.split(/[/\\]/).filter(Boolean);
+  const skip = new Set([
+    "program files",
+    "program files (x86)",
+    "windows",
+    "users",
+    "appdata",
+    "local",
+    "roaming",
+    "programdata",
+  ]);
+  const named = parts.filter((part) => !/^[a-z]:$/i.test(part) && !skip.has(part.toLowerCase()));
+  if (named.length >= 2) return named[named.length - 2];
+  return named[0] ?? "";
+}
 
 export function StartupModule({ c }: { c: NexusController }) {
   const {
@@ -24,212 +49,186 @@ export function StartupModule({ c }: { c: NexusController }) {
     handleToggleStartup,
     handleOpenItemLocation,
     totalStartupCount,
-    activeStartupCount,
-    brokenStartupCount,
     filteredStartupItems,
   } = c;
+  const [statusFilter, setStatusFilter] = useState<StartupFilter>("all");
+
+  const visibleItems = filteredStartupItems.filter((item) => {
+    if (statusFilter === "on") return item.enabled;
+    if (statusFilter === "off") return !item.enabled;
+    return true;
+  });
+  const searchActive = startupSearch.trim().length > 0 || statusFilter !== "all";
+
   return (
-            <motion.div
-              key="startup"
-              initial={{ opacity: 0, y: 12 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -8 }}
-              transition={{ duration: 0.25, ease: "easeOut" }}
-              className="space-y-6 max-w-6xl w-full"
+    <motion.div
+      key="startup"
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -6 }}
+      transition={{ duration: 0.18, ease: "easeOut" }}
+      className="w-full max-w-6xl space-y-4"
+    >
+      <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-end">
+        <div>
+          <h2 className="text-2xl font-semibold text-slate-100">Автозагрузка программ</h2>
+          <p className="mt-1 text-sm text-slate-400">Управление приложениями при старте Windows</p>
+        </div>
+        <button
+          type="button"
+          onClick={() => void fetchStartupItems()}
+          disabled={startupLoading}
+          className="inline-flex items-center gap-2 self-start rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2 text-xs font-medium text-slate-200 transition-colors hover:bg-[#1a2332] disabled:opacity-60"
+        >
+          <RefreshCw size={14} className={startupLoading ? "animate-spin" : ""} />
+          Обновить список
+        </button>
+      </div>
+
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
+        <div className="flex flex-wrap gap-2">
+          {(
+            [
+              ["all", "Все"],
+              ["on", "Включенные"],
+              ["off", "Отключенные"],
+            ] as const
+          ).map(([id, label]) => (
+            <button
+              key={id}
+              type="button"
+              onClick={() => setStatusFilter(id)}
+              className={`rounded-full border px-3 py-1 text-xs font-medium transition-colors ${
+                statusFilter === id
+                  ? "border-sky-500/30 bg-sky-500/10 text-sky-300"
+                  : "border-[#222b38] bg-[#111722] text-slate-400 hover:text-slate-200"
+              }`}
             >
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                <div>
-                  <h2 className="text-2xl font-semibold tracking-tight text-slate-100">
-                    Менеджер автозагрузки
-                  </h2>
-                  <p className="text-xs sm:text-sm text-[#8793a5] font-mono mt-1">
-                    Всего записей:{" "}
-                    <span className="text-[#d5dde8] font-semibold">{totalStartupCount}</span> •
-                    Активных:{" "}
-                    <span className="text-sky-400 font-semibold">
-                      {activeStartupCount}
-                    </span>{" "}
-                    • Обнаружено битых путей:{" "}
-                    <span
-                      className={
-                        brokenStartupCount > 0
-                          ? "text-rose-400 font-semibold"
-                          : "text-[#8793a5] font-semibold"
-                      }
-                    >
-                      {brokenStartupCount}
-                    </span>
-                  </p>
-                </div>
+              {label}
+            </button>
+          ))}
+        </div>
+        <div className="relative min-w-0 flex-1">
+          <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
+          <input
+            type="text"
+            value={startupSearch}
+            onChange={(e) => setStartupSearch(e.target.value)}
+            placeholder="Поиск по имени"
+            className="w-full rounded-lg border border-[#222b38] bg-[#111722] py-2 pl-9 pr-3 text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:border-slate-500"
+          />
+        </div>
+      </div>
 
-                <motion.button
-                  type="button"
-                  whileHover={{ scale: 1.02 }}
-                  whileTap={{ scale: 0.96 }}
-                  onClick={fetchStartupItems}
-                  disabled={startupLoading}
-                  className="inline-flex items-center gap-2 px-4 py-2 rounded-xl backdrop-blur-xl bg-zinc-900/70 hover:bg-zinc-800/80 border border-white/[0.08] text-xs font-mono text-[#c5d0de] transition-colors cursor-pointer self-start sm:self-auto"
-                >
-                  <RefreshCw
-                    size={14}
-                    className={
-                      startupLoading ? "animate-spin text-sky-400" : "text-sky-400"
-                    }
-                  />
-                  <span>Обновить</span>
-                </motion.button>
-              </div>
+      {startupError && (
+        <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+          {startupError}
+        </div>
+      )}
 
-              <div className="relative">
-                <Search
-                  size={16}
-                  className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-[#8793a5]"
-                />
-                <input
-                  type="text"
-                  value={startupSearch}
-                  onChange={(e) => setStartupSearch(e.target.value)}
-                  placeholder="Поиск по названию программы, пути или расположению (HKCU, HKLM, Папка)..."
-                  className="w-full pl-11 pr-4 py-3 rounded-2xl backdrop-blur-xl bg-zinc-900/60 border border-white/[0.07] text-sm text-[#e8edf4] placeholder-zinc-500 focus:outline-none focus:border-sky-500/40 focus:shadow-[0_0_20px_rgba(56,189,248,0.1)] transition-all"
-                />
-              </div>
+      {visibleItems.length === 0 ? (
+        <div className="flex flex-col items-center rounded-xl border border-[#222b38] bg-[#111722] px-6 py-16 text-center">
+          {searchActive ? (
+            <SearchX size={28} className="mb-3 text-slate-500" />
+          ) : (
+            <ShieldCheck size={28} className="mb-3 text-slate-500" />
+          )}
+          <h3 className="text-base font-semibold text-slate-100">
+            {startupLoading
+              ? "Читаем список автозагрузки"
+              : searchActive
+                ? "Ничего не найдено"
+                : "Записей автозапуска не обнаружено"}
+          </h3>
+          <p className="mt-1 max-w-md text-sm text-slate-400">
+            {searchActive
+              ? "Измените фильтр или строку поиска."
+              : totalStartupCount === 0
+                ? "Реестр и папка автозапуска сейчас пусты."
+                : "Подходящих записей нет."}
+          </p>
+          <button
+            type="button"
+            onClick={() => void fetchStartupItems()}
+            disabled={startupLoading}
+            className="mt-4 inline-flex items-center gap-2 rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2 text-xs font-medium text-slate-200 hover:bg-[#1a2332] disabled:opacity-60"
+          >
+            <RefreshCw size={14} className={startupLoading ? "animate-spin" : ""} />
+            Повторить сканирование
+          </button>
+        </div>
+      ) : (
+        <div className="divide-y divide-[#222b38]/50 overflow-hidden rounded-xl border border-[#222b38] bg-[#111722]">
+          {visibleItems.map((item) => (
+            <StartupRow
+              key={item.id}
+              item={item}
+              onOpen={() => void handleOpenItemLocation(item)}
+              onToggle={() => void handleToggleStartup(item)}
+            />
+          ))}
+        </div>
+      )}
+    </motion.div>
+  );
+}
 
-              <AnimatePresence>
-                {startupError && (
-                  <motion.div
-                    initial={{ opacity: 0, y: -6 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: -6 }}
-                    className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-400 text-xs font-mono"
-                  >
-                    {startupError}
-                  </motion.div>
-                )}
-              </AnimatePresence>
+function StartupRow({
+  item,
+  onOpen,
+  onToggle,
+}: {
+  item: StartupItem;
+  onOpen: () => void;
+  onToggle: () => void;
+}) {
+  const path = item.clean_path || item.command;
+  const hint = folderHint(path);
 
-              <motion.div
-                variants={cardsContainerVariants}
-                initial="hidden"
-                animate="show"
-                className="space-y-3"
-              >
-                {filteredStartupItems.length === 0 ? (
-                  <SpotlightCard className="p-8 text-center">
-                    <p className="text-sm text-[#8793a5] font-mono">
-                      {startupLoading
-                        ? "Сканирование реестра и папок автозагрузки..."
-                        : "Записи автозагрузки не найдены"}
-                    </p>
-                  </SpotlightCard>
-                ) : (
-                  filteredStartupItems.map((item) => (
-                    <SpotlightCard
-                      key={item.id}
-                      variants={cardItemVariants}
-                      spotlightColor={
-                        !item.file_exists
-                          ? "rgba(244, 63, 94, 0.14)"
-                          : item.enabled
-                          ? "rgba(56, 189, 248, 0.12)"
-                          : "rgba(161, 161, 170, 0.08)"
-                      }
-                      className="p-4 sm:p-5"
-                    >
-                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                        <div className="flex items-start gap-3.5 min-w-0 flex-1">
-                          <div
-                            className={`mt-0.5 p-2.5 rounded-xl border shrink-0 ${
-                              !item.file_exists
-                                ? "bg-rose-500/10 border-rose-500/30 text-rose-400"
-                                : item.enabled
-                                ? "bg-sky-500/10 border-sky-500/25 text-sky-400"
-                                : "bg-zinc-800/70 border-white/[0.06] text-[#8793a5]"
-                            }`}
-                          >
-                            {!item.file_exists ? (
-                              <AlertTriangle size={18} />
-                            ) : (
-                              <AppWindow size={18} />
-                            )}
-                          </div>
-
-                          <div className="min-w-0 flex-1 space-y-1">
-                            <div className="flex flex-wrap items-center gap-2">
-                              <span
-                                className={`font-semibold text-sm sm:text-base truncate ${
-                                  item.enabled ? "text-[#e8edf4]" : "text-[#8793a5]"
-                                }`}
-                              >
-                                {item.name}
-                              </span>
-
-                              <span
-                                className={`text-[11px] font-mono px-2 py-0.5 rounded-md border ${getLocationBadgeStyles(
-                                  item.location
-                                )}`}
-                              >
-                                {item.location}
-                              </span>
-
-                              {!item.file_exists && (
-                                <span className="inline-flex items-center gap-1 text-[11px] font-mono px-2 py-0.5 rounded-md bg-rose-500/15 text-rose-400 border border-rose-500/35 shadow-[0_0_12px_rgba(244,63,94,0.2)]">
-                                  ⚠️ Битая запись (файл не найден)
-                                </span>
-                              )}
-                            </div>
-
-                            <p
-                              title={item.command}
-                              className="text-xs font-mono text-[#8793a5] truncate"
-                            >
-                              {item.clean_path || item.command}
-                            </p>
-                          </div>
-                        </div>
-
-                        <div className="flex items-center justify-end gap-3 shrink-0">
-                          <motion.button
-                            type="button"
-                            whileHover={{ scale: 1.05 }}
-                            whileTap={{ scale: 0.94 }}
-                            onClick={() => handleOpenItemLocation(item)}
-                            title="Показать в проводнике"
-                            className="p-2.5 rounded-xl bg-zinc-800/70 hover:bg-zinc-700/80 text-[#c5d0de] hover:text-sky-400 border border-white/[0.06] hover:border-sky-500/30 transition-colors cursor-pointer"
-                          >
-                            <FolderOpen size={16} />
-                          </motion.button>
-
-                          <button
-                            type="button"
-                            role="switch"
-                            aria-checked={item.enabled}
-                            onClick={() => handleToggleStartup(item)}
-                            className={`relative inline-flex h-7 w-13 shrink-0 items-center rounded-full p-1 transition-colors duration-200 cursor-pointer border ${
-                              item.enabled
-                                ? "bg-sky-500/25 border-sky-500/40 shadow-[0_0_14px_rgba(56,189,248,0.25)] justify-end"
-                                : "bg-zinc-900/90 border-white/[0.08] justify-start"
-                            }`}
-                          >
-                            <motion.span
-                              layout
-                              transition={{
-                                type: "spring",
-                                stiffness: 500,
-                                damping: 32,
-                              }}
-                              className={`h-5 w-5 rounded-full ${
-                                item.enabled
-                                  ? "bg-sky-400 shadow-[0_0_10px_#38bdf8]"
-                                  : "bg-zinc-500"
-                              }`}
-                            />
-                          </button>
-                        </div>
-                      </div>
-                    </SpotlightCard>
-                  ))
-                )}
-              </motion.div>
-            </motion.div>
+  return (
+    <div className="flex items-center gap-3 px-4 py-3">
+      <div
+        className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border ${
+          item.file_exists
+            ? "border-[#222b38] bg-[#151c27] text-slate-300"
+            : "border-rose-500/30 bg-rose-500/10 text-rose-300"
+        }`}
+      >
+        {item.file_exists ? <AppWindow size={16} /> : <AlertTriangle size={16} />}
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-sm font-medium text-slate-100">{item.name}</div>
+        <div className="truncate text-xs text-slate-400">
+          {hint && <span>{hint} · </span>}
+          <span className="font-mono">{path}</span>
+        </div>
+      </div>
+      <span className="hidden shrink-0 rounded-md border border-[#222b38] px-2 py-1 text-xs text-slate-400 sm:inline">
+        {sourceBadge(item.location)}
+      </span>
+      <button
+        type="button"
+        onClick={onOpen}
+        className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-[#222b38] bg-[#151c27] px-2.5 py-1.5 text-xs font-medium text-slate-200 hover:bg-[#1a2332]"
+      >
+        <FolderOpen size={13} />
+        Открыть папку
+      </button>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={item.enabled}
+        onClick={onToggle}
+        className={`relative h-5 w-9 shrink-0 rounded-full border transition-colors ${
+          item.enabled ? "border-sky-500/40 bg-sky-500/30" : "border-[#222b38] bg-[#151c27]"
+        }`}
+      >
+        <span
+          className={`absolute top-0.5 h-3.5 w-3.5 rounded-full transition-all ${
+            item.enabled ? "left-4 bg-sky-300" : "left-0.5 bg-slate-500"
+          }`}
+        />
+      </button>
+    </div>
   );
 }
