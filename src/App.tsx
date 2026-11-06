@@ -72,6 +72,7 @@ export default function App() {
     <div className="nexus-shell relative flex h-screen w-screen select-none flex-col overflow-hidden rounded-3xl border border-[#222b38] font-sans text-slate-100">
 
       <TitleBar
+        activeTab={c.activeTab}
         isElevatedAdmin={c.isElevatedAdmin}
         adminError={c.adminError}
         onRestartAsAdmin={c.handleRestartAsAdmin}

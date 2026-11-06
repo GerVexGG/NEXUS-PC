@@ -133,20 +133,26 @@ export function DashboardModule({ c }: { c: NexusController }) {
           <h2 className="text-2xl font-semibold text-slate-100">Обзор системы</h2>
           <p className="mt-1 text-sm text-slate-400">Состояние компьютера в реальном времени</p>
         </div>
-        <div className="inline-flex items-center gap-2 self-start rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-xs text-emerald-400">
-          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-          Система активна
+        <div
+          className={`inline-flex items-center gap-2 self-start rounded-full border px-3 py-1 text-xs ${
+            metricsReady
+              ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-400"
+              : "border-amber-500/20 bg-amber-500/10 text-amber-400"
+          }`}
+        >
+          <span className={`h-1.5 w-1.5 rounded-full ${metricsReady ? "bg-emerald-400" : "animate-pulse bg-amber-400"}`} />
+          {metricsReady ? "Система активна" : "Инициализация метрик..."}
         </div>
       </div>
 
       {!metricsReady ? (
-        <div className="mt-4 grid grid-cols-4 gap-4">
+        <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
           {["cpu", "ram", "disk", "net"].map((key) => (
             <div key={key} className="h-32 animate-pulse rounded-xl border border-[#222b38] bg-[#111722]" />
           ))}
         </div>
       ) : (
-      <div className="mt-4 grid grid-cols-4 gap-4">
+      <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <MetricCard
           label="Процессор"
           value={`${metrics.cpu_usage.toFixed(1)}%`}
@@ -176,12 +182,12 @@ export function DashboardModule({ c }: { c: NexusController }) {
       </div>
       )}
 
-      <div className="mt-4 grid grid-cols-12 gap-4">
-        <div className="col-span-8">
+      <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-12">
+        <div className="min-w-0 lg:col-span-8">
           <LoadHistoryChart history={history} />
         </div>
 
-        <div className="col-span-4 flex flex-col gap-4">
+        <div className="flex min-w-0 flex-col gap-4 lg:col-span-4">
           <div className="rounded-xl border border-[#222b38] bg-[#111722] p-4">
             <div className="text-sm text-slate-400">Сетевое подключение</div>
             <div className="mt-3 flex items-end justify-between gap-3">

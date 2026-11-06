@@ -100,7 +100,7 @@ export function PowerModule({ c }: { c: NexusController }) {
         <p className="mt-0.5 text-sm text-slate-400">Таймеры автоматического выключения и системные действия</p>
       </div>
 
-      <div className="grid grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
         {actions.map((action) => {
           const Icon = action.icon;
           return (

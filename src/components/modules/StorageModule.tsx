@@ -115,9 +115,9 @@ export function StorageModule({ c }: { c: NexusController }) {
       transition={{ duration: 0.18, ease: "easeOut" }}
       className="w-full max-w-6xl space-y-4"
     >
-      <div className="rounded-xl border border-[#222b38] bg-[#111722] p-4">
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-          <div className="min-w-0">
+      <div className="min-w-0 rounded-xl border border-[#222b38] bg-[#111722] p-4">
+        <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+          <div className="min-w-0 flex-1">
             <div className="flex flex-wrap gap-2">
               {availableDrives.map((drive) => {
                 const selected = selectedDriveOrPath.toUpperCase() === drive.toUpperCase();
@@ -142,7 +142,7 @@ export function StorageModule({ c }: { c: NexusController }) {
                 );
               })}
             </div>
-            <div className="mt-3 font-mono text-2xl font-bold text-slate-100">
+            <div className="mt-3 truncate font-mono text-xl font-bold text-slate-100 sm:text-2xl">
               {freeGb !== null && totalGb !== null
                 ? `${freeGb.toFixed(0)} ГБ свободно`
                 : selectedLetter || "Диск"}
@@ -205,8 +205,8 @@ export function StorageModule({ c }: { c: NexusController }) {
       )}
 
       {scanResult && (
-        <div className="grid grid-cols-12 gap-4">
-          <div className="col-span-8 rounded-xl border border-[#222b38] bg-[#111722] p-4">
+        <div className="grid grid-cols-1 gap-4 xl:grid-cols-12">
+          <div className="min-w-0 rounded-xl border border-[#222b38] bg-[#111722] p-4 xl:col-span-8">
             <div className="mb-3 flex flex-wrap items-center gap-1 text-xs text-slate-400">
               {treemapStack.map((node, idx) => (
                 <span key={node.path + idx} className="flex items-center gap-1">
@@ -225,7 +225,7 @@ export function StorageModule({ c }: { c: NexusController }) {
                 </span>
               ))}
             </div>
-            <div className="relative h-80 overflow-hidden rounded-xl border border-[#222b38] bg-[#0e1118] p-1.5">
+            <div className="relative h-[min(20rem,42vh)] min-h-48 overflow-hidden rounded-xl border border-[#222b38] bg-[#0e1118] p-1.5">
               {treemapRects.length === 0 ? (
                 <div className="flex h-full items-center justify-center text-sm text-slate-400">
                   В этой папке нет вложенных каталогов
@@ -269,7 +269,7 @@ export function StorageModule({ c }: { c: NexusController }) {
             </div>
           </div>
 
-          <div className="col-span-4 flex max-h-[420px] flex-col rounded-xl border border-[#222b38] bg-[#111722] p-4">
+          <div className="flex max-h-[min(28rem,52vh)] min-h-0 min-w-0 flex-col rounded-xl border border-[#222b38] bg-[#111722] p-4 xl:col-span-4">
             <div className="flex items-center justify-between gap-2">
               <h3 className="text-sm font-semibold text-slate-100">Тяжёлые файлы</h3>
             </div>

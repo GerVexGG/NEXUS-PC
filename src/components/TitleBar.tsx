@@ -1,6 +1,19 @@
 import { ShieldAlert } from "lucide-react";
 
+const TAB_TITLES: Record<string, string> = {
+  dashboard: "Обзор системы",
+  hardware: "Аппаратный мониторинг",
+  network: "Сетевой монитор",
+  processes: "Диспетчер процессов",
+  startup: "Автозагрузка программ",
+  storage: "Накопители",
+  cleanup: "Центр очистки системы",
+  power: "Управление питанием",
+  drop: "NEXUS Drop",
+};
+
 interface TitleBarProps {
+  activeTab: string;
   isElevatedAdmin: boolean;
   adminError: string | null;
   onRestartAsAdmin: () => void;
@@ -8,6 +21,7 @@ interface TitleBarProps {
 }
 
 export function TitleBar({
+  activeTab,
   isElevatedAdmin,
   adminError,
   onRestartAsAdmin,
@@ -23,10 +37,9 @@ export function TitleBar({
         onDoubleClick={() => onToggleMaximize()}
         className="flex h-full flex-1 cursor-default items-center gap-2.5"
       >
-        <div className="pointer-events-none flex h-5 w-5 items-center justify-center rounded-md bg-white/[0.05] text-[11px] font-semibold text-slate-200">
-          N
-        </div>
-        <span className="pointer-events-none text-xs font-semibold text-slate-100">NEXUS PC</span>
+        <span className="pointer-events-none text-xs font-medium tracking-wide text-slate-400">
+          {TAB_TITLES[activeTab] ?? "Обзор системы"}
+        </span>
         {adminError && (
           <span className="pointer-events-none ml-2 max-w-xs truncate text-xs text-rose-400">{adminError}</span>
         )}

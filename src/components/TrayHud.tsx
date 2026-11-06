@@ -4,23 +4,27 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import type { Metrics } from "../lib/studio";
 
+interface RouteProbe {
+  label: string;
+  host: string;
+  ping_ms: number;
+  jitter_ms: number;
+}
+
 export function TrayHud() {
   const [metrics, setMetrics] = useState<Metrics | null>(null);
-  const [samples, setSamples] = useState<number[]>([]);
+  const [routes, setRoutes] = useState<RouteProbe[]>([]);
 
   useEffect(() => {
     let alive = true;
     const pull = async () => {
-      try {
-        const data = await invoke<Metrics>("get_system_metrics");
-        if (!alive) return;
-        setMetrics(data);
-        if (data.net_ping_ms > 0 && data.net_ping_ms < 999) {
-          setSamples((prev) => [...prev.slice(-7), data.net_ping_ms]);
-        }
-      } catch {
-        /* метрики появятся на следующем опросе */
-      }
+      const [metricsResult, routesResult] = await Promise.allSettled([
+        invoke<Metrics>("get_system_metrics"),
+        invoke<RouteProbe[]>("probe_game_routes"),
+      ]);
+      if (!alive) return;
+      if (metricsResult.status === "fulfilled") setMetrics(metricsResult.value);
+      if (routesResult.status === "fulfilled") setRoutes(routesResult.value);
     };
     void pull();
     const timer = window.setInterval(() => void pull(), 2000);
@@ -41,21 +45,24 @@ export function TrayHud() {
     };
   }, []);
 
-  const ping = metrics && metrics.net_ping_ms > 0 && metrics.net_ping_ms < 999 ? metrics.net_ping_ms : null;
-  const jitter = samples.length >= 2 ? Math.max(...samples) - Math.min(...samples) : null;
-  const stable = jitter !== null && jitter <= 10;
+  const gameRoute = routes.find((route) => route.label.includes("Москва") && route.ping_ms > 0);
+  const ping = gameRoute && gameRoute.ping_ms > 0 && gameRoute.ping_ms < 999 ? gameRoute.ping_ms : null;
+  const jitter = gameRoute ? gameRoute.jitter_ms : null;
+  const stable = jitter !== null && jitter <= 7;
 
   return (
     <div className="flex h-screen w-screen flex-col justify-between rounded-xl border border-[#222b38] bg-[#111722] p-3 text-slate-100">
       <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs">
         <span className="text-slate-400">Пинг</span>
         <span className={`text-right font-mono font-semibold ${ping === null ? "text-slate-400" : ping <= 80 ? "text-emerald-400" : ping <= 120 ? "text-amber-400" : "text-rose-400"}`}>
-          {ping === null ? "—" : `${ping} мс`}
+          {ping === null ? "—" : `${ping} ms`}
         </span>
         <span className="text-slate-400">Джиттер</span>
-        <span className="text-right font-mono font-semibold text-slate-100">{jitter === null ? "—" : `±${jitter} мс`}</span>
+        <span className="text-right font-mono font-semibold text-slate-100">{jitter === null ? "—" : `±${jitter} ms`}</span>
         <span className="text-slate-400">Стабильность</span>
-        <span className={`text-right ${stable ? "text-emerald-300" : "text-slate-400"}`}>{jitter === null ? "—" : stable ? "Стабильно" : "Пакетный джиттер"}</span>
+        <span className={`text-right ${jitter === null ? "text-slate-400" : stable ? "text-emerald-300" : "text-amber-300"}`}>
+          {jitter === null ? "Сбор данных" : stable ? "Стабильно" : "Пакетный джиттер"}
+        </span>
         <span className="text-slate-400">CPU</span>
         <span className="text-right font-mono">{metrics ? `${metrics.cpu_usage.toFixed(0)}%` : "—"}</span>
         <span className="text-slate-400">RAM</span>
