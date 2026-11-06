@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { ChevronDown, Minus, ShieldAlert, ShieldCheck, Square, X, XCircle } from "lucide-react";
+import { ChevronDown, ShieldAlert, ShieldCheck, XCircle } from "lucide-react";
 
 interface TitleBarProps {
   isElevatedAdmin: boolean;
@@ -9,7 +9,6 @@ interface TitleBarProps {
   setAdminMenuOpen: (value: boolean | ((prev: boolean) => boolean)) => void;
   adminError: string | null;
   onRestartAsAdmin: () => void;
-  onMinimize: () => void;
   onToggleMaximize: () => void;
   onClose: () => void;
 }
@@ -20,7 +19,6 @@ export function TitleBar({
   setAdminMenuOpen,
   adminError,
   onRestartAsAdmin,
-  onMinimize,
   onToggleMaximize,
   onClose,
 }: TitleBarProps) {
@@ -126,42 +124,15 @@ export function TitleBar({
                 <button
                   type="button"
                   onClick={onClose}
-                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-rose-500/15 text-[#8793a5] hover:text-rose-300 text-left text-[11px] transition-colors cursor-pointer"
+                  className="w-full flex items-center gap-2 px-2.5 py-2 rounded-lg bg-white/[0.03] hover:bg-rose-500/15 text-[#c5d0de] hover:text-rose-300 border border-[#222b38] text-left text-[11px] transition-colors cursor-pointer"
                 >
-                  <XCircle size={13} className="shrink-0" />
-                  <span>Завершить работу NEXUS PC</span>
+                  <XCircle size={14} className="shrink-0" />
+                  <span>Выход из приложения</span>
                 </button>
               </motion.div>
             )}
           </AnimatePresence>
         </div>
-
-        <div className="h-3.5 w-px bg-[#222b38] mx-0.5" />
-
-        <button
-          type="button"
-          onClick={onMinimize}
-          title="Свернуть"
-          className="h-7 w-8 inline-flex items-center justify-center rounded-md hover:bg-white/10 text-[#8793a5] hover:text-[#e8edf4] transition-colors cursor-pointer"
-        >
-          <Minus size={13} />
-        </button>
-        <button
-          type="button"
-          onClick={onToggleMaximize}
-          title="Развернуть / Оконный режим"
-          className="h-7 w-8 inline-flex items-center justify-center rounded-md hover:bg-white/10 text-[#8793a5] hover:text-[#e8edf4] transition-colors cursor-pointer"
-        >
-          <Square size={11} />
-        </button>
-        <button
-          type="button"
-          onClick={onClose}
-          title="Закрыть NEXUS PC"
-          className="h-7 w-8 inline-flex items-center justify-center rounded-md hover:bg-rose-500/20 hover:text-rose-400 text-[#8793a5] transition-colors cursor-pointer"
-        >
-          <X size={14} />
-        </button>
       </div>
     </header>
   );

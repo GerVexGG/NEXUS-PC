@@ -20,7 +20,7 @@ export default function App() {
   const c = useNexusController();
 
   return (
-    <div className="relative flex flex-col h-screen w-screen bg-[#07080b] obsidian-grid-bg text-[#e8edf4] select-none overflow-hidden font-sans border border-[#222b38]">
+    <div className="relative flex flex-col h-screen w-screen rounded-3xl overflow-hidden border border-[#222b38] bg-[#07080b] obsidian-grid-bg text-[#e8edf4] select-none font-sans">
       <div className="pointer-events-none absolute -top-40 left-40 h-96 w-96 rounded-full bg-sky-500/[0.05] blur-[130px]" />
       <div className="pointer-events-none absolute bottom-0 right-10 h-96 w-96 rounded-full bg-cyan-500/[0.045] blur-[140px]" />
 
@@ -30,7 +30,6 @@ export default function App() {
         setAdminMenuOpen={c.setAdminMenuOpen}
         adminError={c.adminError}
         onRestartAsAdmin={c.handleRestartAsAdmin}
-        onMinimize={c.handleWindowMinimize}
         onToggleMaximize={c.handleWindowToggleMaximize}
         onClose={c.handleWindowClose}
       />
