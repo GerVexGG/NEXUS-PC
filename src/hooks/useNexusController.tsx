@@ -34,6 +34,7 @@ export function useNexusController() {
   const [activeTab, setActiveTab] = useState<
     "dashboard" | "startup" | "storage" | "hardware" | "cleanup" | "power" | "processes" | "network" | "drop"
   >("dashboard");
+  const [metricsReady, setMetricsReady] = useState(false);
   const [metrics, setMetrics] = useState<Metrics>({
     cpu_usage: 0,
     ram_used_gb: 0,
@@ -63,6 +64,8 @@ export function useNexusController() {
   // Состояние модуля Storage Analyzer (Анализатор накопителей)
   const [availableDrives, setAvailableDrives] = useState<string[]>(["C:\\"]);
   const [selectedDriveOrPath, setSelectedDriveOrPath] = useState<string>("C:\\");
+  const selectedDriveRef = useRef(selectedDriveOrPath);
+  selectedDriveRef.current = selectedDriveOrPath;
   const [isScanning, setIsScanning] = useState<boolean>(false);
   const [scanElapsedSec, setScanElapsedSec] = useState<number>(0);
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
@@ -378,6 +381,7 @@ export function useNexusController() {
       try {
         const data = await invoke<Metrics>("get_system_metrics");
         setMetrics(data);
+        setMetricsReady(true);
 
         const nowLabel = new Date().toLocaleTimeString("ru-RU", {
           hour: "2-digit",
@@ -471,13 +475,19 @@ export function useNexusController() {
   }, [isScanning]);
 
   const handleStartStorageScan = async (targetPathOverride?: string) => {
-    const pathToScan = (targetPathOverride ?? selectedDriveOrPath).trim();
+    const pathToScan = (targetPathOverride ?? selectedDriveRef.current).trim();
     if (!pathToScan || isScanning) return;
 
     setIsScanning(true);
     setScanError(null);
+    setScanResult(null);
     try {
       const res = await invoke<ScanResult>("scan_storage", { path: pathToScan });
+      const current = selectedDriveRef.current.trim().replace(/[\\/]+$/g, "").toUpperCase();
+      const scanned = res.target_path.trim().replace(/[\\/]+$/g, "").toUpperCase();
+      if (current.slice(0, 2) !== scanned.slice(0, 2)) {
+        return;
+      }
       setScanResult(res);
       setTreemapStack([res.root_node]);
       setSelectedTreemapNode(res.root_node.children[0] ?? res.root_node);
@@ -521,6 +531,20 @@ export function useNexusController() {
           entry.id === item.id ? { ...entry, enabled: item.enabled } : entry
         )
       );
+    }
+  };
+
+  const handleRemoveStartup = async (item: StartupItem) => {
+    setStartupError(null);
+    try {
+      await invoke("remove_startup_entry", {
+        entryId: item.id,
+        source: item.location,
+      });
+      setStartupItems((prev) => prev.filter((entry) => entry.id !== item.id));
+    } catch (err) {
+      console.error("Ошибка удаления записи автозагрузки:", err);
+      setStartupError(String(err));
     }
   };
 
@@ -796,6 +820,7 @@ export function useNexusController() {
     activeTab,
     setActiveTab,
     metrics,
+    metricsReady,
     setMetrics,
     history,
     setHistory,
@@ -899,6 +924,7 @@ export function useNexusController() {
     handleStartStorageScan,
     handleOpenPathInExplorer,
     handleToggleStartup,
+    handleRemoveStartup,
     handleOpenItemLocation,
     handleStartTimer,
     handleCancelTimer,

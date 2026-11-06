@@ -1,3 +1,4 @@
+import { useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import {
   ChevronRight,
@@ -11,6 +12,53 @@ import {
 import { TREEMAP_PALETTE, formatBytes } from "../../lib/studio";
 import type { NexusController } from "../../hooks/useNexusController";
 
+function driveLabel(drive: string): string {
+  const letter = drive.replace(/[\\/]/g, "").toUpperCase();
+  if (letter.startsWith("C")) return "Локальный диск C:";
+  return `Диск ${letter.endsWith(":") ? letter : `${letter}:`}`;
+}
+
+function joinWin(parts: string[]): string {
+  if (parts.length === 0) return "";
+  if (parts[0].endsWith(":")) return `${parts[0]}\\${parts.slice(1).join("\\")}`;
+  return parts.join("\\");
+}
+
+function groupPrefix(kind: "game" | "program" | "folder"): string {
+  if (kind === "game") return "Игра";
+  if (kind === "program") return "Программа";
+  return "Папка";
+}
+
+function heavyGroup(path: string): { kind: "game" | "program" | "folder"; title: string; folder: string } {
+  const parts = path.replace(/\//g, "\\").split("\\").filter(Boolean);
+  const lower = parts.map((part) => part.toLowerCase());
+  let bestRank = 0;
+  let bestAt = -1;
+  let bestKind: "game" | "program" = "game";
+  const note = (rank: number, at: number, kind: "game" | "program") => {
+    if (at <= 0 || at >= parts.length - 1 || !parts[at] || rank <= bestRank) return;
+    bestRank = rank;
+    bestAt = at;
+    bestKind = kind;
+  };
+  for (let index = 0; index < lower.length; index += 1) {
+    if (lower[index] === "steamapps" && lower[index + 1] === "common") note(100, index + 2, "game");
+    if (lower[index] === "gog galaxy" && lower[index + 1] === "games") note(90, index + 2, "game");
+    if (lower[index] === "gog games" || lower[index] === "epic games") note(85, index + 1, "game");
+    if (lower[index] === "riot games") note(80, index + 1, "game");
+    if (lower[index] === "games") note(70, index + 1, "game");
+    if (lower[index] === "program files (x86)" || lower[index] === "program files") note(40, index + 1, "program");
+  }
+  if (bestAt > 0) {
+    return { kind: bestKind, title: parts[bestAt], folder: joinWin(parts.slice(0, bestAt + 1)) };
+  }
+  const root = parts[0]?.endsWith(":") ? 1 : 0;
+  const title = parts[root] && root < parts.length - 1 ? parts[root] : parts[parts.length - 2] || parts[0] || "";
+  const nameAt = parts[root] && root < parts.length - 1 ? root : Math.max(0, parts.length - 2);
+  return { kind: "folder", title, folder: joinWin(parts.slice(0, nameAt + 1)) };
+}
+
 export function StorageModule({ c }: { c: NexusController }) {
   const {
     metrics,
@@ -23,15 +71,28 @@ export function StorageModule({ c }: { c: NexusController }) {
     scanResult,
     scanError,
     treemapStack,
-    setTreemapStack,
     selectedTreemapNode,
     setSelectedTreemapNode,
     handleStartStorageScan,
     handleOpenPathInExplorer,
     treemapRects,
     filteredTopFiles,
+    setScanResult,
+    setTreemapStack,
   } = c;
 
+  const [heavyMode, setHeavyMode] = useState<"groups" | "files">("groups");
+  const heavyGroups = useMemo(() => {
+    const buckets = new Map<string, { kind: "game" | "program" | "folder"; title: string; folder: string; size: number }>();
+    for (const file of filteredTopFiles) {
+      const group = heavyGroup(file.path);
+      const key = group.folder.toLowerCase();
+      const current = buckets.get(key);
+      if (current) current.size += file.size_bytes;
+      else buckets.set(key, { ...group, size: file.size_bytes });
+    }
+    return [...buckets.values()].sort((a, b) => b.size - a.size);
+  }, [filteredTopFiles]);
   const selectedLetter = selectedDriveOrPath.trim().slice(0, 2).toUpperCase();
   const showsSystemVolume = selectedLetter.startsWith("C") || selectedDriveOrPath.trim() === "";
   const freeGb = showsSystemVolume ? metrics.disk_free_gb : null;
@@ -57,14 +118,19 @@ export function StorageModule({ c }: { c: NexusController }) {
                   <button
                     key={drive}
                     type="button"
-                    onClick={() => setSelectedDriveOrPath(drive)}
+                    onClick={() => {
+                      if (selected) return;
+                      setSelectedDriveOrPath(drive);
+                      setScanResult(null);
+                      setTreemapStack([]);
+                    }}
                     className={`rounded-lg border px-3 py-1.5 text-sm font-medium ${
                       selected
                         ? "border-sky-500/30 bg-sky-500/10 text-sky-300"
                         : "border-[#222b38] bg-[#151c27] text-slate-300 hover:bg-[#1a2332]"
                     }`}
                   >
-                    {drive.replace("\\", "")}
+                    {driveLabel(drive)}
                   </button>
                 );
               })}
@@ -205,19 +271,71 @@ export function StorageModule({ c }: { c: NexusController }) {
           </div>
 
           <div className="col-span-4 flex max-h-[420px] flex-col rounded-xl border border-[#222b38] bg-[#111722] p-4">
-            <h3 className="text-sm font-semibold text-slate-100">Тяжёлые файлы</h3>
-            <p className="mb-3 mt-1 text-xs text-slate-400">{filteredTopFiles.length} самых крупных</p>
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="text-sm font-semibold text-slate-100">Тяжёлые файлы</h3>
+            </div>
+            <div className="mb-3 mt-2 flex gap-1">
+              {(
+                [
+                  ["groups", "Тяжёлые папки и игры"],
+                  ["files", "Одиночные файлы"],
+                ] as const
+              ).map(([id, label]) => (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => setHeavyMode(id)}
+                  className={`rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                    heavyMode === id
+                      ? "border-sky-500/30 bg-sky-500/10 text-sky-300"
+                      : "border-[#222b38] bg-[#151c27] text-slate-400 hover:text-slate-200"
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
             <div className="min-h-0 flex-1 space-y-2 overflow-y-auto">
               {filteredTopFiles.length === 0 ? (
                 <p className="text-sm text-slate-400">Крупные файлы не найдены</p>
+              ) : heavyMode === "groups" ? (
+                heavyGroups.map((group) => (
+                  <div key={group.folder} className="rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="truncate text-sm text-slate-100">
+                          [{groupPrefix(group.kind)}] {group.title}
+                        </div>
+                        <div className="mt-1 truncate font-mono text-[11px] text-slate-500" title={group.folder}>
+                          {group.folder}
+                        </div>
+                      </div>
+                      <span className="shrink-0 font-mono text-xs text-cyan-400">{formatBytes(group.size)}</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void handleOpenPathInExplorer(group.folder)}
+                      className="mt-2 inline-flex items-center gap-1.5 text-xs text-slate-300 hover:text-slate-100"
+                    >
+                      <FolderOpen size={12} />
+                      Открыть
+                    </button>
+                  </div>
+                ))
               ) : (
-                filteredTopFiles.map((file, idx) => (
+                filteredTopFiles.map((file, idx) => {
+                  const group = heavyGroup(file.path);
+                  return (
                   <div key={file.path + idx} className="rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2">
                     <div className="flex items-start justify-between gap-2">
                       <div className="min-w-0">
-                        <div className="flex items-center gap-2">
-                          <FileText size={14} className="shrink-0 text-slate-400" />
-                          <span className="truncate text-sm text-slate-100">{file.name}</span>
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2">
+                            <FileText size={14} className="shrink-0 text-slate-400" />
+                            <span className="truncate text-sm text-slate-100">
+                              [{groupPrefix(group.kind)}] {group.title}
+                            </span>
+                          </div>
                         </div>
                         <div className="mt-1 truncate font-mono text-[11px] text-slate-500" title={file.path}>
                           {file.path}
@@ -234,7 +352,8 @@ export function StorageModule({ c }: { c: NexusController }) {
                       Открыть расположение
                     </button>
                   </div>
-                ))
+                  );
+                })
               )}
             </div>
           </div>

@@ -369,7 +369,7 @@ export function ProcessModule({ c }: { c: NexusController }) {
             style={{ left: processMenu.x, top: processMenu.y, transformOrigin: "top left" }}
             onMouseDown={(e) => e.stopPropagation()}
             onContextMenu={(e) => e.preventDefault()}
-            className="fixed z-[100] w-62 rounded-xl backdrop-blur-2xl bg-[#111722]/97 border border-white/[0.12] shadow-[0_18px_44px_rgba(0,0,0,0.85)] p-1.5 font-mono text-xs"
+            className="fixed z-[100] w-62 rounded-xl bg-[#111722] border border-white/[0.12] shadow-[0_18px_44px_rgba(0,0,0,0.85)] p-1.5 font-mono text-xs"
           >
             <div className="px-2.5 py-2 mb-1 rounded-lg bg-[#151c27] border border-white/[0.06]">
               <div className="text-[#e8edf4] font-bold truncate">{processMenu.process.name}</div>

@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -5,6 +6,7 @@ use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::{Disks, Networks, System};
@@ -53,6 +55,7 @@ pub struct StartupItem {
     pub location: String,   // "HKCU (Реестр)", "HKLM (Система)", "Папка Автозагрузка"
     pub enabled: bool,      // активна ли запись
     pub file_exists: bool,  // существует ли физический файл на диске
+    pub phantom: bool,      // ключ StartupApproved без живой программы
 }
 
 // Структуры модуля Storage Analyzer (Анализатор накопителей)
@@ -62,6 +65,7 @@ pub struct FileEntry {
     pub name: String,
     pub size_bytes: u64,
     pub extension: String,
+    pub app_label: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -204,14 +208,16 @@ pub struct NetworkConnection {
 
 // Хранилище состояния приложения
 pub struct AppState {
-    pub sys: Mutex<System>,
-    pub networks: Mutex<Networks>,
+    pub sys: Arc<Mutex<System>>,
+    pub networks: Arc<Mutex<Networks>>,
+    pub disk_space: Arc<Mutex<(u64, u64)>>,
     pub ping_cache: Mutex<(u32, Option<Instant>)>,
     pub process_last_refresh: Mutex<Option<Instant>>,
     pub hw_telemetry: Arc<Mutex<Option<HardwareTelemetry>>>,
     pub hw_sidecar_child: Arc<Mutex<Option<Child>>>,
     pub icon_cache: Mutex<HashMap<String, String>>,
     pub drop_hub: Arc<drop_server::DropHub>,
+    pub tray_ping_item: Mutex<Option<tauri::menu::MenuItem<tauri::Wry>>>,
 }
 
 impl Drop for AppState {
@@ -228,6 +234,11 @@ impl Drop for AppState {
 fn find_hwmon_sidecar_exe() -> Option<PathBuf> {
     let candidates = [
         // Корень проекта Nexus/hwmon-sidecar (при запуске из src-tauri или из корня Nexus)
+        PathBuf::from("nexus-hwmon.exe"),
+        PathBuf::from("../src-tauri/nexus-hwmon.exe"),
+        PathBuf::from("src-tauri/nexus-hwmon.exe"),
+        PathBuf::from("../hwmon-sidecar/bin/Release/net9.0/win-x64/publish/nexus-hwmon.exe"),
+        PathBuf::from("hwmon-sidecar/bin/Release/net9.0/win-x64/publish/nexus-hwmon.exe"),
         PathBuf::from("../hwmon-sidecar/bin/publish/nexus-hwmon.exe"),
         PathBuf::from("hwmon-sidecar/bin/publish/nexus-hwmon.exe"),
         PathBuf::from("../hwmon-sidecar/bin/Release/net9.0/win-x64/nexus-hwmon.exe"),
@@ -248,6 +259,10 @@ fn find_hwmon_sidecar_exe() -> Option<PathBuf> {
             let near_exe = exe_dir.join("nexus-hwmon.exe");
             if near_exe.exists() {
                 return Some(near_exe);
+            }
+            let beside_manifest = exe_dir.join("../../nexus-hwmon.exe");
+            if beside_manifest.exists() {
+                return Some(beside_manifest);
             }
             // При запуске из src-tauri/target/debug поднимаемся на 3 уровня к Nexus/hwmon-sidecar
             let from_target_root = exe_dir.join("../../../hwmon-sidecar/bin/publish/nexus-hwmon.exe");
@@ -421,6 +436,69 @@ fn get_hardware_telemetry(state: State<'_, AppState>) -> Result<HardwareTelemetr
     })
 }
 
+// Раскрытие переменных окружения Windows (%APPDATA%, %LOCALAPPDATA%, %ProgramFiles% и остальных).
+fn expand_environment_path(input: &str) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn ExpandEnvironmentStringsW(src: *const u16, dst: *mut u16, size: u32) -> u32;
+        }
+
+        let wide: Vec<u16> = std::ffi::OsStr::new(input)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            let needed = ExpandEnvironmentStringsW(wide.as_ptr(), std::ptr::null_mut(), 0);
+            if needed > 1 {
+                let mut buf = vec![0u16; needed as usize];
+                let written = ExpandEnvironmentStringsW(wide.as_ptr(), buf.as_mut_ptr(), needed);
+                if written > 0 {
+                    let end = buf.iter().position(|unit| *unit == 0).unwrap_or(buf.len());
+                    return OsString::from_wide(&buf[..end]).to_string_lossy().into_owned();
+                }
+            }
+        }
+    }
+    expand_env_vars(input)
+}
+
+fn cut_executable_path(input: &str) -> String {
+    let lower = input.to_ascii_lowercase();
+    for ext in [".exe", ".lnk", ".bat", ".cmd", ".com", ".msc"] {
+        let mut from = 0usize;
+        while let Some(rel) = lower[from..].find(ext) {
+            let end = from + rel + ext.len();
+            let next = input[end..].chars().next();
+            if next.is_none() || matches!(next, Some(' ' | '\t' | '"' | '/' | ',')) {
+                return input[..end].trim().trim_matches('"').to_string();
+            }
+            from = end;
+        }
+    }
+    input.trim().trim_matches('"').to_string()
+}
+
+/// Раскрывает переменные, снимает кавычки и отрезает аргументы после исполняемого файла.
+fn sanitize_launch_path(raw: &str) -> String {
+    let expanded = expand_environment_path(raw.trim());
+    let trimmed = expanded.trim();
+    let unquoted = if let Some(stripped) = trimmed.strip_prefix('"') {
+        if let Some(end) = stripped.find('"') {
+            stripped[..end].trim().to_string()
+        } else {
+            stripped.trim_matches('"').trim().to_string()
+        }
+    } else {
+        trimmed.trim_matches('"').trim().to_string()
+    };
+    cut_executable_path(&unquoted)
+}
+
 // Раскрытие переменных окружения Windows вида %VAR%
 fn expand_env_vars(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
@@ -456,39 +534,35 @@ fn expand_env_vars(input: &str) -> String {
     result
 }
 
-// Извлечение чистого пути к исполняемому файлу из строки команды реестра
-fn extract_clean_path(raw_command: &str) -> String {
-    let expanded = expand_env_vars(raw_command.trim());
-    if expanded.is_empty() {
-        return String::new();
-    }
-
-    let candidate = if let Some(stripped) = expanded.strip_prefix('"') {
-        if let Some(end_quote) = stripped.find('"') {
-            stripped[..end_quote].trim().to_string()
-        } else {
-            stripped.trim().to_string()
-        }
-    } else {
-        let lower = expanded.to_lowercase();
-        let mut cut = None;
-        for ext in [".exe", ".bat", ".cmd", ".com", ".msc"] {
-            if let Some(pos) = lower.find(ext) {
-                cut = Some(pos + ext.len());
-                break;
+fn exe_span(expanded: &str) -> Option<String> {
+    let lower = expanded.to_lowercase();
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find(".exe") {
+        let start = from + rel;
+        let end = start + 4;
+        let next = lower[end..].chars().next();
+        if next.is_none() || !next.is_some_and(|ch| ch.is_ascii_alphanumeric()) {
+            let mut head = expanded[..end].trim().to_string();
+            if let Some(quote) = head.rfind('"') {
+                head = head[quote + 1..].trim().to_string();
+            }
+            head = head.trim_matches('"').trim().to_string();
+            if !head.is_empty() {
+                return Some(head);
             }
         }
-        if let Some(end_idx) = cut {
-            expanded[..end_idx].trim().to_string()
-        } else {
-            expanded
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_string()
-        }
-    };
+        from = end;
+    }
+    None
+}
+
+// Извлечение чистого пути к исполняемому файлу из строки команды реестра
+fn extract_clean_path(raw_command: &str) -> String {
+    let expanded = expand_environment_path(raw_command.trim());
+    let candidate = exe_span(&expanded).unwrap_or_else(|| sanitize_launch_path(&expanded));
+    if candidate.is_empty() {
+        return String::new();
+    }
 
     if !candidate.is_empty() && !candidate.contains('\\') && !candidate.contains('/') {
         if let Ok(windir) = std::env::var("WINDIR") {
@@ -507,9 +581,24 @@ fn extract_clean_path(raw_command: &str) -> String {
 }
 
 #[cfg(target_os = "windows")]
+fn startup_approved_disabled(root: winreg::HKEY, subkey: &str, name: &str) -> bool {
+    let Ok(key) = RegKey::predef(root).open_subkey_with_flags(subkey, KEY_READ) else {
+        return false;
+    };
+    let Ok(raw) = key.get_raw_value(name) else {
+        return false;
+    };
+    match raw.bytes.first().copied() {
+        None | Some(0x02) => false,
+        Some(0x03) => true,
+        Some(byte) => byte % 2 == 1,
+    }
+}
+
 fn read_registry_run_items(
     root: winreg::HKEY,
     subkey_path: &str,
+    access: u32,
     source_tag: &str,
     location_label: &str,
     enabled: bool,
@@ -517,7 +606,7 @@ fn read_registry_run_items(
     items: &mut Vec<StartupItem>,
 ) {
     let hive = RegKey::predef(root);
-    let Ok(key) = hive.open_subkey_with_flags(subkey_path, KEY_READ) else {
+    let Ok(key) = hive.open_subkey_with_flags(subkey_path, access) else {
         return;
     };
 
@@ -538,7 +627,26 @@ fn read_registry_run_items(
         }
 
         let clean_path = extract_clean_path(&command);
-        let file_exists = !clean_path.is_empty() && Path::new(&clean_path).exists();
+        let file_exists = startup_target_exists(&clean_path);
+        let approved_off = enabled
+            && match source_tag {
+                "HKCU_RUN" => startup_approved_disabled(
+                    HKEY_CURRENT_USER,
+                    r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
+                    &name,
+                ),
+                "HKLM_RUN" => startup_approved_disabled(
+                    HKEY_LOCAL_MACHINE,
+                    r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
+                    &name,
+                ),
+                "HKLM_WOW64_RUN" => startup_approved_disabled(
+                    HKEY_LOCAL_MACHINE,
+                    r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32",
+                    &name,
+                ),
+                _ => false,
+            };
 
         items.push(StartupItem {
             id,
@@ -546,13 +654,20 @@ fn read_registry_run_items(
             command,
             clean_path,
             location: location_label.to_string(),
-            enabled,
+            enabled: enabled && !approved_off,
             file_exists,
+            phantom: false,
         });
     }
 }
 
-fn scan_startup_folder(dir_path: &Path, items: &mut Vec<StartupItem>, seen_ids: &mut HashSet<String>) {
+fn scan_startup_folder(
+    dir_path: &Path,
+    location_label: &str,
+    approved_root: Option<winreg::HKEY>,
+    items: &mut Vec<StartupItem>,
+    seen_ids: &mut HashSet<String>,
+) {
     let Ok(entries) = std::fs::read_dir(dir_path) else {
         return;
     };
@@ -562,7 +677,10 @@ fn scan_startup_folder(dir_path: &Path, items: &mut Vec<StartupItem>, seen_ids: 
             continue;
         };
         let path = entry.path();
-        if !path.is_file() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
             continue;
         }
 
@@ -596,16 +714,39 @@ fn scan_startup_folder(dir_path: &Path, items: &mut Vec<StartupItem>, seen_ids: 
             .unwrap_or_else(|| file_name.clone());
 
         let actual_path_str = path.to_string_lossy().to_string();
-        let file_exists = path.exists();
+        let resolved_target = if actual_path_str.to_ascii_lowercase().contains(".lnk") {
+            shortcut_target(Path::new(&actual_path_str))
+        } else {
+            None
+        };
+        let clean_path = resolved_target.clone().unwrap_or_else(|| actual_path_str.clone());
+        let file_exists = if actual_path_str.to_ascii_lowercase().contains(".lnk") {
+            resolved_target
+                .as_ref()
+                .is_some_and(|target| Path::new(target).exists())
+        } else {
+            path.exists()
+        };
+        let approved_off = enabled
+            && approved_root
+                .map(|root| {
+                    startup_approved_disabled(
+                        root,
+                        r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder",
+                        &file_name,
+                    )
+                })
+                .unwrap_or(false);
 
         items.push(StartupItem {
             id,
             name: display_name,
             command: actual_path_str.clone(),
-            clean_path: actual_path_str,
-            location: "Папка Автозагрузка".to_string(),
-            enabled,
+            clean_path,
+            location: location_label.to_string(),
+            enabled: enabled && !approved_off,
             file_exists,
+            phantom: false,
         });
     }
 }
@@ -620,6 +761,7 @@ fn get_startup_items() -> Result<Vec<StartupItem>, String> {
         read_registry_run_items(
             HKEY_CURRENT_USER,
             RUN_KEY_PATH,
+            KEY_READ,
             "HKCU_RUN",
             "HKCU (Реестр)",
             true,
@@ -629,6 +771,7 @@ fn get_startup_items() -> Result<Vec<StartupItem>, String> {
         read_registry_run_items(
             HKEY_LOCAL_MACHINE,
             RUN_KEY_PATH,
+            KEY_READ | KEY_WOW64_64KEY,
             "HKLM_RUN",
             "HKLM (Система)",
             true,
@@ -638,6 +781,7 @@ fn get_startup_items() -> Result<Vec<StartupItem>, String> {
         read_registry_run_items(
             HKEY_LOCAL_MACHINE,
             RUN_WOW64_KEY_PATH,
+            KEY_READ | KEY_WOW64_64KEY,
             "HKLM_WOW64_RUN",
             "HKLM (Система)",
             true,
@@ -655,6 +799,7 @@ fn get_startup_items() -> Result<Vec<StartupItem>, String> {
             read_registry_run_items(
                 HKEY_CURRENT_USER,
                 &subkey,
+                KEY_READ,
                 source_tag,
                 location_label,
                 false,
@@ -666,6 +811,7 @@ fn get_startup_items() -> Result<Vec<StartupItem>, String> {
         read_registry_run_items(
             HKEY_CURRENT_USER,
             NEXUS_DISABLED_REG_BASE,
+            KEY_READ,
             "HKCU_RUN",
             "HKCU (Реестр)",
             false,
@@ -681,21 +827,513 @@ fn get_startup_items() -> Result<Vec<StartupItem>, String> {
             .join("Start Menu")
             .join("Programs")
             .join("Startup");
-        scan_startup_folder(&user_startup, &mut items, &mut seen_ids);
+        scan_startup_folder(
+            &user_startup,
+            "Папка Автозагрузка",
+            Some(HKEY_CURRENT_USER),
+            &mut items,
+            &mut seen_ids,
+        );
     }
 
-    if let Ok(all_users) = std::env::var("ALLUSERSPROFILE") {
-        let common_startup: PathBuf = Path::new(&all_users)
+    let program_data = std::env::var("PROGRAMDATA")
+        .or_else(|_| std::env::var("ALLUSERSPROFILE"))
+        .ok();
+    if let Some(program_data) = program_data {
+        let common_startup: PathBuf = Path::new(&program_data)
             .join("Microsoft")
             .join("Windows")
             .join("Start Menu")
             .join("Programs")
             .join("Startup");
-        scan_startup_folder(&common_startup, &mut items, &mut seen_ids);
+        scan_startup_folder(
+            &common_startup,
+            "Общая автозагрузка",
+            Some(HKEY_LOCAL_MACHINE),
+            &mut items,
+            &mut seen_ids,
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        append_msix_startup(&mut items, &mut seen_ids);
+        append_orphan_approved(&mut items, &mut seen_ids);
     }
 
     items.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     Ok(items)
+}
+
+fn pretty_store_name(family: &str) -> String {
+    let base = family.split('_').next().unwrap_or(family);
+    let short = base.rsplit('.').next().unwrap_or(base);
+    short.replace('-', " ")
+}
+
+#[allow(dead_code)]
+fn name_already_listed(items: &[StartupItem], name: &str) -> bool {
+    items.iter().any(|item| item.name.eq_ignore_ascii_case(name))
+}
+
+#[cfg(target_os = "windows")]
+fn append_msix_startup(items: &mut Vec<StartupItem>, seen_ids: &mut HashSet<String>) {
+    let base = r"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData";
+    let Ok(root) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(base) else {
+        return;
+    };
+    for family in root.enum_keys().filter_map(|item| item.ok()) {
+        let tasks_path = format!(r"{}\{}\StartupTasks", base, family);
+        let Ok(tasks) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(&tasks_path) else {
+            continue;
+        };
+        for task in tasks.enum_keys().filter_map(|item| item.ok()) {
+            let Ok(task_key) = tasks.open_subkey(&task) else {
+                continue;
+            };
+            let state: u32 = task_key.get_value("State").unwrap_or(2);
+            let id = format!("msix|{}|{}", family, task);
+            if !seen_ids.insert(id.clone()) {
+                continue;
+            }
+            let name = pretty_store_name(&family);
+            items.push(StartupItem {
+                id,
+                name,
+                command: task,
+                clean_path: String::new(),
+                location: "Приложение Store".to_string(),
+                enabled: state == 2 || state == 4,
+                file_exists: true,
+                phantom: false,
+            });
+        }
+    }
+}
+
+fn normalize_token(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn startup_alias(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('"')
+        .to_lowercase()
+        .trim_end_matches(".disabled")
+        .trim_end_matches(".lnk")
+        .trim_end_matches(".exe")
+        .to_string()
+}
+
+fn remember_name(bucket: &mut HashSet<String>, value: &str) {
+    let alias = startup_alias(value);
+    if alias.is_empty() {
+        return;
+    }
+    bucket.insert(alias.clone());
+    let token = normalize_token(&alias);
+    if token.len() >= 4 {
+        bucket.insert(token);
+    }
+}
+
+fn names_match(approved: &str, known: &HashSet<String>) -> bool {
+    let alias = startup_alias(approved);
+    if alias.is_empty() {
+        return false;
+    }
+    if known.contains(&alias) {
+        return true;
+    }
+    let token = normalize_token(&alias);
+    if token.len() >= 4 && known.contains(&token) {
+        return true;
+    }
+    if token.len() < 6 {
+        return false;
+    }
+    known.iter().any(|candidate| {
+        let other = if candidate.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+            candidate.clone()
+        } else {
+            normalize_token(candidate)
+        };
+        other.len() >= 6 && (token.contains(&other) || other.contains(&token))
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn collect_run_value_names() -> HashSet<String> {
+    let mut names = HashSet::new();
+    let keys = [
+        (HKEY_CURRENT_USER, RUN_KEY_PATH, KEY_READ),
+        (HKEY_LOCAL_MACHINE, RUN_KEY_PATH, KEY_READ | KEY_WOW64_64KEY),
+        (HKEY_LOCAL_MACHINE, RUN_WOW64_KEY_PATH, KEY_READ | KEY_WOW64_64KEY),
+    ];
+    for (root, path, access) in keys {
+        let Ok(key) = RegKey::predef(root).open_subkey_with_flags(path, access) else {
+            continue;
+        };
+        for item in key.enum_values().filter_map(|entry| entry.ok()) {
+            remember_name(&mut names, &item.0);
+        }
+    }
+    names
+}
+
+#[cfg(target_os = "windows")]
+fn collect_startup_file_names() -> HashSet<String> {
+    let mut names = HashSet::new();
+    let mut folders = Vec::new();
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        folders.push(
+            Path::new(&appdata)
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs")
+                .join("Startup"),
+        );
+    }
+    if let Ok(program_data) = std::env::var("PROGRAMDATA").or_else(|_| std::env::var("ALLUSERSPROFILE")) {
+        folders.push(
+            Path::new(&program_data)
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs")
+                .join("Startup"),
+        );
+    }
+    for folder in folders {
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.eq_ignore_ascii_case("desktop.ini") {
+                continue;
+            }
+            remember_name(&mut names, &file_name);
+        }
+    }
+    names
+}
+
+#[cfg(target_os = "windows")]
+fn walk_task_tree(key: &RegKey, names: &mut HashSet<String>, depth: u8) {
+    if depth > 8 {
+        return;
+    }
+    for subkey in key.enum_keys().filter_map(|item| item.ok()) {
+        remember_name(names, &subkey);
+        if let Ok(child) = key.open_subkey(&subkey) {
+            walk_task_tree(&child, names, depth + 1);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn collect_scheduled_task_names() -> HashSet<String> {
+    let mut names = HashSet::new();
+    if let Ok(root) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(
+        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree",
+        KEY_READ | KEY_WOW64_64KEY,
+    ) {
+        walk_task_tree(&root, &mut names, 0);
+    }
+
+    let mut cmd = Command::new("schtasks");
+    cmd.args(["/query", "/fo", "csv"]);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    if let Ok(output) = cmd.output() {
+        if output.status.success() {
+            let text = decode_command_output(&output.stdout);
+            for line in text.lines().skip(1) {
+                let cells = split_csv_line(line);
+                let Some(task) = cells.first() else {
+                    continue;
+                };
+                if task.to_lowercase().contains("\\microsoft\\") {
+                    continue;
+                }
+                let short = task.rsplit(['\\', '/']).next().unwrap_or(task);
+                remember_name(&mut names, short);
+            }
+        }
+    }
+    names
+}
+
+fn collect_install_names(dir: &Path, depth: u8, names: &mut HashSet<String>) {
+    if depth > 2 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let low = file_name.to_lowercase();
+        if low.starts_with('.') || low == "common files" || low == "windowsapps" {
+            continue;
+        }
+        remember_name(names, &file_name);
+        let path = entry.path();
+        if path.is_dir() {
+            collect_install_names(&path, depth + 1, names);
+        }
+    }
+}
+
+fn collect_program_names() -> HashSet<String> {
+    let mut names = HashSet::new();
+    let mut roots = Vec::new();
+    for var in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA", "APPDATA"] {
+        if let Ok(value) = std::env::var(var) {
+            if !value.is_empty() {
+                roots.push(PathBuf::from(value));
+            }
+        }
+    }
+    for root in roots {
+        collect_install_names(&root, 0, &mut names);
+    }
+    names
+}
+
+#[cfg(target_os = "windows")]
+fn append_orphan_approved(items: &mut Vec<StartupItem>, seen_ids: &mut HashSet<String>) {
+    let mut known = collect_run_value_names();
+    for name in collect_startup_file_names() {
+        known.insert(name);
+    }
+    for name in collect_scheduled_task_names() {
+        known.insert(name);
+    }
+    for name in collect_program_names() {
+        known.insert(name);
+    }
+
+    let sources = [
+        (
+            HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
+            "HKCU Run",
+        ),
+        (
+            HKEY_LOCAL_MACHINE,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
+            "HKLM Run",
+        ),
+        (
+            HKEY_LOCAL_MACHINE,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32",
+            "HKLM Run32",
+        ),
+        (
+            HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder",
+            "HKCU StartupFolder",
+        ),
+        (
+            HKEY_LOCAL_MACHINE,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder",
+            "HKLM StartupFolder",
+        ),
+    ];
+    for (root, path, label) in sources {
+        let Ok(key) = RegKey::predef(root).open_subkey(path) else {
+            continue;
+        };
+        for (name, _value) in key.enum_values().filter_map(|item| item.ok()) {
+            if name.trim().is_empty() || names_match(&name, &known) {
+                continue;
+            }
+            let id = format!("approved|{label}|{name}");
+            if !seen_ids.insert(id.clone()) {
+                continue;
+            }
+            items.push(StartupItem {
+                id,
+                name,
+                command: String::new(),
+                clean_path: String::new(),
+                location: "Осиротевшая запись реестра".to_string(),
+                enabled: false,
+                file_exists: false,
+                phantom: true,
+            });
+        }
+    }
+}
+
+fn decode_command_output(bytes: &[u8]) -> String {
+    let utf16 = bytes.starts_with(&[0xFF, 0xFE])
+        || bytes.windows(4).take(8).any(|chunk| chunk[1] == 0 && chunk[3] == 0);
+    if utf16 {
+        let words: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        return String::from_utf16_lossy(&words)
+            .trim_start_matches('\u{feff}')
+            .trim()
+            .to_string();
+    }
+    String::from_utf8_lossy(bytes).trim().to_string()
+}
+
+fn hidden_powershell(script: &str) -> Result<String, String> {
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let output = cmd
+        .output()
+        .map_err(|e| format!("Не удалось запустить PowerShell: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "Команда PowerShell завершилась с ошибкой".to_string()
+        } else {
+            stderr
+        });
+    }
+    Ok(decode_command_output(&output.stdout))
+}
+
+#[allow(dead_code)]
+fn append_cim_startup(items: &mut Vec<StartupItem>, seen_ids: &mut HashSet<String>) {
+    let Ok(text) = hidden_powershell(
+        "Get-CimInstance Win32_StartupCommand | Select-Object Name,Command,Location | ConvertTo-Json -Compress",
+    ) else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return;
+    };
+    let entries = match value {
+        serde_json::Value::Array(list) => list,
+        other => vec![other],
+    };
+    for entry in entries {
+        let Some(name) = entry.get("Name").and_then(|v| v.as_str()).map(str::trim) else {
+            continue;
+        };
+        if name.is_empty() || name_already_listed(items, name) {
+            continue;
+        }
+        let id = format!("cim|{}", name.to_lowercase());
+        if !seen_ids.insert(id.clone()) {
+            continue;
+        }
+        let command = entry
+            .get("Command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let location = entry
+            .get("Location")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Win32_StartupCommand");
+        let clean_path = extract_clean_path(&command);
+        items.push(StartupItem {
+            id,
+            name: name.to_string(),
+            command,
+            file_exists: startup_target_exists(&clean_path),
+            clean_path,
+            location: format!("CIM · {}", location),
+            enabled: true,
+            phantom: false,
+        });
+    }
+}
+
+fn split_csv_line(line: &str) -> Vec<String> {
+    let mut cells = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for ch in line.chars() {
+        match ch {
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                cells.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    cells.push(current.trim().to_string());
+    cells
+}
+
+#[allow(dead_code)]
+fn append_logon_tasks(items: &mut Vec<StartupItem>, seen_ids: &mut HashSet<String>) {
+    let mut cmd = Command::new("schtasks");
+    cmd.args(["/query", "/fo", "csv", "/v"]);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let Ok(output) = cmd.output() else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let text = decode_command_output(&output.stdout);
+    let mut lines = text.lines();
+    let Some(header) = lines.next() else {
+        return;
+    };
+    let columns = split_csv_line(header);
+    let name_idx = columns.iter().position(|cell| {
+        let low = cell.to_lowercase();
+        low.contains("taskname") || low.contains("имя задачи")
+    });
+    let Some(name_idx) = name_idx else {
+        return;
+    };
+    for line in lines {
+        let cells = split_csv_line(line);
+        let blob = cells.join(" ").to_lowercase();
+        let logon = blob.contains("at logon")
+            || blob.contains("at log on")
+            || blob.contains("при входе")
+            || blob.contains("onlogon");
+        if !logon {
+            continue;
+        }
+        let Some(task_name) = cells.get(name_idx).map(|s| s.trim()) else {
+            continue;
+        };
+        if task_name.is_empty() || task_name.to_lowercase().contains("\\microsoft\\") {
+            continue;
+        }
+        let short = task_name.rsplit('\\').next().unwrap_or(task_name);
+        if name_already_listed(items, short) {
+            continue;
+        }
+        let id = format!("task|{}", task_name.to_lowercase());
+        if !seen_ids.insert(id.clone()) {
+            continue;
+        }
+        items.push(StartupItem {
+            id,
+            name: short.to_string(),
+            command: task_name.to_string(),
+            clean_path: String::new(),
+            location: "Планировщик · вход в систему".to_string(),
+            enabled: !blob.contains("disabled") && !blob.contains("отключено"),
+            file_exists: true,
+            phantom: false,
+        });
+    }
 }
 
 #[tauri::command]
@@ -796,36 +1434,394 @@ fn toggle_startup_item(id: String, enable: bool) -> Result<(), String> {
     Err("Неизвестный формат идентификатора автозагрузки".to_string())
 }
 
+fn startup_target_exists(clean_path: &str) -> bool {
+    if clean_path.is_empty() {
+        return false;
+    }
+    let path = Path::new(clean_path);
+    if !path.exists() {
+        return false;
+    }
+    if clean_path.to_ascii_lowercase().contains(".lnk") {
+        return shortcut_target(path).is_some_and(|target| Path::new(&target).exists());
+    }
+    true
+}
+
+fn shortcut_target(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let raw = parse_shell_link_target(&bytes).or_else(|| find_embedded_path(&bytes));
+    let raw = raw.or_else(|| shortcut_target_via_shell(path))?;
+    let expanded = expand_environment_path(raw.trim().trim_matches('"'));
+    if expanded.is_empty() {
+        return None;
+    }
+    let target = Path::new(&expanded);
+    if target.is_absolute() {
+        Some(expanded)
+    } else {
+        path.parent()
+            .map(|parent| parent.join(target).to_string_lossy().into_owned())
+            .or(Some(expanded))
+    }
+}
+
+fn shortcut_target_via_shell(path: &Path) -> Option<String> {
+    let escaped = path.to_string_lossy().replace('\'', "''");
+    let script = format!(
+        "(New-Object -ComObject WScript.Shell).CreateShortcut('{escaped}').TargetPath"
+    );
+    let text = hidden_powershell(&script).ok()?;
+    let line = text.lines().find(|line| !line.trim().is_empty())?.trim().to_string();
+    if line.is_empty() { None } else { Some(line) }
+}
+
+fn read_cstr(bytes: &[u8], offset: usize) -> Option<String> {
+    if offset == 0 || offset >= bytes.len() {
+        return None;
+    }
+    let end = bytes[offset..].iter().position(|byte| *byte == 0).map(|pos| offset + pos)?;
+    let text = String::from_utf8_lossy(&bytes[offset..end]).trim().to_string();
+    if text.len() > 3 { Some(text) } else { None }
+}
+
+fn read_utf16_cstr(bytes: &[u8], offset: usize) -> Option<String> {
+    if offset == 0 || offset + 2 > bytes.len() {
+        return None;
+    }
+    let mut units = Vec::new();
+    let mut cursor = offset;
+    while cursor + 1 < bytes.len() {
+        let unit = u16::from_le_bytes([bytes[cursor], bytes[cursor + 1]]);
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
+        cursor += 2;
+        if units.len() > 1024 {
+            break;
+        }
+    }
+    let text = String::from_utf16_lossy(&units).trim().to_string();
+    if text.len() > 3 { Some(text) } else { None }
+}
+
+fn parse_shell_link_target(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 0x4C || read_u32(bytes, 0)? < 0x4C {
+        return None;
+    }
+    let flags = read_u32(bytes, 0x14)?;
+    let mut offset = 0x4Cusize;
+    if flags & 0x1 != 0 {
+        let id_size = u16::from_le_bytes(bytes.get(offset..offset + 2)?.try_into().ok()?) as usize;
+        offset = offset.checked_add(2 + id_size)?;
+    }
+    if flags & 0x2 == 0 || offset + 28 > bytes.len() {
+        return None;
+    }
+    let info = &bytes[offset..];
+    let header_size = read_u32(info, 4)? as usize;
+    let info_flags = read_u32(info, 8)?;
+    let mut target = None;
+    if info_flags & 0x1 != 0 {
+        target = read_cstr(info, read_u32(info, 16)? as usize);
+        if header_size >= 0x24 {
+            if let Some(wide) = read_utf16_cstr(info, read_u32(info, 28)? as usize) {
+                target = Some(wide);
+            }
+        }
+        let suffix_off = read_u32(info, 24).unwrap_or(0) as usize;
+        if let Some(suffix) = read_cstr(info, suffix_off) {
+            if let Some(base) = target.as_mut() {
+                if !base.to_ascii_lowercase().ends_with(&suffix.to_ascii_lowercase()) {
+                    if !base.ends_with('\\') && !suffix.starts_with('\\') {
+                        base.push('\\');
+                    }
+                    base.push_str(&suffix);
+                }
+            }
+        }
+    }
+    target.filter(|value| value.contains(":\\") || value.contains(":/") || value.starts_with("\\\\"))
+}
+
+fn find_slice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|window| window == needle)
+}
+
+fn is_path_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'\\' | b'/' | b':' | b'.' | b' ' | b'(' | b')' | b'-' | b'_' | b'&' | b'\'' | b'[' | b']' | b'+' | b',' | b'~'
+        )
+}
+
+fn find_embedded_path(bytes: &[u8]) -> Option<String> {
+    let lower: Vec<u8> = bytes.iter().copied().map(|byte| byte.to_ascii_lowercase()).collect();
+    for ext in [b".exe".as_slice(), b".bat", b".cmd", b".com"] {
+        let mut from = 0usize;
+        while let Some(rel) = find_slice(&lower[from..], ext) {
+            let end = from + rel + ext.len();
+            let mut start = end - ext.len();
+            while start > 0 && is_path_byte(bytes[start - 1]) {
+                start -= 1;
+            }
+            if end - start > 5 {
+                let text = String::from_utf8_lossy(&bytes[start..end]).trim().to_string();
+                if text.contains(":\\") || text.contains(":/") {
+                    return Some(text);
+                }
+            }
+            from = end;
+        }
+    }
+
+    let mut index = 2usize;
+    while index + 3 < bytes.len() {
+        if bytes[index] == b':'
+            && bytes[index + 1] == 0
+            && (bytes[index + 2] == b'\\' || bytes[index + 2] == b'/')
+            && bytes[index + 3] == 0
+            && bytes[index - 1] == 0
+            && bytes[index - 2].is_ascii_alphabetic()
+        {
+            let start = index - 2;
+            let mut end = start;
+            while end + 1 < bytes.len() && bytes[end + 1] == 0 && is_path_byte(bytes[end]) {
+                end += 2;
+            }
+            if end > start + 8 {
+                let units: Vec<u16> = bytes[start..end]
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                    .collect();
+                let text = String::from_utf16_lossy(&units);
+                let low = text.to_ascii_lowercase();
+                if low.contains(".exe") || low.ends_with(".bat") || low.ends_with(".cmd") {
+                    return Some(text);
+                }
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn startup_delete_error(err: &dyn std::fmt::Display) -> String {
+    let text = err.to_string().to_lowercase();
+    if text.contains("os error 5")
+        || text.contains("access is denied")
+        || text.contains("отказано")
+        || text.contains("доступ")
+    {
+        "Для удаления системной записи требуются права Администратора (кнопка в шапке)".to_string()
+    } else {
+        format!("Не удалось удалить запись: {err}")
+    }
+}
+
+fn delete_registry_value(root: winreg::HKEY, subkey: &str, name: &str) -> Result<(), String> {
+    let key = RegKey::predef(root)
+        .open_subkey_with_flags(subkey, KEY_SET_VALUE)
+        .map_err(|e| startup_delete_error(&e))?;
+    key.delete_value(name)
+        .map_err(|e| startup_delete_error(&e))
+}
+
+#[tauri::command]
+fn remove_startup_entry(entry_id: String, source: String) -> Result<(), String> {
+    let entry_id = entry_id.trim().to_string();
+    if entry_id.is_empty() {
+        return Err("Не указана запись автозагрузки".to_string());
+    }
+
+    if let Some(base_path) = entry_id.strip_prefix("dir|") {
+        for candidate in [base_path.to_string(), format!("{base_path}.disabled")] {
+            let path = Path::new(&candidate);
+            if path.exists() {
+                std::fs::remove_file(path)
+                    .map_err(|e| format!("Не удалось удалить файл автозапуска: {e}"))?;
+            }
+        }
+        if let Some(file_name) = Path::new(base_path).file_name().and_then(|name| name.to_str()) {
+            let _ = delete_registry_value(
+                HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder",
+                file_name,
+            );
+        }
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(rest) = entry_id.strip_prefix("reg|") {
+        let mut parts = rest.splitn(2, '|');
+        let source_tag = parts.next().ok_or("Некорректный ID записи реестра")?;
+        let value_name = parts.next().ok_or("Не указано имя параметра реестра")?;
+        let (active_root, active_subkey, approved_root, approved_subkey) = match source_tag {
+            "HKCU_RUN" => (
+                HKEY_CURRENT_USER,
+                RUN_KEY_PATH,
+                HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
+            ),
+            "HKLM_RUN" => (
+                HKEY_LOCAL_MACHINE,
+                RUN_KEY_PATH,
+                HKEY_LOCAL_MACHINE,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
+            ),
+            "HKLM_WOW64_RUN" => (
+                HKEY_LOCAL_MACHINE,
+                RUN_WOW64_KEY_PATH,
+                HKEY_LOCAL_MACHINE,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32",
+            ),
+            _ => return Err(format!("Неизвестный источник реестра: {source_tag}")),
+        };
+        delete_registry_value(active_root, active_subkey, value_name)?;
+        let _ = delete_registry_value(approved_root, approved_subkey, value_name);
+        let backup = format!(r"{NEXUS_DISABLED_REG_BASE}\{source_tag}");
+        let _ = delete_registry_value(HKEY_CURRENT_USER, &backup, value_name);
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(rest) = entry_id.strip_prefix("approved|") {
+        let mut parts = rest.splitn(2, '|');
+        let label = parts.next().unwrap_or("");
+        let value_name = parts.next().ok_or("Не указано имя битой записи")?;
+        let hive = if label.contains("HKLM") {
+            HKEY_LOCAL_MACHINE
+        } else {
+            HKEY_CURRENT_USER
+        };
+        let subkey = if label.contains("Run32") {
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32"
+        } else if label.contains("StartupFolder") {
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder"
+        } else {
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+        };
+        delete_registry_value(hive, subkey, value_name)?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(rest) = entry_id.strip_prefix("msix|") {
+        let mut parts = rest.splitn(2, '|');
+        let family = parts.next().ok_or("Не указано приложение Store")?;
+        let task = parts.next().ok_or("Не указана задача Store")?;
+        let parent = format!(
+            r"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData\{family}\StartupTasks"
+        );
+        RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags(&parent, KEY_WRITE)
+            .and_then(|key| key.delete_subkey_all(task))
+            .map_err(|e| format!("Не удалось удалить задачу Store: {e}"))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(name) = entry_id.strip_prefix("cim|") {
+        let mut removed = false;
+        for (root, subkey) in [
+            (HKEY_CURRENT_USER, RUN_KEY_PATH),
+            (HKEY_LOCAL_MACHINE, RUN_KEY_PATH),
+            (HKEY_LOCAL_MACHINE, RUN_WOW64_KEY_PATH),
+        ] {
+            if let Ok(key) = RegKey::predef(root).open_subkey_with_flags(subkey, KEY_READ | KEY_SET_VALUE) {
+                let names: Vec<String> = key.enum_values().filter_map(|item| item.ok().map(|(value_name, _)| value_name)).collect();
+                for value_name in names {
+                    if value_name.eq_ignore_ascii_case(name) {
+                        key.delete_value(&value_name)
+                            .map_err(|e| format!("Не удалось удалить запись «{value_name}»: {e}"))?;
+                        removed = true;
+                    }
+                }
+            }
+        }
+        if !removed {
+            return Err(format!("Запись «{name}» не найдена в реестре ({source})"));
+        }
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(task) = entry_id.strip_prefix("task|") {
+        let mut cmd = Command::new("schtasks");
+        cmd.args(["/Delete", "/TN", task, "/F"]);
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        let output = cmd.output().map_err(|e| format!("Не удалось запустить schtasks: {e}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = decode_command_output(&output.stderr);
+        return Err(if stderr.trim().is_empty() {
+            format!("Не удалось удалить задачу планировщика ({source})")
+        } else {
+            stderr
+        });
+    }
+
+    Err(format!("Неизвестный формат записи автозагрузки ({source})"))
+}
+
+fn explorer_display_path(path: &Path) -> String {
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut shown = resolved.display().to_string();
+    if let Some(stripped) = shown.strip_prefix(r"\\?\") {
+        shown = stripped.to_string();
+    }
+    if let Some(unc) = shown.strip_prefix(r"UNC\") {
+        shown = format!(r"\\{unc}");
+    }
+    shown
+}
+
+fn spawn_explorer_select(shown: &str) -> Result<(), String> {
+    let mut cmd = Command::new("explorer");
+    #[cfg(target_os = "windows")]
+    cmd.raw_arg(format!("/select,\"{shown}\""));
+    #[cfg(not(target_os = "windows"))]
+    cmd.arg(shown);
+    cmd.spawn().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn spawn_explorer_folder(shown: &str) -> Result<(), String> {
+    let mut cmd = Command::new("explorer");
+    #[cfg(target_os = "windows")]
+    cmd.raw_arg(format!("\"{shown}\""));
+    #[cfg(not(target_os = "windows"))]
+    cmd.arg(shown);
+    cmd.spawn().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 fn open_item_location(path: String) -> Result<(), String> {
-    let trimmed = path.trim().trim_matches('"');
-    if trimmed.is_empty() {
+    let cleaned = sanitize_launch_path(&path);
+    if cleaned.is_empty() {
         return Err("Путь к файлу пуст".to_string());
     }
 
-    let target_path = Path::new(trimmed);
-    let mut cmd = Command::new("explorer.exe");
-
-    if target_path.exists() {
-        if target_path.is_dir() {
-            cmd.arg(trimmed);
-        } else {
-            cmd.arg(format!("/select,{}", trimmed));
-        }
-    } else if let Some(parent) = target_path.parent() {
-        if parent.exists() {
-            cmd.arg(parent.as_os_str());
-        } else {
-            return Err(format!("Файл и родительская папка не найдены: {}", trimmed));
-        }
-    } else {
-        return Err(format!("Файл не найден на диске: {}", trimmed));
+    let path_buf = PathBuf::from(&cleaned);
+    if path_buf.is_dir() {
+        return spawn_explorer_folder(&explorer_display_path(&path_buf));
+    }
+    if path_buf.exists() {
+        return spawn_explorer_select(&explorer_display_path(&path_buf));
     }
 
-    cmd.spawn()
-        .map_err(|e| format!("Не удалось открыть Проводник Windows: {}", e))?;
+    if let Some(parent) = path_buf.parent() {
+        if parent.as_os_str().len() > 0 && parent.exists() {
+            return spawn_explorer_folder(&explorer_display_path(parent));
+        }
+    }
 
-    Ok(())
+    Err(format!("Файл не найден: {cleaned}"))
 }
 
 // Возвращает список доступных дисков системы (C:\, D:\ и т.д.)
@@ -864,7 +1860,230 @@ fn classify_extension(ext: &str) -> &'static str {
     }
 }
 
-// Многопоточное сканирование выбранного диска или папки через jwalk
+struct ScanShared {
+    files: AtomicU64,
+    bytes: AtomicU64,
+    cats: [AtomicU64; 6],
+    top: Mutex<BinaryHeap<Reverse<(u64, String, String, String)>>>,
+    top_floor: AtomicU64,
+}
+
+fn skip_scan_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("$Recycle.Bin")
+        || name.eq_ignore_ascii_case("System Volume Information")
+        || name.eq_ignore_ascii_case("Recovery")
+        || name.eq_ignore_ascii_case("hiberfil.sys")
+        || name.eq_ignore_ascii_case("pagefile.sys")
+}
+
+fn metadata_is_reparse(meta: &std::fs::Metadata) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        return meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = meta;
+        false
+    }
+}
+
+fn content_label(path: &str) -> String {
+    let folders: Vec<String> = Path::new(path)
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if folders.len() < 2 {
+        return String::new();
+    }
+    let lower: Vec<String> = folders.iter().map(|part| part.to_lowercase()).collect();
+    let mut best: Option<(u8, usize)> = None;
+    let consider = |best: &mut Option<(u8, usize)>, rank: u8, at: usize| {
+        if at + 1 < folders.len() && (best.map(|(prev, _)| rank > prev).unwrap_or(true)) {
+            *best = Some((rank, at));
+        }
+    };
+    for index in 0..lower.len() {
+        if lower[index] == "steamapps" && lower.get(index + 1).map(String::as_str) == Some("common") {
+            consider(&mut best, 100, index + 2);
+        }
+        if lower[index] == "gog galaxy" && lower.get(index + 1).map(String::as_str) == Some("games") {
+            consider(&mut best, 90, index + 2);
+        }
+        if matches!(lower[index].as_str(), "gog games" | "epic games") {
+            consider(&mut best, 85, index + 1);
+        }
+        if lower[index] == "riot games" {
+            consider(&mut best, 80, index + 1);
+        }
+        if lower[index] == "games" {
+            consider(&mut best, 70, index + 1);
+        }
+        if matches!(lower[index].as_str(), "program files" | "program files (x86)") {
+            consider(&mut best, 40, index + 1);
+        }
+    }
+    if let Some((_, at)) = best {
+        if let Some(name) = folders.get(at) {
+            return name.clone();
+        }
+    }
+    folders.first().cloned().unwrap_or_default()
+}
+
+fn category_index(ext: &str) -> usize {
+    match classify_extension(ext) {
+        "Видео" => 0,
+        "Игры и софт" => 1,
+        "Архивы и образы" => 2,
+        "Аудио" => 3,
+        "Документы" => 4,
+        _ => 5,
+    }
+}
+
+fn push_top_file(shared: &ScanShared, size: u64, path: String, name: String, ext: String) {
+    if size == 0 {
+        return;
+    }
+    let floor = shared.top_floor.load(Ordering::Relaxed);
+    if floor > 0 && size <= floor {
+        return;
+    }
+    let Ok(mut heap) = shared.top.lock() else {
+        return;
+    };
+    if heap.len() >= 100 {
+        if let Some(smallest) = heap.peek() {
+            if size <= smallest.0.0 {
+                shared.top_floor.store(smallest.0.0, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+    heap.push(Reverse((size, path, name, ext)));
+    if heap.len() > 100 {
+        heap.pop();
+    }
+    if heap.len() >= 100 {
+        if let Some(smallest) = heap.peek() {
+            shared.top_floor.store(smallest.0.0, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Параллельный обход без повторного запроса атрибутов безопасности.
+/// Размер берётся из записи каталога, символические ссылки и точки повторной обработки не раскрываются.
+fn scan_dir_fast(path: &Path, depth: u8, shared: &ScanShared) -> (u64, u64, Vec<FolderNode>) {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return (0, 0, Vec::new());
+    };
+
+    let mut direct_bytes = 0u64;
+    let mut local_files = 0u64;
+    let mut local_cats = [0u64; 6];
+    let mut subdirs: Vec<PathBuf> = Vec::new();
+
+    for item in entries {
+        let Ok(entry) = item else { continue };
+        let name = entry.file_name();
+        let name_text = name.to_string_lossy();
+        if skip_scan_name(&name_text) {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else { continue };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if metadata_is_reparse(&meta) {
+            continue;
+        }
+        if file_type.is_dir() {
+            subdirs.push(path.join(&name));
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let size = meta.len();
+        direct_bytes = direct_bytes.saturating_add(size);
+        local_files = local_files.saturating_add(1);
+        let ext = Path::new(&name)
+            .extension()
+            .map(|value| value.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        local_cats[category_index(&ext)] = local_cats[category_index(&ext)].saturating_add(size);
+
+        let floor = shared.top_floor.load(Ordering::Relaxed);
+        if size > 0 && (floor == 0 || size > floor) {
+            push_top_file(
+                shared,
+                size,
+                path.join(&name).to_string_lossy().into_owned(),
+                name_text.into_owned(),
+                ext,
+            );
+        }
+    }
+
+    shared.bytes.fetch_add(direct_bytes, Ordering::Relaxed);
+    shared.files.fetch_add(local_files, Ordering::Relaxed);
+    for (idx, bytes) in local_cats.iter().enumerate() {
+        if *bytes > 0 {
+            shared.cats[idx].fetch_add(*bytes, Ordering::Relaxed);
+        }
+    }
+
+    let nested: Vec<(PathBuf, u64, Vec<FolderNode>)> = if subdirs.len() > 1 && depth < 4 {
+        subdirs
+            .into_par_iter()
+            .map(|sub| {
+                let (bytes, _direct, children) = scan_dir_fast(&sub, depth + 1, shared);
+                (sub, bytes, children)
+            })
+            .collect()
+    } else {
+        subdirs
+            .into_iter()
+            .map(|sub| {
+                let (bytes, _direct, children) = scan_dir_fast(&sub, depth + 1, shared);
+                (sub, bytes, children)
+            })
+            .collect()
+    };
+
+    let mut tree_bytes = direct_bytes;
+    let mut children = Vec::new();
+    for (sub, bytes, kids) in nested {
+        tree_bytes = tree_bytes.saturating_add(bytes);
+        if depth < 3 {
+            children.push(FolderNode {
+                name: sub
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                path: sub.to_string_lossy().into_owned(),
+                size_bytes: bytes,
+                children: if depth < 2 { kids } else { Vec::new() },
+            });
+        }
+    }
+    if depth < 3 {
+        children.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+        children.truncate(10);
+    }
+
+    (tree_bytes, direct_bytes, children)
+}
+
+// Многопоточное сканирование выбранного диска или папки через rayon
 #[tauri::command]
 async fn scan_storage(path: String) -> Result<ScanResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -878,183 +2097,38 @@ async fn scan_storage(path: String) -> Result<ScanResult, String> {
             return Err(format!("Указанный путь не существует: {}", normalized));
         }
 
-        let mut total_scanned_bytes: u64 = 0;
-        let mut total_files_count: u64 = 0;
+        let shared = ScanShared {
+            files: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            cats: std::array::from_fn(|_| AtomicU64::new(0)),
+            top: Mutex::new(BinaryHeap::new()),
+            top_floor: AtomicU64::new(0),
+        };
+        let (_tree_bytes, root_direct_files_bytes, mut root_children) =
+            scan_dir_fast(&root_path, 0, &shared);
 
-        let mut top_heap: BinaryHeap<Reverse<(u64, String, String, String)>> =
-            BinaryHeap::with_capacity(101);
-
-        let mut cat_video: u64 = 0;
-        let mut cat_games_soft: u64 = 0;
-        let mut cat_archives: u64 = 0;
-        let mut cat_audio: u64 = 0;
-        let mut cat_docs: u64 = 0;
-        let mut cat_other: u64 = 0;
-
-        let mut level1_sizes: HashMap<String, u64> = HashMap::new();
-        let mut level2_sizes: HashMap<(String, String), u64> = HashMap::new();
-        let mut level3_sizes: HashMap<(String, String, String), u64> = HashMap::new();
-        let mut root_direct_files_bytes: u64 = 0;
-
-        let walker = jwalk::WalkDir::new(&root_path)
-            .skip_hidden(false)
-            .process_read_dir(|_depth, _path, _state, children| {
-                children.retain(|dir_entry_res| {
-                    if let Ok(dir_entry) = dir_entry_res {
-                        let name = dir_entry.file_name.to_string_lossy();
-                        !name.eq_ignore_ascii_case("System Volume Information")
-                            && !name.eq_ignore_ascii_case("$Recycle.Bin")
-                    } else {
-                        false
-                    }
-                });
-            });
-
-        for entry_res in walker {
-            let Ok(entry) = entry_res else {
-                continue;
-            };
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-
-            let size = meta.len();
-            total_scanned_bytes = total_scanned_bytes.saturating_add(size);
-            total_files_count = total_files_count.saturating_add(1);
-
-            let entry_path = entry.path();
-            let ext = entry_path
-                .extension()
-                .map(|e| e.to_string_lossy().to_lowercase())
-                .unwrap_or_default();
-
-            match classify_extension(&ext) {
-                "Видео" => cat_video = cat_video.saturating_add(size),
-                "Игры и софт" => cat_games_soft = cat_games_soft.saturating_add(size),
-                "Архивы и образы" => cat_archives = cat_archives.saturating_add(size),
-                "Аудио" => cat_audio = cat_audio.saturating_add(size),
-                "Документы" => cat_docs = cat_docs.saturating_add(size),
-                _ => cat_other = cat_other.saturating_add(size),
-            }
-
-            let qualifies = top_heap.len() < 100
-                || top_heap
-                    .peek()
-                    .map(|smallest| size > smallest.0 .0)
-                    .unwrap_or(true);
-
-            if qualifies && size > 0 {
-                let file_name = entry.file_name().to_string_lossy().to_string();
-                let full_path_str = entry_path.to_string_lossy().to_string();
-                top_heap.push(Reverse((size, full_path_str, file_name, ext)));
-                if top_heap.len() > 100 {
-                    top_heap.pop();
-                }
-            }
-
-            if let Ok(rel) = entry_path.strip_prefix(&root_path) {
-                let mut comps = rel.components().filter_map(|c| match c {
-                    std::path::Component::Normal(os) => Some(os.to_string_lossy().to_string()),
-                    _ => None,
-                });
-
-                let first = comps.next();
-                let second = comps.next();
-                let third = comps.next();
-                let fourth = comps.next();
-
-                match (first, second, third, fourth) {
-                    (Some(_file_in_root), None, _, _) => {
-                        root_direct_files_bytes = root_direct_files_bytes.saturating_add(size);
-                    }
-                    (Some(c1), Some(_c2_or_file), None, _) => {
-                        *level1_sizes.entry(c1).or_insert(0) += size;
-                    }
-                    (Some(c1), Some(c2), Some(_c3_or_file), None) => {
-                        *level1_sizes.entry(c1.clone()).or_insert(0) += size;
-                        *level2_sizes.entry((c1, c2)).or_insert(0) += size;
-                    }
-                    (Some(c1), Some(c2), Some(c3), Some(_)) => {
-                        *level1_sizes.entry(c1.clone()).or_insert(0) += size;
-                        *level2_sizes.entry((c1.clone(), c2.clone())).or_insert(0) += size;
-                        *level3_sizes.entry((c1, c2, c3)).or_insert(0) += size;
-                    }
-                    _ => {}
-                }
-            }
-        }
+        let total_scanned_bytes = shared.bytes.load(Ordering::Relaxed);
+        let total_files_count = shared.files.load(Ordering::Relaxed);
+        let top_heap = shared
+            .top
+            .lock()
+            .map(|mut heap| std::mem::take(&mut *heap))
+            .unwrap_or_default();
 
         let mut top_files: Vec<FileEntry> = top_heap
             .into_iter()
-            .map(|Reverse((size_bytes, path, name, extension))| FileEntry {
-                path,
-                name,
-                size_bytes,
-                extension,
-            })
-            .collect();
-        top_files.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
-
-        let mut l1_vec: Vec<(String, u64)> = level1_sizes.into_iter().collect();
-        l1_vec.sort_by(|a, b| b.1.cmp(&a.1));
-        l1_vec.truncate(10);
-
-        let mut root_children: Vec<FolderNode> = l1_vec
-            .into_iter()
-            .map(|(c1_name, c1_size)| {
-                let c1_path = root_path.join(&c1_name);
-
-                let mut l2_vec: Vec<(String, u64)> = level2_sizes
-                    .iter()
-                    .filter(|((parent_c1, _), _)| parent_c1 == &c1_name)
-                    .map(|((_, c2_name), &sz)| (c2_name.clone(), sz))
-                    .collect();
-                l2_vec.sort_by(|a, b| b.1.cmp(&a.1));
-                l2_vec.truncate(10);
-
-                let l2_children: Vec<FolderNode> = l2_vec
-                    .into_iter()
-                    .map(|(c2_name, c2_size)| {
-                        let c2_path = c1_path.join(&c2_name);
-
-                        let mut l3_vec: Vec<(String, u64)> = level3_sizes
-                            .iter()
-                            .filter(|((p1, p2, _), _)| p1 == &c1_name && p2 == &c2_name)
-                            .map(|((_, _, c3_name), &sz)| (c3_name.clone(), sz))
-                            .collect();
-                        l3_vec.sort_by(|a, b| b.1.cmp(&a.1));
-                        l3_vec.truncate(10);
-
-                        let l3_children: Vec<FolderNode> = l3_vec
-                            .into_iter()
-                            .map(|(c3_name, c3_size)| FolderNode {
-                                path: c2_path.join(&c3_name).to_string_lossy().to_string(),
-                                name: c3_name,
-                                size_bytes: c3_size,
-                                children: Vec::new(),
-                            })
-                            .collect();
-
-                        FolderNode {
-                            name: c2_name,
-                            path: c2_path.to_string_lossy().to_string(),
-                            size_bytes: c2_size,
-                            children: l3_children,
-                        }
-                    })
-                    .collect();
-
-                FolderNode {
-                    name: c1_name,
-                    path: c1_path.to_string_lossy().to_string(),
-                    size_bytes: c1_size,
-                    children: l2_children,
+            .map(|Reverse((size_bytes, path, name, extension))| {
+                let app_label = content_label(&path);
+                FileEntry {
+                    path,
+                    name,
+                    size_bytes,
+                    extension,
+                    app_label,
                 }
             })
             .collect();
+        top_files.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
 
         if root_direct_files_bytes > 0 {
             root_children.push(FolderNode {
@@ -1080,12 +2154,12 @@ async fn scan_storage(path: String) -> Result<ScanResult, String> {
         };
 
         let category_sizes = vec![
-            ("Игры и софт".to_string(), cat_games_soft),
-            ("Видео".to_string(), cat_video),
-            ("Архивы и образы".to_string(), cat_archives),
-            ("Аудио".to_string(), cat_audio),
-            ("Документы".to_string(), cat_docs),
-            ("Прочее".to_string(), cat_other),
+            ("Игры и софт".to_string(), shared.cats[1].load(Ordering::Relaxed)),
+            ("Видео".to_string(), shared.cats[0].load(Ordering::Relaxed)),
+            ("Архивы и образы".to_string(), shared.cats[2].load(Ordering::Relaxed)),
+            ("Аудио".to_string(), shared.cats[3].load(Ordering::Relaxed)),
+            ("Документы".to_string(), shared.cats[4].load(Ordering::Relaxed)),
+            ("Прочее".to_string(), shared.cats[5].load(Ordering::Relaxed)),
         ];
 
         Ok(ScanResult {
@@ -1174,16 +2248,12 @@ fn get_system_metrics(state: State<'_, AppState>) -> SystemMetrics {
     };
 
     let net_ping_ms = measure_network_ping_ms(&state);
+    update_tray_ping(&state, net_ping_ms);
 
-    let disks = Disks::new_with_refreshed_list();
-    let (disk_free_gb, disk_total_gb) = disks
-        .first()
-        .map(|d| {
-            (
-                d.available_space() / 1024 / 1024 / 1024,
-                d.total_space() / 1024 / 1024 / 1024,
-            )
-        })
+    let (disk_free_gb, disk_total_gb) = state
+        .disk_space
+        .lock()
+        .map(|slot| *slot)
         .unwrap_or((0, 0));
 
     SystemMetrics {
@@ -1328,6 +2398,285 @@ fn app_exit(app: tauri::AppHandle, state: State<'_, AppState>) {
     app.exit(0);
 }
 
+#[tauri::command]
+fn flush_dns() -> Result<(), String> {
+    let mut cmd = Command::new("ipconfig");
+    cmd.args(["/flushdns"]);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let output = cmd
+        .output()
+        .map_err(|e| format!("Не удалось запустить ipconfig /flushdns: {}", e))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if stderr.is_empty() {
+            "Очистка кэша DNS не выполнена".to_string()
+        } else {
+            stderr
+        })
+    }
+}
+
+const MEDIA_PROFILE_KEY: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile";
+
+#[derive(Serialize, Clone)]
+struct RouteProbe {
+    label: String,
+    host: String,
+    ping_ms: u32,
+    jitter_ms: u32,
+}
+
+fn sample_tcp_route(ip: Ipv4Addr, port: u16) -> (u32, u32) {
+    let addr = SocketAddr::new(IpAddr::V4(ip), port);
+    let mut samples = Vec::new();
+    for _ in 0..3 {
+        let started = Instant::now();
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(700)).is_ok() {
+            samples.push(started.elapsed().as_millis().max(1) as u32);
+        }
+    }
+    if samples.is_empty() {
+        return (0, 0);
+    }
+    let fastest = *samples.iter().min().unwrap_or(&0);
+    let slowest = *samples.iter().max().unwrap_or(&0);
+    (fastest, slowest.saturating_sub(fastest))
+}
+
+#[tauri::command]
+fn probe_game_routes() -> Vec<RouteProbe> {
+    let targets = [
+        ("DNS / Магистраль", Ipv4Addr::new(1, 1, 1, 1), 53u16),
+        ("СНГ / Москва", Ipv4Addr::new(162, 159, 135, 234), 443u16),
+        ("Европа / Cloudflare", Ipv4Addr::new(1, 0, 0, 1), 53u16),
+    ];
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (label, ip, port) in targets {
+            handles.push(scope.spawn(move || {
+                let (ping_ms, jitter_ms) = sample_tcp_route(ip, port);
+                RouteProbe {
+                    label: label.to_string(),
+                    host: ip.to_string(),
+                    ping_ms,
+                    jitter_ms,
+                }
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or(RouteProbe {
+                label: String::new(),
+                host: String::new(),
+                ping_ms: 0,
+                jitter_ms: 0,
+            }))
+            .collect()
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn media_profile_key(writable: bool) -> Result<RegKey, String> {
+    let flags = if writable {
+        KEY_READ | KEY_SET_VALUE | KEY_WOW64_64KEY
+    } else {
+        KEY_READ | KEY_WOW64_64KEY
+    };
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(MEDIA_PROFILE_KEY, flags)
+        .map_err(|e| format!("Не удалось открыть профиль мультимедиа: {}", e))
+}
+
+#[tauri::command]
+fn get_packet_priority() -> Result<bool, String> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        return Ok(false);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let key = media_profile_key(false)?;
+        let throttle: u32 = key.get_value("NetworkThrottlingIndex").unwrap_or(10);
+        Ok(throttle == u32::MAX)
+    }
+}
+
+#[tauri::command]
+fn set_packet_priority(enabled: bool) -> Result<(), String> {
+    if !check_is_elevated_admin() {
+        return Err("Требуются права Администратора (кнопка в шапке)".to_string());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let key = media_profile_key(true)?;
+        if enabled {
+            key.set_value("NetworkThrottlingIndex", &u32::MAX)
+                .map_err(|e| format!("Не удалось записать NetworkThrottlingIndex: {}", e))?;
+            key.set_value("SystemResponsiveness", &0u32)
+                .map_err(|e| format!("Не удалось записать SystemResponsiveness: {}", e))?;
+        } else {
+            key.set_value("NetworkThrottlingIndex", &10u32)
+                .map_err(|e| format!("Не удалось вернуть NetworkThrottlingIndex: {}", e))?;
+            key.set_value("SystemResponsiveness", &20u32)
+                .map_err(|e| format!("Не удалось вернуть SystemResponsiveness: {}", e))?;
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = enabled;
+        Err("Настройка доступна только в Windows".to_string())
+    }
+}
+
+#[tauri::command]
+fn tune_ethernet_adapter() -> Result<String, String> {
+    if !check_is_elevated_admin() {
+        return Err("Требуются права Администратора (кнопка в шапке)".to_string());
+    }
+    let script = r#"
+$script:changed = 0
+Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
+  $props = Get-NetAdapterAdvancedProperty -Name $_.Name -ErrorAction SilentlyContinue
+  foreach ($p in $props) {
+    $key = [string]$p.RegistryKeyword
+    if ($key -match 'EEE|GreenEthernet|InterruptModeration') {
+      $choice = $null
+      foreach ($v in @($p.ValidDisplayValues)) {
+        if ($v -match '^(Disabled|Отключено)$') { $choice = $v; break }
+      }
+      if (-not $choice -and $key -match 'Interrupt') {
+        foreach ($v in @($p.ValidDisplayValues)) {
+          if ($v -match 'Low|Низк') { $choice = $v; break }
+        }
+      }
+      if ($choice) {
+        try {
+          Set-NetAdapterAdvancedProperty -Name $_.Name -RegistryKeyword $key -DisplayValue $choice -NoRestart -ErrorAction Stop
+          $script:changed++
+        } catch {}
+      }
+    }
+  }
+}
+Write-Output $script:changed
+"#;
+    let text = hidden_powershell(script)?;
+    let changed = text.lines().last().unwrap_or("0").trim().parse::<u32>().unwrap_or(0);
+    if changed == 0 {
+        return Err("У активного Ethernet-адаптера не найдены Energy Efficient Ethernet, Green Ethernet или Interrupt Moderation".to_string());
+    }
+    Ok(format!("Отключено параметров адаптера: {}", changed))
+}
+
+#[tauri::command]
+fn get_ethernet_tuned() -> Result<bool, String> {
+    let script = r#"
+$seen = 0
+$tuned = 0
+Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
+  $props = Get-NetAdapterAdvancedProperty -Name $_.Name -ErrorAction SilentlyContinue
+  foreach ($p in $props) {
+    $key = [string]$p.RegistryKeyword
+    if ($key -match 'EEE|GreenEthernet|InterruptModeration') {
+      $seen++
+      $value = [string]$p.DisplayValue
+      if ($value -match 'Disabled|Отключено|Low|Низк') { $tuned++ }
+    }
+  }
+}
+if ($seen -gt 0 -and $tuned -eq $seen) { '1' } else { '0' }
+"#;
+    let text = hidden_powershell(script)?;
+    Ok(text.lines().last().unwrap_or("0").trim() == "1")
+}
+
+#[tauri::command]
+fn set_ethernet_tuned(enabled: bool) -> Result<String, String> {
+    if enabled {
+        return tune_ethernet_adapter();
+    }
+    if !check_is_elevated_admin() {
+        return Err("Требуются права Администратора (кнопка в шапке)".to_string());
+    }
+    let script = r#"
+$script:changed = 0
+Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
+  $props = Get-NetAdapterAdvancedProperty -Name $_.Name -ErrorAction SilentlyContinue
+  foreach ($p in $props) {
+    $key = [string]$p.RegistryKeyword
+    if ($key -match 'EEE|GreenEthernet|InterruptModeration') {
+      $choice = $null
+      $pattern = if ($key -match 'Interrupt') { 'Enabled|Включено|Moderate|Средн' } else { '^(Enabled|Включено)$' }
+      foreach ($v in @($p.ValidDisplayValues)) {
+        if ($v -match $pattern) { $choice = $v; break }
+      }
+      if ($choice) {
+        try {
+          Set-NetAdapterAdvancedProperty -Name $_.Name -RegistryKeyword $key -DisplayValue $choice -NoRestart -ErrorAction Stop
+          $script:changed++
+        } catch {}
+      }
+    }
+  }
+}
+Write-Output $script:changed
+"#;
+    let text = hidden_powershell(script)?;
+    let changed = text.lines().last().unwrap_or("0").trim().parse::<u32>().unwrap_or(0);
+    if changed == 0 {
+        return Err("Не удалось вернуть энергосбережение сетевого адаптера".to_string());
+    }
+    Ok(format!("Возвращено параметров адаптера: {}", changed))
+}
+
+fn update_tray_ping(state: &AppState, ping_ms: u32) {
+    let Ok(guard) = state.tray_ping_item.lock() else {
+        return;
+    };
+    let Some(item) = guard.as_ref() else {
+        return;
+    };
+    let label = if ping_ms > 0 {
+        format!("Ping: {ping_ms} ms")
+    } else {
+        "Ping: нет сети".to_string()
+    };
+    let _ = item.set_text(label);
+}
+
+fn reveal_main_window(app: &tauri::AppHandle) {
+    if let Some(hud) = app.get_webview_window("tray_hud") {
+        let _ = hud.hide();
+    }
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn toggle_tray_hud(app: &tauri::AppHandle, icon_x: f64, icon_y: f64) {
+    let Some(window) = app.get_webview_window("tray_hud") else {
+        return;
+    };
+    if window.is_visible().unwrap_or(false) {
+        let _ = window.hide();
+        return;
+    }
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let width = 280.0 * scale;
+    let height = 180.0 * scale;
+    let x = (icon_x - width + 20.0).max(8.0) as i32;
+    let y = (icon_y - height - 10.0).max(8.0) as i32;
+    let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition { x, y }));
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
 // Описание цели очистки для модуля Cleanup Center
 struct CleanupTargetSpec {
     id: &'static str,
@@ -1392,6 +2741,25 @@ fn build_cleanup_specs() -> Vec<CleanupTargetSpec> {
     dump_dirs.push(PathBuf::from(&sys_root).join("Minidump"));
     dump_dirs.push(PathBuf::from(&sys_root).join("LiveKernelReports"));
 
+    let mut browser_dirs = Vec::new();
+    if !local_app_data.is_empty() {
+        let base = PathBuf::from(&local_app_data);
+        push_chromium_caches(&mut browser_dirs, base.join(r"Google\Chrome\User Data"));
+        push_chromium_caches(&mut browser_dirs, base.join(r"Microsoft\Edge\User Data"));
+        push_chromium_caches(&mut browser_dirs, base.join(r"Yandex\YandexBrowser\User Data"));
+    }
+
+    let mut discord_dirs = Vec::new();
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let discord = PathBuf::from(appdata).join("discord");
+        for leaf in ["Cache", "Code Cache", "GPUCache"] {
+            let dir = discord.join(leaf);
+            if dir.is_dir() {
+                discord_dirs.push(dir);
+            }
+        }
+    }
+
     vec![
         CleanupTargetSpec {
             id: "user_temp",
@@ -1441,7 +2809,90 @@ fn build_cleanup_specs() -> Vec<CleanupTargetSpec> {
             requires_admin: false,
             dirs: dump_dirs,
         },
+        CleanupTargetSpec {
+            id: "browser_cache",
+            name: "Кэш браузеров (Chrome, Edge, Yandex)",
+            description: "Временный кэш картинок, стилей и скриптов. Сессии и пароли сохраняются.",
+            paths_hint: "Cache • Code Cache • GPUCache",
+            requires_admin: false,
+            dirs: browser_dirs,
+        },
+        CleanupTargetSpec {
+            id: "windows_update",
+            name: "Загрузки Windows Update",
+            description: "Установочные пакеты уже применённых обновлений операционной системы.",
+            paths_hint: "%SystemRoot%\\SoftwareDistribution\\Download",
+            requires_admin: true,
+            dirs: vec![PathBuf::from(&sys_root).join(r"SoftwareDistribution\Download")],
+        },
+        CleanupTargetSpec {
+            id: "discord_cache",
+            name: "Кэш Discord и мессенджеров",
+            description: "Кэшированные превью медиафайлов и голосовых сообщений.",
+            paths_hint: "%APPDATA%\\discord\\Cache • Code Cache • GPUCache",
+            requires_admin: false,
+            dirs: discord_dirs,
+        },
     ]
+}
+
+fn push_chromium_caches(dirs: &mut Vec<PathBuf>, user_data: PathBuf) {
+    let Ok(entries) = std::fs::read_dir(&user_data) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let profile_name = entry.file_name().to_string_lossy().to_lowercase();
+        if profile_name != "default" && !profile_name.starts_with("profile ") {
+            continue;
+        }
+        for leaf in ["Cache", "Code Cache", "GPUCache"] {
+            let dir = entry.path().join(leaf);
+            if dir.is_dir() {
+                dirs.push(dir);
+            }
+        }
+    }
+}
+
+fn is_cache_only_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            let low = name.to_lowercase();
+            low == "cache" || low == "code cache" || low == "gpucache"
+        })
+        .unwrap_or(false)
+}
+
+fn is_protected_browser_entry(path: &Path) -> bool {
+    path.components().any(|component| {
+        let std::path::Component::Normal(name) = component else {
+            return false;
+        };
+        matches!(
+            name.to_string_lossy().to_lowercase().as_str(),
+            "cookies"
+                | "cookies-journal"
+                | "history"
+                | "history-journal"
+                | "login data"
+                | "login data-journal"
+                | "web data"
+                | "web data-journal"
+                | "bookmarks"
+                | "bookmarks.bak"
+                | "preferences"
+                | "secure preferences"
+                | "sessions"
+                | "indexeddb"
+                | "local storage"
+                | "session storage"
+                | "extension cookies"
+        )
+    })
 }
 
 // Проверка, подлежит ли конкретный файл учёту и удалению в рамках категории
@@ -1469,6 +2920,9 @@ fn scan_category_dir_recursive(category_id: &str, dir: &Path, size_acc: &mut u64
             continue;
         };
         let path = entry.path();
+        if matches!(category_id, "browser_cache" | "discord_cache") && is_protected_browser_entry(&path) {
+            continue;
+        }
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
@@ -1506,6 +2960,9 @@ fn clean_category_dir_recursive(
             continue;
         };
         let path = entry.path();
+        if matches!(category_id, "browser_cache" | "discord_cache") && is_protected_browser_entry(&path) {
+            continue;
+        }
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
@@ -1564,6 +3021,9 @@ async fn scan_cleanup_targets() -> Result<Vec<CleanupCategory>, String> {
             let mut total_files: u64 = 0;
 
             for dir in &spec.dirs {
+                if matches!(spec.id, "browser_cache" | "discord_cache") && !is_cache_only_dir(dir) {
+                    continue;
+                }
                 if dir.exists() {
                     scan_category_dir_recursive(spec.id, dir, &mut total_size, &mut total_files);
                 }
@@ -1611,6 +3071,9 @@ async fn execute_cleanup(category_ids: Vec<String>) -> Result<CleanupReport, Str
             let mut cat_freed: u64 = 0;
 
             for dir in &spec.dirs {
+                if matches!(spec.id, "browser_cache" | "discord_cache") && !is_cache_only_dir(dir) {
+                    continue;
+                }
                 if dir.exists() {
                     clean_category_dir_recursive(
                         spec.id,
@@ -2417,42 +3880,137 @@ fn apply_dwm_rounded_corners(hwnd: isize) {
 #[cfg(not(target_os = "windows"))]
 fn apply_dwm_rounded_corners(_hwnd: isize) {}
 
+fn start_background_services(
+    sys: Arc<Mutex<System>>,
+    networks: Arc<Mutex<Networks>>,
+    disk_space: Arc<Mutex<(u64, u64)>>,
+    hw_telemetry: Arc<Mutex<Option<HardwareTelemetry>>>,
+    hw_sidecar_child: Arc<Mutex<Option<Child>>>,
+) {
+    std::thread::spawn(move || {
+        spawn_hwmon_sidecar(hw_telemetry, Arc::clone(&hw_sidecar_child));
+        if let Ok(mut guard) = sys.lock() {
+            guard.refresh_cpu_usage();
+        }
+        std::thread::sleep(Duration::from_millis(180));
+        if let Ok(mut guard) = sys.lock() {
+            guard.refresh_cpu_usage();
+            guard.refresh_memory();
+        }
+        if let Ok(mut guard) = networks.lock() {
+            guard.refresh(true);
+        }
+        loop {
+            let disks = Disks::new_with_refreshed_list();
+            let sample = disks
+                .first()
+                .map(|disk| {
+                    (
+                        disk.available_space() / 1024 / 1024 / 1024,
+                        disk.total_space() / 1024 / 1024 / 1024,
+                    )
+                })
+                .unwrap_or((0, 0));
+            if let Ok(mut slot) = disk_space.lock() {
+                *slot = sample;
+            }
+            std::thread::sleep(Duration::from_secs(8));
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let mut sys = System::new_all();
-    sys.refresh_all(); // Первичный прогрев датчиков
-
-    let networks = Networks::new_with_refreshed_list();
+    let sys = Arc::new(Mutex::new(System::new()));
+    let networks = Arc::new(Mutex::new(Networks::new()));
+    let disk_space = Arc::new(Mutex::new((0u64, 0u64)));
     let hw_telemetry = Arc::new(Mutex::new(None));
     let hw_sidecar_child = Arc::new(Mutex::new(None));
 
-    // Запускаем фоновый C# sidecar-процесс мониторинга железа
-    spawn_hwmon_sidecar(Arc::clone(&hw_telemetry), Arc::clone(&hw_sidecar_child));
+    start_background_services(
+        Arc::clone(&sys),
+        Arc::clone(&networks),
+        Arc::clone(&disk_space),
+        Arc::clone(&hw_telemetry),
+        Arc::clone(&hw_sidecar_child),
+    );
 
     let child_for_exit = Arc::clone(&hw_sidecar_child);
 
     tauri::Builder::default()
         .manage(AppState {
-            sys: Mutex::new(sys),
-            networks: Mutex::new(networks),
+            sys,
+            networks,
+            disk_space,
             ping_cache: Mutex::new((0, None)),
             process_last_refresh: Mutex::new(None),
             hw_telemetry,
             hw_sidecar_child,
             icon_cache: Mutex::new(HashMap::new()),
             drop_hub: Arc::new(drop_server::DropHub::new()),
+            tray_ping_item: Mutex::new(None),
         })
         .setup(|app| {
-            #[cfg(target_os = "windows")]
             if let Some(window) = app.get_webview_window("main") {
+                #[cfg(target_os = "windows")]
                 if let Ok(hwnd) = window.hwnd() {
                     apply_dwm_rounded_corners(hwnd_to_isize(hwnd));
                 }
             }
+
+            let ping_item = tauri::menu::MenuItem::with_id(app, "ping", "Ping: —", false, None::<&str>)?;
+            let title_item = tauri::menu::MenuItem::with_id(app, "title", "NEXUS PC", false, None::<&str>)?;
+            let show_item = tauri::menu::MenuItem::with_id(app, "show", "Показать окно", true, None::<&str>)?;
+            let quit_item = tauri::menu::MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
+            let menu = tauri::menu::Menu::with_items(app, &[&title_item, &ping_item, &show_item, &quit_item])?;
+            if let Some(state) = app.try_state::<AppState>() {
+                if let Ok(mut slot) = state.tray_ping_item.lock() {
+                    *slot = Some(ping_item);
+                }
+            }
+            if let Some(icon) = app.default_window_icon() {
+                let _tray = tauri::tray::TrayIconBuilder::with_id("nexus")
+                    .icon(icon.clone())
+                    .tooltip("NEXUS PC")
+                    .menu(&menu)
+                    .show_menu_on_left_click(false)
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "show" => reveal_main_window(app),
+                        "quit" => {
+                            if let Some(state) = app.try_state::<AppState>() {
+                                if let Ok(mut guard) = state.hw_sidecar_child.lock() {
+                                    if let Some(mut child) = guard.take() {
+                                        let _ = child.kill();
+                                    }
+                                }
+                            }
+                            app.exit(0);
+                        }
+                        _ => {}
+                    })
+                    .on_tray_icon_event(|tray, event| match event {
+                        tauri::tray::TrayIconEvent::Click {
+                            button: tauri::tray::MouseButton::Left,
+                            button_state: tauri::tray::MouseButtonState::Up,
+                            position,
+                            ..
+                        } => toggle_tray_hud(tray.app_handle(), position.x, position.y),
+                        tauri::tray::TrayIconEvent::DoubleClick {
+                            button: tauri::tray::MouseButton::Left,
+                            ..
+                        } => reveal_main_window(tray.app_handle()),
+                        _ => {}
+                    })
+                    .build(app)?;
+            }
             Ok(())
         })
-        .on_window_event(move |window, event| {
-            if let tauri::WindowEvent::Destroyed = event {
+        .on_window_event(move |window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+            tauri::WindowEvent::Destroyed => {
                 if window.label() == "main" {
                     if let Ok(mut guard) = child_for_exit.lock() {
                         if let Some(mut child) = guard.take() {
@@ -2461,6 +4019,7 @@ pub fn run() {
                     }
                 }
             }
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             get_system_metrics,
@@ -2468,6 +4027,7 @@ pub fn run() {
             cancel_shutdown,
             get_startup_items,
             toggle_startup_item,
+            remove_startup_entry,
             open_item_location,
             get_available_drives,
             scan_storage,
@@ -2475,6 +4035,13 @@ pub fn run() {
             is_elevated_admin,
             restart_as_admin,
             app_exit,
+            flush_dns,
+            probe_game_routes,
+            get_packet_priority,
+            set_packet_priority,
+            tune_ethernet_adapter,
+            get_ethernet_tuned,
+            set_ethernet_tuned,
             scan_cleanup_targets,
             execute_cleanup,
             get_process_list,

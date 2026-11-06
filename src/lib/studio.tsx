@@ -1,5 +1,5 @@
-import { useState, memo, type ReactNode, MouseEvent } from "react";
-import { motion, AnimatePresence, type Variants } from "framer-motion";
+import { useEffect, useRef, memo, type ReactNode, type MouseEvent } from "react";
+import { motion, type Variants } from "framer-motion";
 import {
   Sparkles,
 } from "lucide-react";
@@ -26,6 +26,7 @@ export interface StartupItem {
   location: string;
   enabled: boolean;
   file_exists: boolean;
+  phantom: boolean;
 }
 
 export interface FileEntry {
@@ -33,6 +34,7 @@ export interface FileEntry {
   name: string;
   size_bytes: number;
   extension: string;
+  app_label: string;
 }
 
 export interface FolderNode {
@@ -311,18 +313,17 @@ export function getPingHudStyle(pingMs: number): {
       barPercent: 0,
     };
   }
-  if (pingMs < 40) {
+  if (pingMs <= 80) {
     return {
       valueText: `${pingMs}`,
-      statusLabel: "ИДЕАЛЬНО",
-      colorClass: "text-sky-400 drop-shadow-[0_0_12px_rgba(56,189,248,0.35)]",
-      badgeClass:
-        "bg-sky-500/15 text-sky-300 border-sky-500/35 shadow-[0_0_12px_rgba(56,189,248,0.2)]",
-      dotClass: "bg-sky-400 shadow-[0_0_8px_#38bdf8]",
+      statusLabel: pingMs <= 40 ? "ОТЛИЧНО" : "НОРМА",
+      colorClass: "text-emerald-400",
+      badgeClass: "bg-emerald-500/15 text-emerald-300 border-emerald-500/35",
+      dotClass: "bg-emerald-400",
       barPercent: Math.max(12, Math.min(100, (1 - pingMs / 150) * 100)),
     };
   }
-  if (pingMs <= 90) {
+  if (pingMs <= 120) {
     return {
       valueText: `${pingMs}`,
       statusLabel: "СРЕДНЕ",
@@ -561,9 +562,14 @@ export function SegmentedHudBar({
   return (
     <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/[0.06]">
       <div
-        className={`h-full rounded-full transition-[width] duration-500 ease-out ${styles.barClass}`}
-        style={{ width: `${clamped}%` }}
-      />
+        className={`relative h-full overflow-hidden rounded-full ${styles.barClass}`}
+        style={{
+          width: `${clamped}%`,
+          transition: "width 0.5s cubic-bezier(0.4, 0, 0.2, 1)",
+        }}
+      >
+        <span className="bar-shimmer pointer-events-none absolute inset-y-0 left-0 w-2/5" />
+      </div>
     </div>
   );
 }
@@ -589,7 +595,7 @@ export interface SpotlightCardProps {
 export function SpotlightCard({
   children,
   className = "",
-  spotlightColor = "rgba(148, 163, 184, 0.55)",
+  spotlightColor = "rgba(56, 189, 248, 0.12)",
   variants,
 }: SpotlightCardProps) {
   const handleMouseMove = (e: MouseEvent<HTMLDivElement>) => {
@@ -602,15 +608,26 @@ export function SpotlightCard({
     <motion.div
       variants={variants}
       onMouseMove={handleMouseMove}
+      whileHover={{
+        y: -1,
+        transition: { type: "spring", stiffness: 420, damping: 32 },
+      }}
       style={{ "--spotlight-color": spotlightColor } as React.CSSProperties}
-      className={`group relative rounded-xl border border-[#222b38] bg-[#111722] ${className}`}
+      className={`group relative transform-gpu rounded-xl border border-[#222b38] bg-[#111722] transition-colors duration-300 hover:border-slate-700/80 ${className}`}
     >
+      <div
+        className="pointer-events-none absolute inset-0 rounded-xl opacity-0 transition-opacity duration-300 group-hover:opacity-100"
+        style={{
+          background:
+            "radial-gradient(400px circle at var(--mouse-x, -200px) var(--mouse-y, -200px), var(--spotlight-color), transparent 80%)",
+        }}
+      />
       <div
         className="pointer-events-none absolute inset-0 rounded-xl opacity-0 transition-opacity duration-300 group-hover:opacity-100"
         style={{
           padding: "1px",
           background:
-            "radial-gradient(140px circle at var(--mouse-x, 50%) var(--mouse-y, 0px), var(--spotlight-color), transparent 72%)",
+            "radial-gradient(400px circle at var(--mouse-x, -200px) var(--mouse-y, -200px), rgba(56, 189, 248, 0.55), transparent 80%)",
           mask: "linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0)",
           maskComposite: "exclude",
           WebkitMask: "linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0)",
@@ -622,17 +639,87 @@ export function SpotlightCard({
   );
 }
 
+function smoothSeriesPath(
+  coords: { x: number; y: number }[],
+  baseline: number
+): { line: string; area: string } {
+  if (coords.length === 0) return { line: "", area: "" };
+
+  const fmt = (n: number) => n.toFixed(2);
+  let line = `M ${fmt(coords[0].x)} ${fmt(coords[0].y)}`;
+
+  for (let i = 0; i < coords.length - 1; i++) {
+    const p0 = coords[Math.max(0, i - 1)];
+    const p1 = coords[i];
+    const p2 = coords[i + 1];
+    const p3 = coords[Math.min(coords.length - 1, i + 2)];
+    const cp1x = p1.x + (p2.x - p0.x) / 6;
+    const cp1y = p1.y + (p2.y - p0.y) / 6;
+    const cp2x = p2.x - (p3.x - p1.x) / 6;
+    const cp2y = p2.y - (p3.y - p1.y) / 6;
+    line += ` C ${fmt(cp1x)} ${fmt(cp1y)} ${fmt(cp2x)} ${fmt(cp2y)} ${fmt(p2.x)} ${fmt(p2.y)}`;
+  }
+
+  const firstX = fmt(coords[0].x);
+  const lastX = fmt(coords[coords.length - 1].x);
+  const area = `${line} L ${lastX} ${fmt(baseline)} L ${firstX} ${fmt(baseline)} Z`;
+  return { line, area };
+}
+
+function nearestSeries(
+  history: HistoryPoint[],
+  relX: number,
+  relY: number,
+  widthPx: number,
+  heightPx: number,
+  plotWidth: number,
+  plotHeight: number,
+  maxPoints: number
+): { idx: number; series: "cpu" | "ram"; x: number; y: number } | null {
+  if (history.length === 0 || widthPx <= 0 || heightPx <= 0) return null;
+  const slot = Math.round(relX * (maxPoints - 1));
+  const center = Math.max(0, Math.min(history.length - 1, slot));
+  const mouseX = relX * widthPx;
+  const mouseY = relY * heightPx;
+  let best: { idx: number; series: "cpu" | "ram"; x: number; y: number; dist: number } | null = null;
+
+  for (let idx = Math.max(0, center - 2); idx <= Math.min(history.length - 1, center + 2); idx++) {
+    const point = history[idx];
+    const x = (idx / Math.max(1, maxPoints - 1)) * plotWidth;
+    const xPx = (x / plotWidth) * widthPx;
+    const samples: Array<{ series: "cpu" | "ram"; value: number }> = [
+      { series: "cpu", value: point.cpu },
+      { series: "ram", value: point.ram },
+    ];
+    for (const sample of samples) {
+      const clamped = Math.min(100, Math.max(0, sample.value));
+      const y = plotHeight - (clamped / 100) * (plotHeight - 16) - 8;
+      const yPx = (y / plotHeight) * heightPx;
+      const dist = Math.hypot(mouseX - xPx, mouseY - yPx);
+      if (!best || dist < best.dist) {
+        best = { idx, series: sample.series, x, y, dist };
+      }
+    }
+  }
+
+  if (!best || best.dist > 22) return null;
+  return best;
+}
+
 // Изолированный компонент графика истории нагрузки за последние 60 секунд
 export const LoadHistoryChart = memo(function LoadHistoryChart({
   history,
 }: {
   history: HistoryPoint[];
 }) {
-  const [hoverIndex, setHoverIndex] = useState<number | null>(null);
-
   const width = 600;
   const height = 180;
   const maxPoints = HISTORY_LENGTH;
+  const plotRef = useRef<HTMLDivElement>(null);
+  const hoverRef = useRef<{ relX: number; relY: number } | null>(null);
+  const dotRef = useRef<HTMLDivElement>(null);
+  const badgeRef = useRef<HTMLDivElement>(null);
+  const tipRef = useRef<HTMLSpanElement>(null);
 
   const getCoord = (idx: number, val: number) => {
     const x = (idx / Math.max(1, maxPoints - 1)) * width;
@@ -642,46 +729,70 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
   };
 
   const buildPaths = (key: "cpu" | "ram") => {
-    if (history.length === 0) return { line: "", area: "" };
-
     const coords = history.map((pt, idx) => getCoord(idx, pt[key]));
-
-    const line = coords
-      .map((c, i) => `${i === 0 ? "M" : "L"} ${c.x.toFixed(1)} ${c.y.toFixed(1)}`)
-      .join(" ");
-
-    const firstX = coords[0].x.toFixed(1);
-    const lastX = coords[coords.length - 1].x.toFixed(1);
-    const area = `${line} L ${lastX} ${height} L ${firstX} ${height} Z`;
-
-    return { line, area };
+    return smoothSeriesPath(coords, height);
   };
 
   const cpuPaths = buildPaths("cpu");
   const ramPaths = buildPaths("ram");
+  const activePoint = history[history.length - 1];
+  const lastIndex = history.length - 1;
+  const cpuBeacon = activePoint ? getCoord(lastIndex, activePoint.cpu) : null;
+  const ramBeacon = activePoint ? getCoord(lastIndex, activePoint.ram) : null;
 
-  const activePoint =
-    hoverIndex !== null && history[hoverIndex]
-      ? history[hoverIndex]
-      : history[history.length - 1];
+  const paintHover = (relX: number, relY: number) => {
+    const plot = plotRef.current;
+    const rect = plot?.getBoundingClientRect();
+    const hit =
+      rect &&
+      nearestSeries(history, relX, relY, rect.width, rect.height, width, height, maxPoints);
+    if (!hit || !dotRef.current || !badgeRef.current || !tipRef.current) {
+      if (dotRef.current) dotRef.current.style.opacity = "0";
+      if (badgeRef.current) badgeRef.current.style.opacity = "0";
+      return;
+    }
+    const point = history[hit.idx];
+    const value = hit.series === "cpu" ? point.cpu : point.ram;
+    const xPct = (hit.x / width) * 100;
+    const yPct = (hit.y / height) * 100;
+    dotRef.current.style.opacity = "1";
+    dotRef.current.style.left = `${xPct}%`;
+    dotRef.current.style.top = `${yPct}%`;
+    dotRef.current.style.background = hit.series === "cpu" ? "#38bdf8" : "#2dd4bf";
+    dotRef.current.style.boxShadow =
+      hit.series === "cpu"
+        ? "0 0 8px rgba(56, 189, 248, 0.85)"
+        : "0 0 8px rgba(45, 212, 191, 0.8)";
+    badgeRef.current.style.opacity = "1";
+    badgeRef.current.style.left = `${Math.min(84, Math.max(16, xPct))}%`;
+    tipRef.current.textContent = `${point.timestamp}  ${hit.series === "cpu" ? "CPU" : "RAM"} ${value.toFixed(1)}%`;
+    tipRef.current.style.color = hit.series === "cpu" ? "#38bdf8" : "#5eead4";
+  };
 
-  const hoverCoordCpu =
-    hoverIndex !== null && history[hoverIndex]
-      ? getCoord(hoverIndex, history[hoverIndex].cpu)
-      : null;
+  const hideHover = () => {
+    hoverRef.current = null;
+    if (dotRef.current) dotRef.current.style.opacity = "0";
+    if (badgeRef.current) badgeRef.current.style.opacity = "0";
+  };
 
-  const hoverCoordRam =
-    hoverIndex !== null && history[hoverIndex]
-      ? getCoord(hoverIndex, history[hoverIndex].ram)
-      : null;
+  const moveHover = (clientX: number, clientY: number, rect: DOMRect) => {
+    if (history.length === 0 || rect.width <= 0 || rect.height <= 0) return;
+    const relX = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    const relY = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
+    hoverRef.current = { relX, relY };
+    paintHover(relX, relY);
+  };
 
-  const hoverPercentX =
-    hoverIndex !== null ? (hoverIndex / Math.max(1, maxPoints - 1)) * 100 : 50;
+  useEffect(() => {
+    const hover = hoverRef.current;
+    if (!hover) return;
+    paintHover(hover.relX, hover.relY);
+  }, [history, maxPoints]);
 
   return (
     <SpotlightCard
       variants={cardItemVariants}
-      spotlightColor="rgba(34, 211, 238, 0.09)"
+      spotlightColor="rgba(56, 189, 248, 0.12)"
       className="p-5 sm:p-6"
     >
       <div className="space-y-4">
@@ -710,150 +821,156 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
             </div>
             <div className="h-3.5 w-px bg-zinc-800" />
             <div className="flex items-center gap-2">
-              <span className="h-2.5 w-2.5 rounded-full bg-cyan-400 shadow-[0_0_10px_rgba(34,211,238,0.85)]"></span>
+              <span className="h-2.5 w-2.5 rounded-full bg-teal-400 shadow-[0_0_10px_rgba(45,212,191,0.75)]"></span>
               <span className="text-[#8793a5]">RAM:</span>
-              <span className="w-12 text-right font-mono font-semibold text-cyan-400">
+              <span className="w-12 text-right font-mono font-semibold text-teal-300">
                 {activePoint ? `${activePoint.ram.toFixed(1)}%` : "0.0%"}
               </span>
             </div>
           </div>
         </div>
 
-        {/* Область SVG-графика */}
-        <div className="relative h-[260px] w-full select-none">
-          <div className="pointer-events-none absolute inset-y-0 left-2 z-10 flex flex-col justify-between py-2 font-mono text-xs text-slate-500">
-            <span>100%</span>
-            <span>75%</span>
-            <span>50%</span>
-            <span>25%</span>
-            <span>0%</span>
-          </div>
-
-          <AnimatePresence>
-            {hoverIndex !== null && history[hoverIndex] && (
-              <motion.div
-                initial={{ opacity: 0, y: 6, scale: 0.94 }}
-                animate={{ opacity: 1, y: 0, scale: 1 }}
-                exit={{ opacity: 0, y: 4, scale: 0.94 }}
-                transition={{ duration: 0.14, ease: "easeOut" }}
-                style={{
-                  left: `${Math.min(86, Math.max(14, hoverPercentX))}%`,
-                }}
-                className="pointer-events-none absolute top-2.5 z-20 flex -translate-x-1/2 items-center gap-3 whitespace-nowrap rounded-xl border border-[#222b38] bg-[#111722] px-3 py-1.5 font-mono text-xs shadow-lg"
-              >
-                <span className="text-[#8793a5]">{history[hoverIndex].timestamp}</span>
-                <span className="text-sky-400 font-semibold">
-                  CPU {history[hoverIndex].cpu.toFixed(1)}%
-                </span>
-                <span className="text-cyan-400 font-semibold">
-                  RAM {history[hoverIndex].ram.toFixed(1)}%
-                </span>
-              </motion.div>
-            )}
-          </AnimatePresence>
-
-          <svg
-            viewBox={`0 0 ${width} ${height}`}
-            preserveAspectRatio="none"
-            className="w-full h-full overflow-visible rounded-xl bg-[#151c27]/90 border border-white/5 cursor-crosshair"
-            onMouseMove={(e) => {
-              const rect = e.currentTarget.getBoundingClientRect();
-              const relX = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-              const idx = Math.round(relX * (history.length - 1));
-              setHoverIndex(idx);
-            }}
-            onMouseLeave={() => setHoverIndex(null)}
+        <div>
+          <div
+            ref={plotRef}
+            className="relative h-[260px] w-full select-none"
+            onMouseMove={(e) => moveHover(e.clientX, e.clientY, e.currentTarget.getBoundingClientRect())}
+            onMouseLeave={hideHover}
           >
-            <defs>
-              <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
-                <feGaussianBlur stdDeviation="3.2" result="blur" />
-                <feMerge>
-                  <feMergeNode in="blur" />
-                  <feMergeNode in="SourceGraphic" />
-                </feMerge>
-              </filter>
+            <div className="pointer-events-none absolute inset-y-0 left-2 z-10 flex flex-col justify-between py-2 font-mono text-xs text-slate-500">
+              <span>100%</span>
+              <span>75%</span>
+              <span>50%</span>
+              <span>25%</span>
+              <span>0%</span>
+            </div>
 
-              <linearGradient id="cpuAreaGrad" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#38bdf8" stopOpacity="0.34" />
-                <stop offset="65%" stopColor="#38bdf8" stopOpacity="0.08" />
-                <stop offset="100%" stopColor="#38bdf8" stopOpacity="0.0" />
-              </linearGradient>
-              <linearGradient id="ramAreaGrad" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#22d3ee" stopOpacity="0.26" />
-                <stop offset="65%" stopColor="#22d3ee" stopOpacity="0.06" />
-                <stop offset="100%" stopColor="#22d3ee" stopOpacity="0.0" />
-              </linearGradient>
-            </defs>
-
-            {[0.25, 0.5, 0.75].map((ratio) => (
-              <line
-                key={ratio}
-                x1={0}
-                y1={height * ratio}
-                x2={width}
-                y2={height * ratio}
-                stroke="#27272a"
-                strokeOpacity="0.65"
-                strokeDasharray="4 4"
-                strokeWidth="1"
-              />
-            ))}
-
-            <path d={ramPaths.area} fill="url(#ramAreaGrad)" />
-            <path
-              d={ramPaths.line}
-              fill="none"
-              stroke="#22d3ee"
-              strokeWidth="2.2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              filter="url(#glow)"
+            <div
+              ref={dotRef}
+              className="pointer-events-none absolute z-10 h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full opacity-0"
             />
+            <div
+              ref={badgeRef}
+              className="pointer-events-none absolute top-2.5 z-20 -translate-x-1/2 whitespace-nowrap rounded-lg border border-[#222b38] bg-[#0e1118] px-2.5 py-1 font-mono text-xs opacity-0 shadow-lg"
+            >
+              <span ref={tipRef} className="font-semibold" />
+            </div>
 
-            <path d={cpuPaths.area} fill="url(#cpuAreaGrad)" />
-            <path
-              d={cpuPaths.line}
-              fill="none"
-              stroke="#38bdf8"
-              strokeWidth="2.2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              filter="url(#glow)"
-            />
+            <svg
+              viewBox={`0 0 ${width} ${height}`}
+              preserveAspectRatio="none"
+              className="pointer-events-none h-full w-full transform-gpu overflow-visible rounded-xl border border-white/5 bg-[#151c27]/90"
+            >
+              <defs>
+                <linearGradient id="cpuStroke" x1="0" y1="0" x2={width} y2="0" gradientUnits="userSpaceOnUse">
+                  <stop offset="0%" stopColor="#38bdf8" />
+                  <stop offset="100%" stopColor="#6366f1" />
+                </linearGradient>
+                <linearGradient id="ramStroke" x1="0" y1="0" x2={width} y2="0" gradientUnits="userSpaceOnUse">
+                  <stop offset="0%" stopColor="#2dd4bf" />
+                  <stop offset="100%" stopColor="#10b981" />
+                </linearGradient>
+                <linearGradient id="cpuGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#38bdf8" stopOpacity="0.25" />
+                  <stop offset="100%" stopColor="#6366f1" stopOpacity="0" />
+                </linearGradient>
+                <linearGradient id="ramGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#2dd4bf" stopOpacity="0.25" />
+                  <stop offset="100%" stopColor="#10b981" stopOpacity="0" />
+                </linearGradient>
+              </defs>
 
-            {hoverIndex !== null && hoverCoordCpu && hoverCoordRam && (
-              <g>
+              {[0.25, 0.5, 0.75].map((ratio) => (
                 <line
-                  x1={hoverCoordCpu.x}
-                  y1={0}
-                  x2={hoverCoordCpu.x}
-                  y2={height}
-                  stroke="#a1a1aa"
-                  strokeOpacity="0.5"
+                  key={ratio}
+                  x1={0}
+                  y1={height * ratio}
+                  x2={width}
+                  y2={height * ratio}
+                  stroke="#27272a"
+                  strokeOpacity="0.65"
+                  strokeDasharray="4 4"
                   strokeWidth="1"
-                  strokeDasharray="3 3"
                 />
-                <circle
-                  cx={hoverCoordRam.x}
-                  cy={hoverCoordRam.y}
-                  r="4.5"
-                  fill="#090b0e"
-                  stroke="#22d3ee"
-                  strokeWidth="2.5"
-                  filter="url(#glow)"
-                />
-                <circle
-                  cx={hoverCoordCpu.x}
-                  cy={hoverCoordCpu.y}
-                  r="4.5"
-                  fill="#090b0e"
-                  stroke="#38bdf8"
-                  strokeWidth="2.5"
-                  filter="url(#glow)"
-                />
-              </g>
+              ))}
+
+              <path d={ramPaths.area} fill="url(#ramGrad)" />
+              <path
+                d={ramPaths.line}
+                fill="none"
+                stroke="url(#ramStroke)"
+                strokeWidth="5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                opacity="0.28"
+                vectorEffect="non-scaling-stroke"
+              />
+              <path
+                d={ramPaths.line}
+                fill="none"
+                stroke="url(#ramStroke)"
+                strokeWidth="2.2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                vectorEffect="non-scaling-stroke"
+                style={{
+                  filter:
+                    "drop-shadow(0 0 2px rgba(45,212,191,0.7)) drop-shadow(0 0 8px rgba(16,185,129,0.35))",
+                }}
+              />
+
+              <path d={cpuPaths.area} fill="url(#cpuGrad)" />
+              <path
+                d={cpuPaths.line}
+                fill="none"
+                stroke="url(#cpuStroke)"
+                strokeWidth="5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                opacity="0.32"
+                vectorEffect="non-scaling-stroke"
+              />
+              <path
+                d={cpuPaths.line}
+                fill="none"
+                stroke="url(#cpuStroke)"
+                strokeWidth="2.2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                vectorEffect="non-scaling-stroke"
+                style={{ filter: "drop-shadow(0 0 8px rgba(56, 189, 248, 0.45))" }}
+              />
+            </svg>
+
+            {ramBeacon && (
+              <div
+                className="pointer-events-none absolute z-10"
+                style={{
+                  left: `${(ramBeacon.x / width) * 100}%`,
+                  top: `${(ramBeacon.y / height) * 100}%`,
+                }}
+              >
+                <div className="relative h-3.5 w-3.5 -translate-x-1/2 -translate-y-1/2 transform-gpu">
+                  <span className="absolute inset-0 animate-ping rounded-full bg-teal-300/70" />
+                  <span className="absolute left-1/2 top-1/2 h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-teal-200 shadow-[0_0_8px_rgba(45,212,191,0.9)]" />
+                </div>
+              </div>
             )}
-          </svg>
+            {cpuBeacon && (
+              <div
+                className="pointer-events-none absolute z-10"
+                style={{
+                  left: `${(cpuBeacon.x / width) * 100}%`,
+                  top: `${(cpuBeacon.y / height) * 100}%`,
+                }}
+              >
+                <div className="relative h-3.5 w-3.5 -translate-x-1/2 -translate-y-1/2 transform-gpu">
+                  <span className="absolute inset-0 animate-ping rounded-full bg-sky-400/75" />
+                  <span className="absolute left-1/2 top-1/2 h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-sky-200 shadow-[0_0_8px_rgba(56,189,248,0.95)]" />
+                </div>
+              </div>
+            )}
+          </div>
 
           <div className="mt-1.5 flex justify-between px-1 text-xs text-slate-500">
             <span>-60 сек</span>

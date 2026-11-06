@@ -2185,6 +2185,7 @@ dependencies = [
  "jwalk",
  "png",
  "qrcode",
+ "rayon",
  "serde",
  "serde_json",
  "sysinfo",

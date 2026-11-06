@@ -1,9 +1,10 @@
-import type { ReactNode } from "react";
+import { useEffect, type ReactNode } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import type { LucideIcon } from "lucide-react";
 import {
-  Activity, Cpu, HardDrive, LayoutDashboard, Loader2, Network, Power, Rocket, Smartphone, Trash2,
+  Activity, Cpu, HardDrive, LayoutDashboard, Loader2, LogOut, Minimize2, Network, Power, Rocket, Smartphone, Trash2,
 } from "lucide-react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useNexusController } from "./hooks/useNexusController";
 import {
   formatCountdown,
@@ -61,17 +62,20 @@ function SidebarItem({
 export default function App() {
   const c = useNexusController();
 
+  useEffect(() => {
+    const window = getCurrentWindow();
+    void window.show();
+    void window.setFocus();
+  }, []);
+
   return (
-    <div className="relative flex h-screen w-screen select-none flex-col overflow-hidden rounded-3xl border border-[#222b38] bg-[#07080b] font-sans text-slate-100">
+    <div className="nexus-shell relative flex h-screen w-screen select-none flex-col overflow-hidden rounded-3xl border border-[#222b38] font-sans text-slate-100">
 
       <TitleBar
         isElevatedAdmin={c.isElevatedAdmin}
-        adminMenuOpen={c.adminMenuOpen}
-        setAdminMenuOpen={c.setAdminMenuOpen}
         adminError={c.adminError}
         onRestartAsAdmin={c.handleRestartAsAdmin}
         onToggleMaximize={c.handleWindowToggleMaximize}
-        onClose={c.handleWindowClose}
       />
 
       {/* Рабочая область под кастомным тайтлбаром */}
@@ -161,35 +165,50 @@ export default function App() {
             </div>
           </nav>
         </div>
-        {/* Нижний приборный блок статуса ядра и пинга */}
         <div className="space-y-2 px-1">
-          <div className="flex items-center justify-between rounded-lg border border-[#222b38] bg-[#111722] px-3 py-2 text-xs">
-            <span className="text-slate-500">Пинг</span>
-            <span className={`font-mono font-medium tabular-nums ${c.pingStyle.colorClass}`}>
-              {c.metrics.net_ping_ms > 0 ? `${c.metrics.net_ping_ms} мс` : "нет сети"}
-            </span>
-          </div>
-          <div className="flex items-center justify-between rounded-lg border border-[#222b38] bg-[#111722] px-3 py-2 text-xs text-slate-500">
-            <span>Ядро</span>
-            <span className="flex items-center gap-2 text-emerald-400">
-              <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-              Онлайн
-            </span>
-          </div>
+          <button
+            type="button"
+            onClick={() => {
+              getCurrentWindow().hide().catch(() => {});
+            }}
+            className="flex w-full items-center gap-2 rounded-lg border border-[#222b38] bg-[#111722] px-3 py-2 text-xs text-slate-300 transition-colors hover:bg-[#151c27] hover:text-slate-100"
+          >
+            <Minimize2 size={14} />
+            Свернуть в трей
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              c.handleWindowClose();
+            }}
+            className="flex w-full items-center gap-2 rounded-lg border border-[#222b38] bg-[#111722] px-3 py-2 text-xs text-rose-300 transition-colors hover:bg-rose-500/10"
+          >
+            <LogOut size={14} />
+            Выход
+          </button>
         </div>
       </aside>
 
       <main className="relative z-10 flex-1 min-w-0 flex flex-col overflow-y-auto p-6 lg:p-7">
         <AnimatePresence mode="wait">
-          {c.activeTab === "dashboard" && <DashboardModule c={c} />}
-          {c.activeTab === "startup" && <StartupModule c={c} />}
-          {c.activeTab === "storage" && <StorageModule c={c} />}
-          {c.activeTab === "hardware" && <HardwareModule c={c} />}
-          {c.activeTab === "cleanup" && <CleanupModule c={c} />}
-          {c.activeTab === "power" && <PowerModule c={c} />}
-          {c.activeTab === "processes" && <ProcessModule c={c} />}
-          {c.activeTab === "network" && <NetworkModule c={c} />}
-          {c.activeTab === "drop" && <DropModule />}
+          <motion.div
+            key={c.activeTab}
+            initial={{ opacity: 0, y: 6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -4 }}
+            transition={{ duration: 0.18, ease: "easeOut" }}
+            className="w-full transform-gpu"
+          >
+            {c.activeTab === "dashboard" && <DashboardModule c={c} />}
+            {c.activeTab === "startup" && <StartupModule c={c} />}
+            {c.activeTab === "storage" && <StorageModule c={c} />}
+            {c.activeTab === "hardware" && <HardwareModule c={c} />}
+            {c.activeTab === "cleanup" && <CleanupModule c={c} />}
+            {c.activeTab === "power" && <PowerModule c={c} />}
+            {c.activeTab === "processes" && <ProcessModule c={c} />}
+            {c.activeTab === "network" && <NetworkModule c={c} />}
+            {c.activeTab === "drop" && <DropModule />}
+          </motion.div>
         </AnimatePresence>
       </main>
       </div>

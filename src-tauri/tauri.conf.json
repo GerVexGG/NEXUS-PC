@@ -11,7 +11,8 @@
   },
   "app": {
     "windows": [
-      {
+        {
+        "label": "main",
         "title": "NEXUS PC",
         "width": 1240,
         "height": 800,
@@ -19,6 +20,21 @@
         "minHeight": 620,
         "decorations": false,
         "transparent": true,
+        "shadow": true,
+        "visible": false
+      },
+      {
+        "label": "tray_hud",
+        "title": "NEXUS PC",
+        "url": "index.html?view=tray",
+        "width": 280,
+        "height": 180,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "visible": false,
+        "skipTaskbar": true,
+        "resizable": false,
         "shadow": true
       }
     ],
@@ -36,8 +52,8 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": {
-      "../hwmon-sidecar/bin/publish/nexus-hwmon.exe": "nexus-hwmon.exe"
-    }
+    "resources": [
+      "nexus-hwmon.exe"
+    ]
   }
 }

@@ -400,7 +400,7 @@ export function NetworkModule({ c }: { c: NexusController }) {
             style={{ left: menu.x, top: menu.y }}
             onMouseDown={(event) => event.stopPropagation()}
             onContextMenu={(event) => event.preventDefault()}
-            className="fixed z-[100] w-64 rounded-xl backdrop-blur-2xl bg-[#111722]/97 border border-[#222b38] shadow-[0_18px_44px_rgba(0,0,0,0.85)] p-1.5 font-mono text-xs"
+            className="fixed z-[100] w-64 rounded-xl bg-[#111722] border border-[#222b38] shadow-[0_18px_44px_rgba(0,0,0,0.85)] p-1.5 font-mono text-xs"
           >
             <div className="px-2.5 py-2 mb-1 rounded-lg bg-[#151c27] border border-[#222b38]">
               <div className="text-[#e8edf4] font-bold truncate">{menu.conn.process_name}</div>

@@ -11,6 +11,27 @@ function cleanupSafety(id: string): { badge: string; badgeClass: string; descrip
       description: "Не затрагивает программы и личные файлы.",
     };
   }
+  if (id === "browser_cache") {
+    return {
+      badge: "100% БЕЗОПАСНО",
+      badgeClass: "border-emerald-500/30 bg-emerald-500/10 text-emerald-300",
+      description: "Временный кэш картинок, стилей и скриптов. Сессии и пароли сохраняются.",
+    };
+  }
+  if (id === "windows_update") {
+    return {
+      badge: "100% БЕЗОПАСНО",
+      badgeClass: "border-emerald-500/30 bg-emerald-500/10 text-emerald-300",
+      description: "Установочные пакеты уже применённых обновлений операционной системы.",
+    };
+  }
+  if (id === "discord_cache") {
+    return {
+      badge: "100% БЕЗОПАСНО",
+      badgeClass: "border-emerald-500/30 bg-emerald-500/10 text-emerald-300",
+      description: "Кэшированные превью медиафайлов и голосовых сообщений.",
+    };
+  }
   if (id === "shader_cache") {
     return {
       badge: "КЭШ ШЕЙДЕРОВ",
@@ -128,7 +149,7 @@ export function CleanupModule({ c }: { c: NexusController }) {
         )}
       </div>
 
-      <div className="sticky bottom-3 z-20 flex flex-col gap-3 rounded-xl border border-[#222b38] bg-[#0e1118]/90 p-3 backdrop-blur sm:flex-row sm:items-center sm:justify-between">
+      <div className="sticky bottom-3 z-20 flex flex-col gap-3 rounded-xl border border-[#222b38] bg-[#0e1118] p-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="text-sm text-slate-300">
           Выбрано к удалению:{" "}
           <span className="font-mono font-bold text-cyan-400">{formatSelectedGb(selectedCleanupBytes)}</span>

@@ -8,6 +8,7 @@ import {
   Search,
   SearchX,
   ShieldCheck,
+  Trash2,
 } from "lucide-react";
 import type { StartupItem } from "../../lib/studio";
 import type { NexusController } from "../../hooks/useNexusController";
@@ -16,6 +17,9 @@ type StartupFilter = "all" | "on" | "off";
 
 function sourceBadge(location: string): string {
   const value = location.toLowerCase();
+  if (value.includes("store") || value.includes("приложен")) return "Store";
+  if (value.includes("планировщик") || value.includes("cim")) return "Вход в систему";
+  if (value.includes("общая")) return "Общая папка";
   if (value.includes("hkcu")) return "HKCU Run";
   if (value.includes("hklm")) return "HKLM Run";
   if (value.includes("папк")) return "Папка Автозапуск";
@@ -47,18 +51,23 @@ export function StartupModule({ c }: { c: NexusController }) {
     startupError,
     fetchStartupItems,
     handleToggleStartup,
+    handleRemoveStartup,
     handleOpenItemLocation,
     totalStartupCount,
     filteredStartupItems,
+    startupItems,
   } = c;
   const [statusFilter, setStatusFilter] = useState<StartupFilter>("all");
+  const [phantomsOnly, setPhantomsOnly] = useState(false);
+  const phantomCount = startupItems.filter((item) => item.phantom).length;
 
   const visibleItems = filteredStartupItems.filter((item) => {
-    if (statusFilter === "on") return item.enabled;
-    if (statusFilter === "off") return !item.enabled;
+    if (phantomsOnly && !item.phantom) return false;
+    if (statusFilter === "on") return item.enabled && !item.phantom;
+    if (statusFilter === "off") return !item.enabled && !item.phantom;
     return true;
   });
-  const searchActive = startupSearch.trim().length > 0 || statusFilter !== "all";
+  const searchActive = startupSearch.trim().length > 0 || statusFilter !== "all" || phantomsOnly;
 
   return (
     <motion.div
@@ -108,6 +117,19 @@ export function StartupModule({ c }: { c: NexusController }) {
             </button>
           ))}
         </div>
+        {phantomCount > 0 && (
+          <button
+            type="button"
+            onClick={() => setPhantomsOnly((value) => !value)}
+            className={`rounded-full border px-3 py-1 text-xs font-medium transition-colors ${
+              phantomsOnly
+                ? "border-rose-500/30 bg-rose-500/10 text-rose-300"
+                : "border-[#222b38] bg-[#111722] text-rose-300 hover:bg-rose-500/10"
+            }`}
+          >
+            Найдено фантомных записей в реестре: {phantomCount}
+          </button>
+        )}
         <div className="relative min-w-0 flex-1">
           <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
           <input
@@ -165,6 +187,7 @@ export function StartupModule({ c }: { c: NexusController }) {
               item={item}
               onOpen={() => void handleOpenItemLocation(item)}
               onToggle={() => void handleToggleStartup(item)}
+              onRemove={() => void handleRemoveStartup(item)}
             />
           ))}
         </div>
@@ -177,10 +200,12 @@ function StartupRow({
   item,
   onOpen,
   onToggle,
+  onRemove,
 }: {
   item: StartupItem;
   onOpen: () => void;
   onToggle: () => void;
+  onRemove: () => void;
 }) {
   const path = item.clean_path || item.command;
   const hint = folderHint(path);
@@ -197,7 +222,20 @@ function StartupRow({
         {item.file_exists ? <AppWindow size={16} /> : <AlertTriangle size={16} />}
       </div>
       <div className="min-w-0 flex-1">
-        <div className="truncate text-sm font-medium text-slate-100">{item.name}</div>
+        <div className="flex min-w-0 items-center gap-2">
+          <div className="truncate text-sm font-medium text-slate-100">{item.name}</div>
+          {item.phantom ? (
+            <span className="shrink-0 rounded-md border border-rose-500/20 bg-rose-500/10 px-1.5 py-0.5 text-[11px] text-rose-400">
+              Осиротевшая запись реестра
+            </span>
+          ) : (
+            !item.file_exists && (
+              <span className="shrink-0 rounded-md border border-rose-500/20 bg-rose-500/10 px-1.5 py-0.5 text-[11px] text-rose-400">
+                Мертвая запись
+              </span>
+            )
+          )}
+        </div>
         <div className="truncate text-xs text-slate-400">
           {hint && <span>{hint} · </span>}
           <span className="font-mono">{path}</span>
@@ -206,29 +244,51 @@ function StartupRow({
       <span className="hidden shrink-0 rounded-md border border-[#222b38] px-2 py-1 text-xs text-slate-400 sm:inline">
         {sourceBadge(item.location)}
       </span>
-      <button
-        type="button"
-        onClick={onOpen}
-        className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-[#222b38] bg-[#151c27] px-2.5 py-1.5 text-xs font-medium text-slate-200 hover:bg-[#1a2332]"
-      >
-        <FolderOpen size={13} />
-        Открыть папку
-      </button>
-      <button
-        type="button"
-        role="switch"
-        aria-checked={item.enabled}
-        onClick={onToggle}
-        className={`relative h-5 w-9 shrink-0 rounded-full border transition-colors ${
-          item.enabled ? "border-sky-500/40 bg-sky-500/30" : "border-[#222b38] bg-[#151c27]"
-        }`}
-      >
-        <span
-          className={`absolute top-0.5 h-3.5 w-3.5 rounded-full transition-all ${
-            item.enabled ? "left-4 bg-sky-300" : "left-0.5 bg-slate-500"
+      {!item.phantom && (
+        <button
+          type="button"
+          onClick={onOpen}
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-[#222b38] bg-[#151c27] px-2.5 py-1.5 text-xs font-medium text-slate-200 hover:bg-[#1a2332]"
+        >
+          <FolderOpen size={13} />
+          Открыть папку
+        </button>
+      )}
+      {item.phantom ? (
+        <button
+          type="button"
+          onClick={onRemove}
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-rose-500/20 bg-rose-500/10 px-2.5 py-1.5 text-xs font-medium text-rose-400 hover:bg-rose-500/15"
+        >
+          <Trash2 size={13} />
+          Удалить ключ
+        </button>
+      ) : item.file_exists ? (
+        <button
+          type="button"
+          role="switch"
+          aria-checked={item.enabled}
+          onClick={onToggle}
+          className={`relative h-5 w-9 shrink-0 rounded-full border transition-colors ${
+            item.enabled ? "border-sky-500/40 bg-sky-500/30" : "border-[#222b38] bg-[#151c27]"
           }`}
-        />
-      </button>
+        >
+          <span
+            className={`absolute top-0.5 h-3.5 w-3.5 rounded-full transition-all ${
+              item.enabled ? "left-4 bg-sky-300" : "left-0.5 bg-slate-500"
+            }`}
+          />
+        </button>
+      ) : (
+        <button
+          type="button"
+          onClick={onRemove}
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-rose-500/20 bg-rose-500/10 px-2.5 py-1.5 text-xs font-medium text-rose-400 hover:bg-rose-500/15"
+        >
+          <Trash2 size={13} />
+          Удалить хвост
+        </button>
+      )}
     </div>
   );
 }
