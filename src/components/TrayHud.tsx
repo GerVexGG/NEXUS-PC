@@ -51,22 +51,22 @@ export function TrayHud() {
   const stable = jitter !== null && jitter <= 7;
 
   return (
-    <div className="flex h-screen w-screen flex-col justify-between rounded-xl border border-[#222b38] bg-[#111722] p-3 text-slate-100">
+    <div className="hud-bg flex h-screen w-screen flex-col justify-between border border-slate-800 bg-[#080b11] p-3 text-slate-100">
       <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs">
-        <span className="text-slate-400">Пинг</span>
-        <span className={`text-right font-mono font-semibold ${ping === null ? "text-slate-400" : ping <= 80 ? "text-emerald-400" : ping <= 120 ? "text-amber-400" : "text-rose-400"}`}>
+        <span className="font-mono text-[11px] text-slate-400">PING</span>
+        <span className={`text-right font-mono font-bold ${ping === null ? "text-slate-400" : ping <= 80 ? "text-emerald-400" : ping <= 120 ? "text-amber-400" : "text-rose-400"}`}>
           {ping === null ? "—" : `${ping} ms`}
         </span>
-        <span className="text-slate-400">Джиттер</span>
-        <span className="text-right font-mono font-semibold text-slate-100">{jitter === null ? "—" : `±${jitter} ms`}</span>
-        <span className="text-slate-400">Стабильность</span>
-        <span className={`text-right ${jitter === null ? "text-slate-400" : stable ? "text-emerald-300" : "text-amber-300"}`}>
-          {jitter === null ? "Сбор данных" : stable ? "Стабильно" : "Пакетный джиттер"}
+        <span className="font-mono text-[11px] text-slate-400">JITTER</span>
+        <span className="text-right font-mono font-bold text-slate-100">{jitter === null ? "—" : `±${jitter} ms`}</span>
+        <span className="font-mono text-[11px] text-slate-400">LINK</span>
+        <span className={`text-right font-mono text-[11px] ${jitter === null ? "text-slate-400" : stable ? "text-emerald-300" : "text-amber-300"}`}>
+          {jitter === null ? "SCANNING" : stable ? "STABLE" : "JITTER"}
         </span>
-        <span className="text-slate-400">CPU</span>
-        <span className="text-right font-mono">{metrics ? `${metrics.cpu_usage.toFixed(0)}%` : "—"}</span>
-        <span className="text-slate-400">RAM</span>
-        <span className="text-right font-mono">{metrics ? `${metrics.ram_percentage.toFixed(0)}%` : "—"}</span>
+        <span className="font-mono text-[11px] text-slate-400">CPU</span>
+        <span className="text-right font-mono font-bold text-cyan-300">{metrics ? `${metrics.cpu_usage.toFixed(0)}%` : "—"}</span>
+        <span className="font-mono text-[11px] text-slate-400">RAM</span>
+        <span className="text-right font-mono font-bold text-cyan-300">{metrics ? `${metrics.ram_percentage.toFixed(0)}%` : "—"}</span>
       </div>
       <div className="mt-2 flex gap-1.5">
         <button
@@ -80,16 +80,16 @@ export function TrayHud() {
               await getCurrentWindow().hide();
             })();
           }}
-          className="flex-1 rounded-lg border border-[#222b38] bg-[#151c27] px-2 py-1.5 text-[11px] text-slate-200 hover:bg-[#1a2332]"
+          className="cyber-btn flex-1 px-2 py-1.5 font-mono text-[11px] font-semibold text-cyan-200"
         >
-          Развернуть NEXUS PC
+          РАЗВЕРНУТЬ NEXUS
         </button>
         <button
           type="button"
           onClick={() => void invoke("app_exit")}
-          className="rounded-lg border border-rose-500/30 bg-rose-500/15 px-2 py-1.5 text-[11px] text-rose-300 hover:bg-rose-500/25"
+          className="cyber-btn-danger px-2.5 py-1.5 font-mono text-[11px] font-semibold text-rose-200"
         >
-          Выход
+          ВЫХОД
         </button>
       </div>
     </div>

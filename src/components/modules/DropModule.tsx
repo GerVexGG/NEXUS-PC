@@ -181,7 +181,7 @@ export function DropModule() {
       )}
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <div className="rounded-xl border border-[#222b38] bg-[#111722] p-4">
+        <div className="card-cyber-hover rounded-xl border border-[#222b38] bg-[#111722] p-4">
           <h3 className="text-sm font-semibold text-slate-100">Точка подключения</h3>
           <div className="mt-3 w-fit rounded-lg bg-white p-2.5">
             {session.is_running && session.qr_svg ? (
@@ -230,7 +230,7 @@ export function DropModule() {
           </ol>
         </div>
 
-        <div className="flex min-h-[320px] flex-col rounded-xl border border-[#222b38] bg-[#111722]">
+        <div className="card-cyber-hover flex min-h-[320px] flex-col rounded-xl border border-[#222b38] bg-[#111722]">
           <div className="flex items-center justify-between gap-2 border-b border-[#222b38] px-4 py-3">
             <h3 className="text-sm font-semibold text-slate-100">История приёма</h3>
             <button

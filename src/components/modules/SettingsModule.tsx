@@ -168,7 +168,7 @@ export function SettingsModule({ c }: { c?: NexusController }) {
         <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">{error}</div>
       )}
 
-      <section className="space-y-3 rounded-xl border border-[#222b38] bg-[#111722] p-4">
+      <section className="card-cyber-hover space-y-3 rounded-xl border border-[#222b38] bg-[#111722] p-4">
         <h3 className="text-sm font-semibold text-slate-100">Запуск и поведение</h3>
         <Toggle checked={draft.autostart} label="Запуск вместе с Windows" onChange={(autostart) => setDraft({ ...draft, autostart })} />
         <Toggle
@@ -183,7 +183,7 @@ export function SettingsModule({ c }: { c?: NexusController }) {
         />
       </section>
 
-      <section className="space-y-4 rounded-xl border border-[#222b38] bg-[#111722] p-4">
+      <section className="card-cyber-hover space-y-4 rounded-xl border border-[#222b38] bg-[#111722] p-4">
         <h3 className="text-sm font-semibold text-slate-100">Аппаратный опрос и уведомления</h3>
         <div>
           <div className="mb-2 text-xs text-slate-400">Интервал опроса датчиков</div>

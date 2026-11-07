@@ -598,16 +598,15 @@ export function SegmentedHudBar({
   const styles = getLoadBarStyles(clamped, theme);
 
   return (
-    <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/[0.06]">
+    <div className="relative h-2 w-full overflow-hidden rounded-sm border border-slate-800/90 bg-[#070a10] p-[1px]">
       <div
-        className={`relative h-full overflow-hidden rounded-full ${styles.barClass}`}
+        className={`shimmer-bar relative h-full overflow-hidden rounded-[1px] ${styles.barClass}`}
         style={{
           width: `${clamped}%`,
-          transition: "width 0.5s cubic-bezier(0.4, 0, 0.2, 1)",
+          transition: "width 0.45s cubic-bezier(0.4, 0, 0.2, 1)",
         }}
-      >
-        <span className="bar-shimmer pointer-events-none absolute inset-y-0 left-0 w-2/5" />
-      </div>
+      />
+      <div className="hud-scale-ticks pointer-events-none absolute inset-0 z-10" />
     </div>
   );
 }
@@ -651,7 +650,7 @@ export function SpotlightCard({
         transition: { type: "spring", stiffness: 420, damping: 32 },
       }}
       style={{ "--spotlight-color": spotlightColor } as React.CSSProperties}
-      className={`group relative transform-gpu rounded-xl border border-[#222b38] bg-[#111722] transition-colors duration-300 hover:border-slate-700/80 ${className}`}
+      className={`tactical-card tactical-brackets group relative transform-gpu rounded-xl transition-colors duration-300 ${className}`}
     >
       <div
         className="pointer-events-none absolute inset-0 rounded-xl opacity-0 transition-opacity duration-300 group-hover:opacity-100"
@@ -840,8 +839,8 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
               <h3 className="text-base font-semibold tracking-tight text-slate-100">
                 Производительность (последние 60 сек)
               </h3>
-              <span className="inline-flex items-center gap-1 rounded-full border border-sky-500/20 bg-sky-500/10 px-2 py-0.5 text-xs text-sky-400">
-                <Sparkles size={10} /> Live
+              <span className="inline-flex items-center gap-1 rounded border border-cyan-500/30 bg-cyan-500/10 px-2 py-0.5 font-mono text-[10px] font-bold tracking-wider text-cyan-300">
+                <Sparkles size={10} /> LIVE TELEMETRY // 60S
               </span>
             </div>
             <p className="mt-0.5 text-sm text-slate-400">
@@ -897,11 +896,11 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
             <svg
               viewBox={`0 0 ${width} ${height}`}
               preserveAspectRatio="none"
-              className="pointer-events-none h-full w-full transform-gpu overflow-visible rounded-xl border border-white/5 bg-[#151c27]/90"
+              className="pointer-events-none h-full w-full transform-gpu overflow-visible rounded-xl border border-slate-800/90 bg-[#080b11]"
             >
               <defs>
                 <linearGradient id="cpuStroke" x1="0" y1="0" x2={width} y2="0" gradientUnits="userSpaceOnUse">
-                  <stop offset="0%" stopColor="#38bdf8" />
+                  <stop offset="0%" stopColor="#00F0FF" />
                   <stop offset="100%" stopColor="#6366f1" />
                 </linearGradient>
                 <linearGradient id="ramStroke" x1="0" y1="0" x2={width} y2="0" gradientUnits="userSpaceOnUse">
@@ -909,7 +908,8 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
                   <stop offset="100%" stopColor="#10b981" />
                 </linearGradient>
                 <linearGradient id="cpuGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#38bdf8" stopOpacity="0.25" />
+                  <stop offset="0%" stopColor="#00F0FF" stopOpacity="0.34" />
+                  <stop offset="55%" stopColor="#6366f1" stopOpacity="0.14" />
                   <stop offset="100%" stopColor="#6366f1" stopOpacity="0" />
                 </linearGradient>
                 <linearGradient id="ramGrad" x1="0" y1="0" x2="0" y2="1">
@@ -918,6 +918,20 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
                 </linearGradient>
               </defs>
 
+              {[0.2, 0.4, 0.6, 0.8].map((ratio) => (
+                <line
+                  key={`v-${ratio}`}
+                  x1={width * ratio}
+                  y1={0}
+                  x2={width * ratio}
+                  y2={height}
+                  stroke="#1e293b"
+                  strokeOpacity="0.55"
+                  strokeDasharray="2 4"
+                  strokeWidth="1"
+                />
+              ))}
+
               {[0.25, 0.5, 0.75].map((ratio) => (
                 <line
                   key={ratio}
@@ -925,8 +939,8 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
                   y1={height * ratio}
                   x2={width}
                   y2={height * ratio}
-                  stroke="#27272a"
-                  strokeOpacity="0.65"
+                  stroke="#1e293b"
+                  strokeOpacity="0.8"
                   strokeDasharray="4 4"
                   strokeWidth="1"
                 />
@@ -976,7 +990,7 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
                 strokeLinecap="round"
                 strokeLinejoin="round"
                 vectorEffect="non-scaling-stroke"
-                style={{ filter: "drop-shadow(0 0 8px rgba(56, 189, 248, 0.45))" }}
+                style={{ filter: "drop-shadow(0 0 8px rgba(0, 240, 255, 0.55))" }}
               />
             </svg>
 

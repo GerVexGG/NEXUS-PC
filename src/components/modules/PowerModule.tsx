@@ -103,7 +103,7 @@ export function PowerModule({ c }: { c: NexusController }) {
                 }
                 void handleImmediateAction(action.id);
               }}
-              className={`flex flex-col items-start gap-3 rounded-xl border border-[#222b38] bg-[#111722] px-4 py-4 text-left text-slate-200 transition-colors ${action.hover}`}
+              className={`card-cyber-hover flex flex-col items-start gap-3 rounded-xl border border-[#222b38] bg-[#111722] px-4 py-4 text-left text-slate-200 transition-colors ${action.hover}`}
             >
               <Icon size={18} className={action.iconClass} />
               <span className="text-sm font-medium">{action.label}</span>
@@ -112,7 +112,7 @@ export function PowerModule({ c }: { c: NexusController }) {
         })}
       </div>
 
-      <div className="rounded-xl border border-[#222b38] bg-[#111722] p-4">
+      <div className="card-cyber-hover rounded-xl border border-[#222b38] bg-[#111722] p-4">
         {timerActive && timerState ? (
           <div className="space-y-4">
             <div className="font-mono text-4xl font-bold text-slate-100">{formatCountdown(remainingSeconds)}</div>

@@ -207,7 +207,7 @@ export function NetworkModule({ c }: { c: NexusController }) {
         <div className="space-y-4">
         <div className="grid gap-3 sm:grid-cols-3">
           {kpis.map((item) => (
-            <div key={item.label} className="rounded-xl border border-[#222b38] bg-[#111722] px-4 py-3">
+            <div key={item.label} className="card-cyber-hover rounded-xl border border-[#222b38] bg-[#111722] px-4 py-3">
               <div className="text-xs text-slate-400">{item.label}</div>
               <div className={`mt-1 font-mono text-2xl font-semibold tabular-nums ${item.tone}`}>{item.value}</div>
             </div>

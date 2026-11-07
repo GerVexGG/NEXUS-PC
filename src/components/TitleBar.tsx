@@ -1,16 +1,16 @@
 import { ShieldAlert } from "lucide-react";
 
 const TAB_TITLES: Record<string, string> = {
-  dashboard: "Обзор системы",
-  hardware: "Аппаратный мониторинг",
-  network: "Сетевой монитор",
-  processes: "Диспетчер процессов",
-  startup: "Автозагрузка программ",
-  storage: "Накопители",
-  cleanup: "Центр очистки системы",
-  power: "Управление питанием",
-  drop: "NEXUS Drop",
-  settings: "Настройки и журнал",
+  dashboard: "SYS // ОБЗОР СИСТЕМЫ",
+  hardware: "HWMON // КОНСОЛЬ ДИАГНОСТИКИ ЖЕЛЕЗА",
+  network: "NET // СЕТЕВОЙ МОНИТОР",
+  processes: "PROC // ДИСПЕТЧЕР ПРОЦЕССОВ",
+  startup: "BOOT // АВТОЗАГРУЗКА ПРОГРАММ",
+  storage: "STORAGE // АНАЛИЗАТОР НАКОПИТЕЛЕЙ",
+  cleanup: "PURGE // ЦЕНТР ОЧИСТКИ СИСТЕМЫ",
+  power: "PWR // УПРАВЛЕНИЕ ПИТАНИЕМ",
+  drop: "DROP // ЛОКАЛЬНАЯ ПЕРЕДАЧА ФАЙЛОВ",
+  settings: "CFG // НАСТРОЙКИ И ЖУРНАЛ",
 };
 
 interface TitleBarProps {
@@ -31,26 +31,29 @@ export function TitleBar({
   return (
     <header
       data-tauri-drag-region
-      className="relative z-40 flex h-9 shrink-0 items-center justify-between border-b border-[#222b38] bg-[#0e1118] pl-3 pr-2"
+      className="relative z-40 flex h-9 shrink-0 items-center justify-between border-b border-slate-800/90 bg-[#080b11] pl-3.5 pr-2.5"
     >
       <div
         data-tauri-drag-region
         onDoubleClick={() => onToggleMaximize()}
         className="flex h-full flex-1 cursor-default items-center gap-2.5"
       >
-        <span className="pointer-events-none text-xs font-medium tracking-wide text-slate-400">
-          {TAB_TITLES[activeTab] ?? "Обзор системы"}
+        <span className="pointer-events-none h-2 w-0.5 bg-cyan-400 shadow-[0_0_6px_#00F0FF]" />
+        <span className="pointer-events-none font-mono text-[11px] font-semibold tracking-widest text-slate-400">
+          {TAB_TITLES[activeTab] ?? "SYS // ОБЗОР СИСТЕМЫ"}
         </span>
         {adminError && (
-          <span className="pointer-events-none ml-2 max-w-xs truncate text-xs text-rose-400">{adminError}</span>
+          <span className="pointer-events-none ml-2 max-w-xs truncate font-mono text-xs text-rose-400">
+            {adminError}
+          </span>
         )}
       </div>
 
-      <div data-tauri-drag-region="false" className="flex h-full items-center">
+      <div data-tauri-drag-region="false" className="flex h-full items-center gap-2">
         {isElevatedAdmin ? (
-          <span className="inline-flex h-7 items-center gap-1.5 rounded-md border border-emerald-500/35 bg-emerald-500/15 px-2.5 text-xs font-medium text-emerald-300">
-            <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-            ADMIN
+          <span className="inline-flex h-6 items-center gap-1.5 rounded border border-emerald-500/35 bg-emerald-500/10 px-2.5 font-mono text-[10px] font-bold tracking-wider text-emerald-300 shadow-[0_0_10px_rgba(16,185,129,0.15)]">
+            <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_6px_#34d399]" />
+            PRIVILEGE: ADMIN
           </span>
         ) : (
           <button
@@ -58,10 +61,10 @@ export function TitleBar({
             data-tauri-drag-region="false"
             onClick={onRestartAsAdmin}
             title="Перезапустить NEXUS PC с правами Администратора (UAC)"
-            className="inline-flex h-7 cursor-pointer items-center gap-1.5 rounded-md border border-[#222b38] bg-white/[0.04] px-2 text-xs text-slate-300 transition-colors hover:bg-white/10 hover:text-slate-100"
+            className="inline-flex h-6 cursor-pointer items-center gap-1.5 rounded border border-slate-800 bg-[#0e131d] px-2.5 font-mono text-[10px] tracking-wider text-slate-300 transition-colors hover:border-cyan-500/40 hover:text-cyan-200"
           >
-            <ShieldAlert size={12} />
-            <span>Перезапустить от имени администратора</span>
+            <ShieldAlert size={11} className="text-amber-400" />
+            <span>ELEVATE: UAC ADMIN</span>
           </button>
         )}
       </div>

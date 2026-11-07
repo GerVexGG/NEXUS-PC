@@ -919,8 +919,22 @@ fn bind_listener() -> Result<TcpListener, String> {
 }
 
 fn default_save_dir() -> PathBuf {
-    let profile = std::env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(profile).join("Downloads").join("NEXUS Drop")
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let candidate = exe_dir.join("NexusDrop");
+            if fs::create_dir_all(&candidate).is_ok() {
+                return candidate;
+            }
+        }
+    }
+    if let Ok(base) = std::env::var("LOCALAPPDATA").or_else(|_| std::env::var("APPDATA")) {
+        let candidate = PathBuf::from(base).join("nexus").join("NexusDrop");
+        let _ = fs::create_dir_all(&candidate);
+        return candidate;
+    }
+    let fallback = PathBuf::from("NexusDrop");
+    let _ = fs::create_dir_all(&fallback);
+    fallback
 }
 
 fn random_token() -> String {

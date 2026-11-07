@@ -98,32 +98,32 @@ export function HardwareModule({ c }: { c: NexusController }) {
   const sidecarStatus =
     hwmonStatus.status === "driver_blocked"
       ? {
-          label: "Драйвер заблокирован (HVCI)",
-          dot: "bg-amber-400",
-          chip: "border-amber-500/30 bg-amber-500/10 text-amber-300",
+          label: "SPECTRE HWMON BRIDGE: HVCI BLOCKED",
+          dot: "bg-amber-400 shadow-[0_0_8px_#fbbf24]",
+          chip: "border-amber-500/35 bg-amber-500/12 text-amber-300",
         }
       : hwmonStatus.status === "restarting" || isRestartingHwmon
         ? {
-            label: `Перезапуск датчиков (попытка ${Math.max(1, hwmonStatus.restart_count)})...`,
-            dot: "bg-amber-400 animate-pulse",
-            chip: "border-amber-500/30 bg-amber-500/10 text-amber-300",
+            label: `SPECTRE HWMON BRIDGE: RESTARTING (#${Math.max(1, hwmonStatus.restart_count)})`,
+            dot: "bg-amber-400 animate-pulse shadow-[0_0_8px_#fbbf24]",
+            chip: "border-amber-500/35 bg-amber-500/12 text-amber-300",
           }
         : sidecarOnline && metricsReady
           ? {
-              label: "Датчики активны",
-              dot: "bg-emerald-400",
-              chip: "border-emerald-500/20 bg-emerald-500/10 text-emerald-400",
+              label: "SPECTRE HWMON BRIDGE: ONLINE",
+              dot: "bg-emerald-400 shadow-[0_0_8px_#34d399]",
+              chip: "border-emerald-500/35 bg-emerald-500/12 text-emerald-300",
             }
           : sidecarOnline
             ? {
-                label: "Подключение...",
-                dot: "bg-amber-400",
-                chip: "border-amber-500/20 bg-amber-500/10 text-amber-300",
+                label: "SPECTRE HWMON BRIDGE: SYNCING...",
+                dot: "bg-cyan-400 animate-pulse shadow-[0_0_8px_#00F0FF]",
+                chip: "border-cyan-500/35 bg-cyan-500/12 text-cyan-300",
               }
             : {
-                label: "Служба недоступна",
+                label: "SPECTRE HWMON BRIDGE: OFFLINE",
                 dot: "bg-slate-500",
-                chip: "border-[#222b38] bg-[#151c27] text-slate-400",
+                chip: "border-slate-800 bg-[#0e131d] text-slate-400",
               };
   const [mode, setMode] = useState<"live" | "history">("live");
   const [minutes, setMinutes] = useState(60);
@@ -202,11 +202,14 @@ export function HardwareModule({ c }: { c: NexusController }) {
     >
       <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-end">
         <div>
-          <h2 className="text-2xl font-semibold text-slate-100">Аппаратный мониторинг</h2>
-          <p className="mt-1 text-sm text-slate-400">Показатели температур, частот и напряжений</p>
+          <div className="font-mono text-[10px] font-bold uppercase tracking-[0.2em] text-cyan-400/90">
+            SPECTRE // HARDWARE DIAGNOSTICS CONSOLE
+          </div>
+          <h2 className="mt-0.5 text-2xl font-bold tracking-tight text-slate-100">Консоль диагностики железа</h2>
+          <p className="mt-0.5 text-sm text-slate-400">Телеметрия температур, частот, энергопотребления и напряжений</p>
         </div>
         <div className="flex flex-wrap items-center gap-2 self-start">
-          <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs ${sidecarStatus.chip}`}>
+          <span className={`inline-flex items-center gap-2 rounded border px-3 py-1 font-mono text-[11px] font-bold tracking-wider ${sidecarStatus.chip}`}>
             <span className={`h-1.5 w-1.5 rounded-full ${sidecarStatus.dot}`} />
             {sidecarStatus.label}
           </span>
@@ -215,10 +218,10 @@ export function HardwareModule({ c }: { c: NexusController }) {
               type="button"
               disabled={isRestartingHwmon}
               onClick={() => void handleRestartHwmon()}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-[#222b38] bg-[#151c27] px-2.5 py-1 text-xs font-medium text-slate-200 transition-colors hover:bg-[#1a2332] disabled:opacity-60"
+              className="cyber-btn inline-flex items-center gap-1.5 px-3 py-1 font-mono text-[11px] font-bold text-cyan-200 disabled:opacity-60"
             >
               <RefreshCw size={12} className={isRestartingHwmon ? "animate-spin" : ""} />
-              Перезапустить службу
+              ПЕРЕЗАПУСТИТЬ МОСТ
             </button>
           )}
         </div>
@@ -297,28 +300,90 @@ export function HardwareModule({ c }: { c: NexusController }) {
       )}
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <section className="rounded-xl border border-[#222b38] bg-[#111722] p-4">
-          <div className="text-sm text-slate-400">Процессор</div>
-          <h3 className="mt-1 truncate text-base font-medium text-slate-100">{hwData?.cpu.name || "Модель не определена"}</h3>
-          <div className="mt-3 font-mono text-2xl font-bold text-slate-100">
+        <section className="tactical-card tactical-brackets rounded-xl p-4">
+          <div className="flex items-center justify-between">
+            <span className="font-mono text-xs font-semibold uppercase tracking-wider text-slate-400">Процессор // CPU PACKAGE</span>
+            {hwData?.cpu.package_temp_c != null && (
+              <span
+                className={`inline-flex items-center gap-1.5 rounded border px-2 py-0.5 font-mono text-[10px] font-bold tracking-widest ${
+                  hwData.cpu.package_temp_c >= thresholds.cpu
+                    ? "animate-pulse border-rose-500/40 bg-rose-500/15 text-rose-300"
+                    : hwData.cpu.package_temp_c >= thresholds.cpu - 10
+                      ? "border-amber-500/40 bg-amber-500/15 text-amber-300"
+                      : "border-cyan-500/35 bg-cyan-500/12 text-cyan-300"
+                }`}
+              >
+                <span
+                  className={`h-2 w-2 rounded-full ${
+                    hwData.cpu.package_temp_c >= thresholds.cpu
+                      ? "bg-rose-500 shadow-[0_0_8px_#f43f5e]"
+                      : hwData.cpu.package_temp_c >= thresholds.cpu - 10
+                        ? "bg-amber-400 shadow-[0_0_8px_#fbbf24]"
+                        : "bg-cyan-400 shadow-[0_0_8px_#00F0FF]"
+                  }`}
+                />
+                {hwData.cpu.package_temp_c >= thresholds.cpu ? "CRITICAL" : hwData.cpu.package_temp_c >= thresholds.cpu - 10 ? "WARM" : "OPTIMAL"}
+              </span>
+            )}
+          </div>
+          <h3 className="mt-1 truncate text-base font-semibold text-slate-100">{hwData?.cpu.name || "Модель не определена"}</h3>
+          <div className="mt-3 font-mono text-3xl font-bold tracking-tight text-white">
             {formatSensor(hwData?.cpu.package_temp_c, 1, "°C").text}
           </div>
-          <div className="mt-2 flex gap-4 text-xs text-slate-400">
-            <span>Частота <span className="font-mono text-slate-100">{formatSensor(hwData?.cpu.avg_clock_mhz != null ? hwData.cpu.avg_clock_mhz / 1000 : null, 2, "GHz").text}</span></span>
-            <span>Мощность <span className="font-mono text-slate-100">{formatSensor(hwData?.cpu.power_watts, 1, "W").text}</span></span>
+          <div className="relative mt-3 h-2 w-full overflow-hidden rounded-sm border border-slate-800/90 bg-[#070a10] p-[1px]">
+            <div
+              className="shimmer-bar h-full rounded-[1px] bg-gradient-to-r from-teal-500 via-cyan-400 to-amber-400 transition-all duration-500"
+              style={{ width: `${Math.min(100, Math.max(0, ((hwData?.cpu.package_temp_c ?? 0) / 100) * 100))}%` }}
+            />
+            <div className="hud-scale-ticks pointer-events-none absolute inset-0 z-10" />
+          </div>
+          <div className="mt-3 flex gap-4 font-mono text-xs text-slate-400">
+            <span>FREQ <span className="font-bold text-slate-100">{formatSensor(hwData?.cpu.avg_clock_mhz != null ? hwData.cpu.avg_clock_mhz / 1000 : null, 2, "GHz").text}</span></span>
+            <span>PWR <span className="font-bold text-slate-100">{formatSensor(hwData?.cpu.power_watts, 1, "W").text}</span></span>
           </div>
         </section>
 
-        <section className="rounded-xl border border-[#222b38] bg-[#111722] p-4">
-          <div className="text-sm text-slate-400">Видеокарта</div>
-          <h3 className="mt-1 truncate text-base font-medium text-slate-100">{gpu?.name || "Адаптер не обнаружен"}</h3>
-          <div className="mt-3 font-mono text-2xl font-bold text-slate-100">
+        <section className="tactical-card tactical-brackets rounded-xl p-4">
+          <div className="flex items-center justify-between">
+            <span className="font-mono text-xs font-semibold uppercase tracking-wider text-slate-400">Видеокарта // GPU CORE</span>
+            {gpu?.core_temp_c != null && (
+              <span
+                className={`inline-flex items-center gap-1.5 rounded border px-2 py-0.5 font-mono text-[10px] font-bold tracking-widest ${
+                  gpu.core_temp_c >= thresholds.gpu
+                    ? "animate-pulse border-rose-500/40 bg-rose-500/15 text-rose-300"
+                    : gpu.core_temp_c >= thresholds.gpu - 10
+                      ? "border-amber-500/40 bg-amber-500/15 text-amber-300"
+                      : "border-cyan-500/35 bg-cyan-500/12 text-cyan-300"
+                }`}
+              >
+                <span
+                  className={`h-2 w-2 rounded-full ${
+                    gpu.core_temp_c >= thresholds.gpu
+                      ? "bg-rose-500 shadow-[0_0_8px_#f43f5e]"
+                      : gpu.core_temp_c >= thresholds.gpu - 10
+                        ? "bg-amber-400 shadow-[0_0_8px_#fbbf24]"
+                        : "bg-cyan-400 shadow-[0_0_8px_#00F0FF]"
+                  }`}
+                />
+                {gpu.core_temp_c >= thresholds.gpu ? "CRITICAL" : gpu.core_temp_c >= thresholds.gpu - 10 ? "WARM" : "OPTIMAL"}
+              </span>
+            )}
+          </div>
+          <h3 className="mt-1 truncate text-base font-semibold text-slate-100">{gpu?.name || "Адаптер не обнаружен"}</h3>
+          <div className="mt-3 font-mono text-3xl font-bold tracking-tight text-white">
             {formatSensor(gpu?.core_temp_c, 1, "°C").text}
           </div>
-          <div className="mt-2 grid grid-cols-3 gap-2 text-xs text-slate-400">
-            <span>Hotspot <span className="block font-mono text-slate-100">{formatSensor(gpu?.hotspot_temp_c, 1, "°C").text}</span></span>
-            <span>VRAM <span className="block font-mono text-slate-100">{formatSensor(gpu?.memory_temp_c, 0, "°C").text}</span></span>
-            <span>Кулер <span className="block font-mono text-slate-100">{formatSensor(gpu?.fan_rpm, 0, "RPM").text}</span></span>
+          <div className="relative mt-3 h-2 w-full overflow-hidden rounded-sm border border-slate-800/90 bg-[#070a10] p-[1px]">
+            <div
+              className="shimmer-bar h-full rounded-[1px] bg-gradient-to-r from-teal-500 via-cyan-400 to-amber-400 transition-all duration-500"
+              style={{ width: `${Math.min(100, Math.max(0, ((gpu?.core_temp_c ?? 0) / 100) * 100))}%` }}
+            />
+            <div className="hud-scale-ticks pointer-events-none absolute inset-0 z-10" />
+          </div>
+          <div className="mt-3 grid grid-cols-3 gap-2 font-mono text-xs text-slate-400">
+            <span>HOTSPOT <span className="block font-bold text-slate-100">{formatSensor(gpu?.hotspot_temp_c, 1, "°C").text}</span></span>
+            <span>VRAM <span className="block font-bold text-slate-100">{formatSensor(gpu?.memory_temp_c, 0, "°C").text}</span></span>
+            <span>FAN <span className="block font-bold text-slate-100">{formatSensor(gpu?.fan_rpm, 0, "RPM").text}</span></span>
           </div>
         </section>
       </div>
@@ -340,7 +405,7 @@ export function HardwareModule({ c }: { c: NexusController }) {
         ))}
       </div>
 
-      <div className="overflow-hidden rounded-xl border border-[#222b38] bg-[#111722]">
+      <div className="tactical-card tactical-brackets overflow-hidden rounded-xl">
         <table className="w-full text-left text-sm">
           <thead className="text-xs text-slate-500">
             <tr className="border-b border-[#222b38]">
@@ -361,10 +426,29 @@ export function HardwareModule({ c }: { c: NexusController }) {
               visible.map((row) => {
                 const range = extremes[row.id];
                 const unit = row.text.includes(" ") ? row.text.slice(row.text.lastIndexOf(" ") + 1) : "";
+                const isTemp = unit === "°C" && row.raw != null;
+                const critLimit = row.group === "gpu" ? thresholds.gpu : thresholds.cpu;
+                const isCrit = isTemp && row.raw! >= critLimit;
+                const isWarn = isTemp && !isCrit && row.raw! >= critLimit - 10;
                 return (
-                  <tr key={row.id} className="border-b border-[#222b38]/70 last:border-0">
-                    <td className="px-4 py-2.5 text-slate-200">{row.name}</td>
-                    <td className="px-4 py-2.5 font-mono text-slate-100">{row.text}</td>
+                  <tr key={row.id} className="border-b border-[#222b38]/70 transition-colors hover:bg-white/[0.02] last:border-0">
+                    <td className="px-4 py-2.5 text-slate-200">
+                      <span className="inline-flex items-center gap-2">
+                        {isTemp && (
+                          <span
+                            className={`h-2 w-2 shrink-0 rounded-full ${
+                              isCrit
+                                ? "animate-pulse bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.85)]"
+                                : isWarn
+                                  ? "bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.75)]"
+                                  : "bg-cyan-400 shadow-[0_0_6px_rgba(0,240,255,0.65)]"
+                            }`}
+                          />
+                        )}
+                        {row.name}
+                      </span>
+                    </td>
+                    <td className={`px-4 py-2.5 font-mono ${isCrit ? "font-bold text-rose-400 animate-pulse" : isWarn ? "text-amber-300" : "text-slate-100"}`}>{row.text}</td>
                     <td className="px-4 py-2.5 font-mono text-slate-400">
                       {range ? `${range.min.toFixed(row.text.includes("GHz") || row.text.includes(" V") ? 2 : 0)} ${unit}` : "—"}
                     </td>

@@ -89,7 +89,7 @@ function StorageScanButton({
         type="button"
         disabled={isScanning}
         onClick={onStartScan}
-        className="inline-flex items-center gap-2 rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2 text-xs font-medium text-slate-200 hover:bg-[#1a2332] disabled:opacity-70"
+        className="cyber-btn inline-flex items-center gap-2.5 px-4 py-2.5 font-mono text-xs font-bold uppercase tracking-wider text-cyan-100 disabled:opacity-70"
       >
         {isScanning ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />}
         {isScanning ? `Сканирование ${scanElapsedSec.toFixed(0)} с` : "Сканировать диск"}
@@ -192,7 +192,7 @@ export function StorageModule({ c }: { c: NexusController }) {
       transition={{ duration: 0.18, ease: "easeOut" }}
       className="w-full max-w-6xl space-y-4"
     >
-      <div className="min-w-0 rounded-xl border border-[#222b38] bg-[#111722] p-4">
+      <div className="tactical-card tactical-brackets min-w-0 rounded-xl p-4">
         <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap gap-2">
@@ -232,7 +232,7 @@ export function StorageModule({ c }: { c: NexusController }) {
             </p>
             <div className="mt-3 h-2 overflow-hidden rounded-full bg-[#151c27]">
               <div className="flex h-full">
-                <div className="h-full bg-sky-500" style={{ width: `${Math.min(100, usedPct)}%` }} />
+                <div className="shimmer-bar h-full bg-gradient-to-r from-cyan-500 to-sky-400" style={{ width: `${Math.min(100, usedPct)}%` }} />
                 <div className="h-full bg-emerald-500/35" style={{ width: `${Math.max(0, 100 - usedPct)}%` }} />
               </div>
             </div>
@@ -253,7 +253,7 @@ export function StorageModule({ c }: { c: NexusController }) {
         )}
       </div>
 
-      <section className="rounded-xl border border-[#222b38] bg-[#111722] p-4">
+      <section className="tactical-card tactical-brackets rounded-xl p-4">
         <h3 className="text-sm font-semibold text-slate-100">Физическое состояние накопителей</h3>
         {diskHealthError && <p className="mt-2 text-xs text-rose-300">{diskHealthError}</p>}
         {diskHealth.length === 0 && !diskHealthError ? (
@@ -273,7 +273,7 @@ export function StorageModule({ c }: { c: NexusController }) {
                       ? "bg-amber-400"
                       : "bg-rose-400";
               return (
-                <div key={disk.model + disk.kind} className="rounded-lg border border-[#222b38] bg-[#151c27] p-3">
+                <div key={disk.model + disk.kind} className="card-cyber-hover rounded-lg border border-[#222b38] bg-[#151c27] p-3">
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0 truncate text-sm font-medium text-slate-100">{disk.model}</div>
                     <span className="shrink-0 rounded-md border border-cyan-500/20 bg-cyan-500/10 px-1.5 py-0.5 text-[11px] text-cyan-300">
@@ -321,7 +321,7 @@ export function StorageModule({ c }: { c: NexusController }) {
           <button
             type="button"
             onClick={() => void handleStartStorageScan()}
-            className="mt-5 inline-flex items-center gap-2 rounded-lg border border-[#222b38] bg-[#151c27] px-4 py-2.5 text-sm font-medium text-slate-200 hover:bg-[#1a2332]"
+            className="cyber-btn mt-5 inline-flex items-center gap-2.5 px-5 py-2.5 font-mono text-xs font-bold uppercase tracking-wider text-cyan-100"
           >
             <Play size={15} />
             Сканировать диск
