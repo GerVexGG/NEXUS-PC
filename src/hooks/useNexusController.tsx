@@ -8,6 +8,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   HISTORY_LENGTH,
   type HardwareTelemetry,
+  type HwmonStatusResponse,
   type HistoryPoint,
   type Metrics,
   PROCESS_REFRESH_MS,
@@ -63,6 +64,12 @@ export function useNexusController() {
 
   // Состояние модуля Hardware Monitor (Мониторинг железа)
   const [hwData, setHwData] = useState<HardwareTelemetry | null>(null);
+  const [hwmonStatus, setHwmonStatus] = useState<HwmonStatusResponse>({
+    status: "offline",
+    restart_count: 0,
+    last_error: null,
+  });
+  const [isRestartingHwmon, setIsRestartingHwmon] = useState<boolean>(false);
   const [alertThresholds, setAlertThresholds] = useState<{ cpu: number; gpu: number }>({
     cpu: 85,
     gpu: 83,
@@ -347,10 +354,18 @@ export function useNexusController() {
 
     const fetchHwTelemetry = async () => {
       try {
-        const data = await invoke<HardwareTelemetry>("get_hardware_telemetry");
-        setHwData(data);
-        if (data.is_admin) {
-          setIsElevatedAdmin(true);
+        const [telemetryRes, statusRes] = await Promise.allSettled([
+          invoke<HardwareTelemetry>("get_hardware_telemetry"),
+          invoke<HwmonStatusResponse>("get_hwmon_status"),
+        ]);
+        if (telemetryRes.status === "fulfilled") {
+          setHwData(telemetryRes.value);
+          if (telemetryRes.value.is_admin) {
+            setIsElevatedAdmin(true);
+          }
+        }
+        if (statusRes.status === "fulfilled") {
+          setHwmonStatus(statusRes.value);
         }
       } catch (err) {
         console.error("Ошибка получения аппаратной телеметрии:", err);
@@ -565,6 +580,32 @@ export function useNexusController() {
 
   const exportTelemetryCsv = useCallback(() => invoke<string>("export_telemetry_csv"), []);
 
+  const handleRestartHwmon = useCallback(async () => {
+    setIsRestartingHwmon(true);
+    setHwmonStatus((prev) => ({ ...prev, status: "restarting", restart_count: 0, last_error: null }));
+    try {
+      await invoke("restart_hwmon");
+      const [telemetryRes, statusRes] = await Promise.allSettled([
+        invoke<HardwareTelemetry>("get_hardware_telemetry"),
+        invoke<HwmonStatusResponse>("get_hwmon_status"),
+      ]);
+      if (telemetryRes.status === "fulfilled") {
+        setHwData(telemetryRes.value);
+      }
+      if (statusRes.status === "fulfilled") {
+        setHwmonStatus(statusRes.value);
+      }
+    } catch (err) {
+      setHwmonStatus((prev) => ({
+        ...prev,
+        status: "offline",
+        last_error: String(err),
+      }));
+    } finally {
+      setIsRestartingHwmon(false);
+    }
+  }, []);
+
   return {
     activeTab,
     setActiveTab,
@@ -595,6 +636,10 @@ export function useNexusController() {
     // Hardware Monitor
     hwData,
     setHwData,
+    hwmonStatus,
+    setHwmonStatus,
+    isRestartingHwmon,
+    handleRestartHwmon,
     alertThresholds,
     setAlertThresholds,
     thermalWarnings,

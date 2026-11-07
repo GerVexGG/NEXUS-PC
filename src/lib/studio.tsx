@@ -125,6 +125,14 @@ export interface HardwareTelemetry {
   storage_temps: StorageTempItem[];
 }
 
+export type HwmonStatus = "ready" | "restarting" | "driver_blocked" | "offline";
+
+export interface HwmonStatusResponse {
+  status: HwmonStatus;
+  restart_count: number;
+  last_error: string | null;
+}
+
 export interface TelemetrySnapshot {
   timestamp: number;
   cpu_usage: number;

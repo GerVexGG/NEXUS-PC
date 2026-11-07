@@ -110,8 +110,12 @@ export function useStorageScanner(options?: { isolateTimer?: boolean }) {
         setSelectedTreemapNode(res.root_node.children[0] ?? res.root_node);
       } catch (err) {
         if (scanRequestIdRef.current !== reqId) return;
+        const msg = String(err);
+        if (msg.includes("SCAN_CANCELLED")) {
+          return;
+        }
         console.error("Ошибка сканирования диска:", err);
-        setScanError(String(err));
+        setScanError(msg);
       } finally {
         if (scanRequestIdRef.current === reqId) {
           setIsScanning(false);
@@ -121,9 +125,15 @@ export function useStorageScanner(options?: { isolateTimer?: boolean }) {
     [isScanning]
   );
 
-  const handleCancelStorageScan = useCallback(() => {
+  const handleCancelStorageScan = useCallback(async () => {
     scanRequestIdRef.current += 1;
     setIsScanning(false);
+    setScanError(null);
+    try {
+      await invoke("cancel_storage_scan");
+    } catch (err) {
+      console.error("Ошибка отмены сканирования диска:", err);
+    }
   }, []);
 
   const handleOpenFolder = useCallback(async (path: string) => {

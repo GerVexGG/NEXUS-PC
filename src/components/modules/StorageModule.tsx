@@ -10,6 +10,7 @@ import {
   Loader2,
   Play,
   Search,
+  Square,
 } from "lucide-react";
 import { TREEMAP_PALETTE, formatBytes } from "../../lib/studio";
 import { useStorageScanElapsed } from "../../hooks/useStorageScanner";
@@ -75,21 +76,35 @@ function heavyGroup(path: string): { kind: "game" | "program" | "folder"; title:
 function StorageScanButton({
   isScanning,
   onStartScan,
+  onCancelScan,
 }: {
   isScanning: boolean;
   onStartScan: () => void;
+  onCancelScan: () => void;
 }) {
   const scanElapsedSec = useStorageScanElapsed(isScanning);
   return (
-    <button
-      type="button"
-      disabled={isScanning}
-      onClick={onStartScan}
-      className="inline-flex items-center gap-2 rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2 text-xs font-medium text-slate-200 hover:bg-[#1a2332] disabled:opacity-70"
-    >
-      {isScanning ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />}
-      {isScanning ? `Сканирование ${scanElapsedSec.toFixed(0)} с` : "Сканировать диск"}
-    </button>
+    <div className="flex items-center gap-2">
+      <button
+        type="button"
+        disabled={isScanning}
+        onClick={onStartScan}
+        className="inline-flex items-center gap-2 rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2 text-xs font-medium text-slate-200 hover:bg-[#1a2332] disabled:opacity-70"
+      >
+        {isScanning ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />}
+        {isScanning ? `Сканирование ${scanElapsedSec.toFixed(0)} с` : "Сканировать диск"}
+      </button>
+      {isScanning && (
+        <button
+          type="button"
+          onClick={onCancelScan}
+          className="inline-flex items-center gap-1.5 rounded-lg border border-rose-500/30 bg-rose-500/15 px-3 py-2 text-xs font-medium text-rose-300 transition-colors hover:bg-rose-500/25"
+        >
+          <Square size={12} className="fill-current" />
+          Остановить
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -107,6 +122,7 @@ export function StorageModule({ c }: { c: NexusController }) {
     selectedTreemapNode,
     setSelectedTreemapNode,
     handleStartStorageScan,
+    handleCancelStorageScan,
     handleOpenPathInExplorer,
     treemapRects,
     filteredTopFiles,
@@ -226,6 +242,7 @@ export function StorageModule({ c }: { c: NexusController }) {
             <StorageScanButton
               isScanning={isScanning}
               onStartScan={() => void handleStartStorageScan()}
+              onCancelScan={() => void handleCancelStorageScan()}
             />
           </div>
         </div>

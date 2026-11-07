@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
-import { Download } from "lucide-react";
+import { AlertTriangle, Download, RefreshCw } from "lucide-react";
 import type { DiagnosticsReport, HardwareTelemetry, TelemetrySnapshot } from "../../lib/studio";
 import type { NexusController } from "../../hooks/useNexusController";
 
@@ -85,13 +85,46 @@ function buildRows(hw: HardwareTelemetry | null, ramGb: number, ramPct: number):
 }
 
 export function HardwareModule({ c }: { c: NexusController }) {
-  const { hwData, metrics, thermalWarnings, metricsReady } = c;
-  const sidecarOnline = hwData?.sidecar_online === true;
-  const sidecarStatus = sidecarOnline && metricsReady
-    ? { label: "Служба активна", dot: "bg-emerald-400", chip: "border-emerald-500/20 bg-emerald-500/10 text-emerald-400" }
-    : sidecarOnline
-      ? { label: "Подключение...", dot: "bg-amber-400", chip: "border-amber-500/20 bg-amber-500/10 text-amber-300" }
-      : { label: "Служба недоступна", dot: "bg-slate-500", chip: "border-[#222b38] bg-[#151c27] text-slate-400" };
+  const {
+    hwData,
+    hwmonStatus,
+    isRestartingHwmon,
+    handleRestartHwmon,
+    metrics,
+    thermalWarnings,
+    metricsReady,
+  } = c;
+  const sidecarOnline = hwData?.sidecar_online === true || hwmonStatus.status === "ready";
+  const sidecarStatus =
+    hwmonStatus.status === "driver_blocked"
+      ? {
+          label: "Драйвер заблокирован (HVCI)",
+          dot: "bg-amber-400",
+          chip: "border-amber-500/30 bg-amber-500/10 text-amber-300",
+        }
+      : hwmonStatus.status === "restarting" || isRestartingHwmon
+        ? {
+            label: `Перезапуск датчиков (попытка ${Math.max(1, hwmonStatus.restart_count)})...`,
+            dot: "bg-amber-400 animate-pulse",
+            chip: "border-amber-500/30 bg-amber-500/10 text-amber-300",
+          }
+        : sidecarOnline && metricsReady
+          ? {
+              label: "Датчики активны",
+              dot: "bg-emerald-400",
+              chip: "border-emerald-500/20 bg-emerald-500/10 text-emerald-400",
+            }
+          : sidecarOnline
+            ? {
+                label: "Подключение...",
+                dot: "bg-amber-400",
+                chip: "border-amber-500/20 bg-amber-500/10 text-amber-300",
+              }
+            : {
+                label: "Служба недоступна",
+                dot: "bg-slate-500",
+                chip: "border-[#222b38] bg-[#151c27] text-slate-400",
+              };
   const [mode, setMode] = useState<"live" | "history">("live");
   const [minutes, setMinutes] = useState(60);
   const [history, setHistory] = useState<TelemetrySnapshot[]>([]);
@@ -172,11 +205,51 @@ export function HardwareModule({ c }: { c: NexusController }) {
           <h2 className="text-2xl font-semibold text-slate-100">Аппаратный мониторинг</h2>
           <p className="mt-1 text-sm text-slate-400">Показатели температур, частот и напряжений</p>
         </div>
-        <span className={`inline-flex items-center gap-2 self-start rounded-full border px-3 py-1 text-xs ${sidecarStatus.chip}`}>
-          <span className={`h-1.5 w-1.5 rounded-full ${sidecarStatus.dot}`} />
-          {sidecarStatus.label}
-        </span>
+        <div className="flex flex-wrap items-center gap-2 self-start">
+          <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs ${sidecarStatus.chip}`}>
+            <span className={`h-1.5 w-1.5 rounded-full ${sidecarStatus.dot}`} />
+            {sidecarStatus.label}
+          </span>
+          {(hwmonStatus.status === "offline" || hwmonStatus.status === "restarting") && (
+            <button
+              type="button"
+              disabled={isRestartingHwmon}
+              onClick={() => void handleRestartHwmon()}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-[#222b38] bg-[#151c27] px-2.5 py-1 text-xs font-medium text-slate-200 transition-colors hover:bg-[#1a2332] disabled:opacity-60"
+            >
+              <RefreshCw size={12} className={isRestartingHwmon ? "animate-spin" : ""} />
+              Перезапустить службу
+            </button>
+          )}
+        </div>
       </div>
+
+      {hwmonStatus.status === "driver_blocked" && (
+        <div className="flex flex-col justify-between gap-3 rounded-xl border border-amber-500/30 bg-[#111722] p-4 sm:flex-row sm:items-center">
+          <div className="flex items-start gap-3">
+            <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-amber-500/30 bg-amber-500/10 text-amber-300">
+              <AlertTriangle size={16} />
+            </div>
+            <div>
+              <div className="text-sm font-medium text-slate-100">
+                Аппаратный драйвер заблокирован изоляцией ядра Windows (HVCI). Часть температур может быть недоступна
+              </div>
+              {hwmonStatus.last_error && (
+                <div className="mt-1 font-mono text-xs text-slate-400">{hwmonStatus.last_error}</div>
+              )}
+            </div>
+          </div>
+          <button
+            type="button"
+            disabled={isRestartingHwmon}
+            onClick={() => void handleRestartHwmon()}
+            className="inline-flex shrink-0 items-center gap-2 self-start rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2 text-xs font-medium text-slate-200 transition-colors hover:bg-[#1a2332] disabled:opacity-60 sm:self-center"
+          >
+            <RefreshCw size={13} className={isRestartingHwmon ? "animate-spin" : ""} />
+            Перезапустить службу
+          </button>
+        </div>
+      )}
 
       <div className="flex flex-wrap gap-2">
         {([

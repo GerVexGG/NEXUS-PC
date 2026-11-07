@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -218,6 +218,42 @@ pub struct DriveVolumeInfo {
     pub available_bytes: u64,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HwmonStatus {
+    Ready,
+    Restarting,
+    DriverBlocked,
+    Offline,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct HwmonStatusResponse {
+    pub status: HwmonStatus,
+    pub restart_count: u32,
+    pub last_error: Option<String>,
+}
+
+pub struct HwmonWatchdogState {
+    pub status: HwmonStatus,
+    pub restart_count: u32,
+    pub last_error: Option<String>,
+    pub last_stderr_line: Option<String>,
+    pub manual_restart_in_progress: bool,
+}
+
+impl Default for HwmonWatchdogState {
+    fn default() -> Self {
+        Self {
+            status: HwmonStatus::Offline,
+            restart_count: 0,
+            last_error: None,
+            last_stderr_line: None,
+            manual_restart_in_progress: false,
+        }
+    }
+}
+
 // Хранилище состояния приложения
 pub struct AppState {
     pub sys: Arc<Mutex<System>>,
@@ -228,6 +264,8 @@ pub struct AppState {
     pub pid_cache: Mutex<HashMap<u32, (String, String)>>,
     pub hw_telemetry: Arc<Mutex<Option<HardwareTelemetry>>>,
     pub hw_sidecar_child: Arc<Mutex<Option<Child>>>,
+    pub hwmon_watchdog: Arc<Mutex<HwmonWatchdogState>>,
+    pub scan_cancellation_token: Arc<AtomicBool>,
     pub icon_cache: Mutex<HashMap<String, String>>,
     pub drop_hub: Arc<drop_server::DropHub>,
     pub tray_ping_item: Mutex<Option<tauri::menu::MenuItem<tauri::Wry>>>,
@@ -299,12 +337,41 @@ fn find_hwmon_sidecar_exe() -> Option<PathBuf> {
     None
 }
 
+fn is_driver_blocked_indicator(exit_code: Option<i32>, stderr_line: Option<&str>) -> bool {
+    if let Some(code) = exit_code {
+        // 1275 (0x4FB) = ERROR_DRIVER_BLOCKED, -1073740777 / 0xC0000428 = STATUS_INVALID_IMAGE_HASH
+        if code == 1275 || code == 0x4FB || code == -1073740777i32 {
+            return true;
+        }
+    }
+    if let Some(line) = stderr_line {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("winring0")
+            || lower.contains("hvci")
+            || lower.contains("driver")
+            || lower.contains("inpout")
+            || lower.contains("ring0")
+            || lower.contains("kernel isolation")
+            || lower.contains("1275")
+            || lower.contains("0x4fb")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn spawn_hwmon_sidecar(
     telemetry_cache: Arc<Mutex<Option<HardwareTelemetry>>>,
     child_holder: Arc<Mutex<Option<Child>>>,
-) {
+    watchdog_state: Arc<Mutex<HwmonWatchdogState>>,
+) -> Result<(), String> {
     let Some(exe_path) = find_hwmon_sidecar_exe() else {
-        return;
+        if let Ok(mut wd) = watchdog_state.lock() {
+            wd.status = HwmonStatus::Offline;
+            wd.last_error = Some("Исполняемый файл nexus-hwmon.exe не найден".to_string());
+        }
+        return Err("Исполняемый файл nexus-hwmon.exe не найден".to_string());
     };
 
     let mut cmd = Command::new(&exe_path);
@@ -313,24 +380,54 @@ fn spawn_hwmon_sidecar(
     }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
 
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
 
-    let Ok(mut child) = cmd.spawn() else {
-        return;
-    };
+    let mut child = cmd.spawn().map_err(|e| {
+        let msg = format!("Не удалось запустить nexus-hwmon.exe: {e}");
+        if let Ok(mut wd) = watchdog_state.lock() {
+            wd.status = HwmonStatus::Offline;
+            wd.last_error = Some(msg.clone());
+        }
+        msg
+    })?;
 
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill();
-        return;
+        return Err("Не удалось подключиться к stdout сайдкара".to_string());
     };
+    let stderr_opt = child.stderr.take();
 
     if let Ok(mut guard) = child_holder.lock() {
         *guard = Some(child);
     }
 
+    if let Some(stderr) = stderr_opt {
+        let wd_stderr = Arc::clone(&watchdog_state);
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line_res in reader.lines() {
+                let Ok(line) = line_res else {
+                    break;
+                };
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(mut wd) = wd_stderr.lock() {
+                    wd.last_stderr_line = Some(trimmed.to_string());
+                    if is_driver_blocked_indicator(None, Some(trimmed)) {
+                        wd.status = HwmonStatus::DriverBlocked;
+                        wd.last_error = Some(trimmed.to_string());
+                    }
+                }
+            }
+        });
+    }
+
+    let wd_stdout = Arc::clone(&watchdog_state);
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
         for line_res in reader.lines() {
@@ -342,34 +439,198 @@ fn spawn_hwmon_sidecar(
                 continue;
             }
             if let Ok(parsed) = serde_json::from_str::<HardwareTelemetry>(trimmed) {
+                if let Ok(mut wd) = wd_stdout.lock() {
+                    if wd.status != HwmonStatus::DriverBlocked {
+                        wd.status = HwmonStatus::Ready;
+                        wd.last_error = None;
+                    }
+                }
                 if let Ok(mut cache) = telemetry_cache.lock() {
                     *cache = Some(parsed);
                 }
             }
         }
     });
+
+    Ok(())
+}
+
+fn start_hwmon_watchdog(
+    telemetry_cache: Arc<Mutex<Option<HardwareTelemetry>>>,
+    child_holder: Arc<Mutex<Option<Child>>>,
+    watchdog_state: Arc<Mutex<HwmonWatchdogState>>,
+) {
+    std::thread::Builder::new()
+        .name("nexus-hwmon-watchdog".to_string())
+        .spawn(move || {
+            const BACKOFF_SECS: [u64; 5] = [1, 3, 10, 10, 10];
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+
+                let is_manual = watchdog_state
+                    .lock()
+                    .map(|wd| wd.manual_restart_in_progress)
+                    .unwrap_or(false);
+                if is_manual {
+                    continue;
+                }
+
+                let exited_status = {
+                    let Ok(mut guard) = child_holder.lock() else {
+                        continue;
+                    };
+                    match guard.as_mut() {
+                        Some(child) => match child.try_wait() {
+                            Ok(Some(status)) => {
+                                let _ = guard.take();
+                                Some(status)
+                            }
+                            Ok(None) => None,
+                            Err(_) => {
+                                let _ = guard.take();
+                                None
+                            }
+                        },
+                        None => None,
+                    }
+                };
+
+                let Some(exit_status) = exited_status else {
+                    continue;
+                };
+
+                if let Ok(mut cache) = telemetry_cache.lock() {
+                    if let Some(ref mut data) = *cache {
+                        data.sidecar_online = false;
+                    }
+                }
+
+                let exit_code = exit_status.code();
+                let mut delay_secs: Option<u64> = None;
+
+                if let Ok(mut wd) = watchdog_state.lock() {
+                    if wd.manual_restart_in_progress {
+                        continue;
+                    }
+                    let stderr_clone = wd.last_stderr_line.clone();
+                    if is_driver_blocked_indicator(exit_code, stderr_clone.as_deref()) {
+                        wd.status = HwmonStatus::DriverBlocked;
+                        wd.last_error = Some(
+                            stderr_clone.unwrap_or_else(|| {
+                                format!(
+                                    "Драйвер датчиков заблокирован системой (код выхода {:?})",
+                                    exit_code
+                                )
+                            }),
+                        );
+                    } else if wd.restart_count < 5 {
+                        let attempt_idx = wd.restart_count as usize;
+                        wd.restart_count += 1;
+                        wd.status = HwmonStatus::Restarting;
+                        let reason = stderr_clone.unwrap_or_else(|| {
+                            format!("Сайдкар неожиданно завершился (код {:?})", exit_code)
+                        });
+                        wd.last_error = Some(reason);
+                        delay_secs = Some(BACKOFF_SECS[attempt_idx.min(BACKOFF_SECS.len() - 1)]);
+                    } else {
+                        wd.status = HwmonStatus::Offline;
+                        wd.last_error = Some(
+                            "Служба датчиков остановлена после 5 неудачных попыток перезапуска"
+                                .to_string(),
+                        );
+                    }
+                }
+
+                if let Some(wait_s) = delay_secs {
+                    for _ in 0..(wait_s * 5) {
+                        std::thread::sleep(Duration::from_millis(200));
+                        let interrupted = watchdog_state
+                            .lock()
+                            .map(|wd| wd.manual_restart_in_progress)
+                            .unwrap_or(false);
+                        if interrupted {
+                            break;
+                        }
+                    }
+
+                    let interrupted = watchdog_state
+                        .lock()
+                        .map(|wd| wd.manual_restart_in_progress)
+                        .unwrap_or(false);
+                    if !interrupted {
+                        let _ = spawn_hwmon_sidecar(
+                            Arc::clone(&telemetry_cache),
+                            Arc::clone(&child_holder),
+                            Arc::clone(&watchdog_state),
+                        );
+                    }
+                }
+            }
+        })
+        .ok();
+}
+
+#[tauri::command]
+fn get_hwmon_status(state: State<'_, AppState>) -> HwmonStatusResponse {
+    if let Ok(wd) = state.hwmon_watchdog.lock() {
+        HwmonStatusResponse {
+            status: wd.status,
+            restart_count: wd.restart_count,
+            last_error: wd.last_error.clone(),
+        }
+    } else {
+        HwmonStatusResponse {
+            status: HwmonStatus::Offline,
+            restart_count: 0,
+            last_error: Some("Не удалось прочитать статус Watchdog".to_string()),
+        }
+    }
+}
+
+#[tauri::command]
+async fn restart_hwmon(state: State<'_, AppState>) -> Result<(), String> {
+    let telemetry_cache = Arc::clone(&state.hw_telemetry);
+    let child_holder = Arc::clone(&state.hw_sidecar_child);
+    let watchdog_state = Arc::clone(&state.hwmon_watchdog);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Ok(mut wd) = watchdog_state.lock() {
+            wd.manual_restart_in_progress = true;
+            wd.status = HwmonStatus::Restarting;
+            wd.restart_count = 0;
+            wd.last_error = None;
+            wd.last_stderr_line = None;
+        }
+
+        if let Ok(mut guard) = child_holder.lock() {
+            if let Some(mut child) = guard.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+
+        if let Ok(mut cache) = telemetry_cache.lock() {
+            *cache = None;
+        }
+
+        let res = spawn_hwmon_sidecar(
+            Arc::clone(&telemetry_cache),
+            Arc::clone(&child_holder),
+            Arc::clone(&watchdog_state),
+        );
+
+        if let Ok(mut wd) = watchdog_state.lock() {
+            wd.manual_restart_in_progress = false;
+        }
+
+        res
+    })
+    .await
+    .map_err(|e| format!("Ошибка потока перезапуска сайдкара: {e}"))?
 }
 
 #[tauri::command]
 fn get_hardware_telemetry(state: State<'_, AppState>) -> Result<HardwareTelemetry, String> {
-    // Если sidecar еще не запущен, пробуем поднять его лениво
-    {
-        let need_spawn = state
-            .hw_sidecar_child
-            .lock()
-            .map(|mut g| match g.as_mut() {
-                Some(child) => child.try_wait().ok().flatten().is_some(),
-                None => true,
-            })
-            .unwrap_or(false);
-
-        if need_spawn {
-            spawn_hwmon_sidecar(
-                Arc::clone(&state.hw_telemetry),
-                Arc::clone(&state.hw_sidecar_child),
-            );
-        }
-    }
 
     // Читаем базовые данные процессора из sysinfo для обогащения или fallback-ответа
     let (fallback_cpu_name, fallback_clock_mhz) = if let Ok(mut sys) = state.sys.lock() {
@@ -2156,7 +2417,16 @@ fn push_top_file(shared: &ScanShared, size: u64, path: String, name: String, ext
 
 /// Параллельный обход без повторного запроса атрибутов безопасности.
 /// Размер берётся из записи каталога, символические ссылки и точки повторной обработки не раскрываются.
-fn scan_dir_fast(path: &Path, depth: u8, shared: &ScanShared) -> (u64, u64, Vec<FolderNode>) {
+fn scan_worker_loop(
+    path: &Path,
+    depth: u8,
+    shared: &ScanShared,
+    token: &AtomicBool,
+) -> (u64, u64, Vec<FolderNode>) {
+    if token.load(Ordering::Relaxed) {
+        return (0, 0, Vec::new());
+    }
+
     let Ok(entries) = std::fs::read_dir(path) else {
         return (0, 0, Vec::new());
     };
@@ -2167,6 +2437,9 @@ fn scan_dir_fast(path: &Path, depth: u8, shared: &ScanShared) -> (u64, u64, Vec<
     let mut subdirs: Vec<PathBuf> = Vec::new();
 
     for item in entries {
+        if token.load(Ordering::Relaxed) {
+            return (0, 0, Vec::new());
+        }
         let Ok(entry) = item else { continue };
         let name = entry.file_name();
         let name_text = name.to_string_lossy();
@@ -2210,6 +2483,10 @@ fn scan_dir_fast(path: &Path, depth: u8, shared: &ScanShared) -> (u64, u64, Vec<
         }
     }
 
+    if token.load(Ordering::Relaxed) {
+        return (0, 0, Vec::new());
+    }
+
     shared.bytes.fetch_add(direct_bytes, Ordering::Relaxed);
     shared.files.fetch_add(local_files, Ordering::Relaxed);
     for (idx, bytes) in local_cats.iter().enumerate() {
@@ -2221,20 +2498,35 @@ fn scan_dir_fast(path: &Path, depth: u8, shared: &ScanShared) -> (u64, u64, Vec<
     let nested: Vec<(PathBuf, u64, Vec<FolderNode>)> = if subdirs.len() > 1 && depth < 4 {
         subdirs
             .into_par_iter()
-            .map(|sub| {
-                let (bytes, _direct, children) = scan_dir_fast(&sub, depth + 1, shared);
-                (sub, bytes, children)
+            .filter_map(|sub| {
+                if token.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let (bytes, _direct, children) = scan_worker_loop(&sub, depth + 1, shared, token);
+                if token.load(Ordering::Relaxed) {
+                    return None;
+                }
+                Some((sub, bytes, children))
             })
             .collect()
     } else {
-        subdirs
-            .into_iter()
-            .map(|sub| {
-                let (bytes, _direct, children) = scan_dir_fast(&sub, depth + 1, shared);
-                (sub, bytes, children)
-            })
-            .collect()
+        let mut results = Vec::new();
+        for sub in subdirs {
+            if token.load(Ordering::Relaxed) {
+                break;
+            }
+            let (bytes, _direct, children) = scan_worker_loop(&sub, depth + 1, shared, token);
+            if token.load(Ordering::Relaxed) {
+                break;
+            }
+            results.push((sub, bytes, children));
+        }
+        results
     };
+
+    if token.load(Ordering::Relaxed) {
+        return (0, 0, Vec::new());
+    }
 
     let mut tree_bytes = direct_bytes;
     let mut children = Vec::new();
@@ -2260,9 +2552,18 @@ fn scan_dir_fast(path: &Path, depth: u8, shared: &ScanShared) -> (u64, u64, Vec<
     (tree_bytes, direct_bytes, children)
 }
 
-// Многопоточное сканирование выбранного диска или папки через rayon
 #[tauri::command]
-async fn scan_storage(path: String) -> Result<ScanResult, String> {
+fn cancel_storage_scan(state: State<'_, AppState>) -> Result<(), String> {
+    state.scan_cancellation_token.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+async fn execute_drive_storage_scan(
+    token: Arc<AtomicBool>,
+    path: String,
+) -> Result<ScanResult, String> {
+    token.store(false, Ordering::SeqCst);
+
     tauri::async_runtime::spawn_blocking(move || {
         let mut normalized = path.trim().to_string();
         if normalized.len() == 2 && normalized.ends_with(':') {
@@ -2282,7 +2583,11 @@ async fn scan_storage(path: String) -> Result<ScanResult, String> {
             top_floor: AtomicU64::new(0),
         };
         let (_tree_bytes, root_direct_files_bytes, mut root_children) =
-            scan_dir_fast(&root_path, 0, &shared);
+            scan_worker_loop(&root_path, 0, &shared, &token);
+
+        if token.load(Ordering::Relaxed) {
+            return Err("SCAN_CANCELLED".to_string());
+        }
 
         let total_scanned_bytes = shared.bytes.load(Ordering::Relaxed);
         let total_files_count = shared.files.load(Ordering::Relaxed);
@@ -2350,6 +2655,19 @@ async fn scan_storage(path: String) -> Result<ScanResult, String> {
     })
     .await
     .map_err(|e| format!("Ошибка выполнения фонового потока сканирования: {}", e))?
+}
+
+// Многопоточное сканирование выбранного диска или папки через rayon
+#[tauri::command]
+async fn scan_storage(state: State<'_, AppState>, path: String) -> Result<ScanResult, String> {
+    let token = Arc::clone(&state.scan_cancellation_token);
+    execute_drive_storage_scan(token, path).await
+}
+
+#[tauri::command]
+async fn scan_drive_storage(state: State<'_, AppState>, path: String) -> Result<ScanResult, String> {
+    let token = Arc::clone(&state.scan_cancellation_token);
+    execute_drive_storage_scan(token, path).await
 }
 
 fn probe_gateway_ping_ms() -> u32 {
@@ -4571,9 +4889,19 @@ fn start_background_services(
     disk_space: Arc<Mutex<(u64, u64)>>,
     hw_telemetry: Arc<Mutex<Option<HardwareTelemetry>>>,
     hw_sidecar_child: Arc<Mutex<Option<Child>>>,
+    hwmon_watchdog: Arc<Mutex<HwmonWatchdogState>>,
 ) {
+    start_hwmon_watchdog(
+        Arc::clone(&hw_telemetry),
+        Arc::clone(&hw_sidecar_child),
+        Arc::clone(&hwmon_watchdog),
+    );
     std::thread::spawn(move || {
-        spawn_hwmon_sidecar(hw_telemetry, Arc::clone(&hw_sidecar_child));
+        let _ = spawn_hwmon_sidecar(
+            hw_telemetry,
+            Arc::clone(&hw_sidecar_child),
+            hwmon_watchdog,
+        );
         if let Ok(mut guard) = sys.lock() {
             guard.refresh_cpu_usage();
         }
@@ -4604,6 +4932,8 @@ pub fn run() {
     let disk_space = Arc::new(Mutex::new((0u64, 0u64)));
     let hw_telemetry = Arc::new(Mutex::new(None));
     let hw_sidecar_child = Arc::new(Mutex::new(None));
+    let hwmon_watchdog = Arc::new(Mutex::new(HwmonWatchdogState::default()));
+    let scan_cancellation_token = Arc::new(AtomicBool::new(false));
     let history_buffer = Arc::new(RwLock::new(VecDeque::new()));
     telemetry::start_sampler(
         Arc::clone(&hw_telemetry),
@@ -4616,6 +4946,7 @@ pub fn run() {
         Arc::clone(&disk_space),
         Arc::clone(&hw_telemetry),
         Arc::clone(&hw_sidecar_child),
+        Arc::clone(&hwmon_watchdog),
     );
 
     let child_for_exit = Arc::clone(&hw_sidecar_child);
@@ -4630,6 +4961,8 @@ pub fn run() {
             pid_cache: Mutex::new(HashMap::new()),
             hw_telemetry,
             hw_sidecar_child,
+            hwmon_watchdog,
+            scan_cancellation_token,
             icon_cache: Mutex::new(HashMap::new()),
             drop_hub: Arc::new(drop_server::DropHub::new()),
             tray_ping_item: Mutex::new(None),
@@ -4720,7 +5053,11 @@ pub fn run() {
             open_item_location,
             get_available_drives,
             scan_storage,
+            scan_drive_storage,
+            cancel_storage_scan,
             get_hardware_telemetry,
+            get_hwmon_status,
+            restart_hwmon,
             is_elevated_admin,
             restart_as_admin,
             app_exit,
