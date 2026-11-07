@@ -2,7 +2,7 @@ import { useEffect, type ReactNode } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import type { LucideIcon } from "lucide-react";
 import {
-  Activity, Cpu, HardDrive, LayoutDashboard, Loader2, LogOut, Minimize2, Network, Power, Rocket, Settings, Smartphone, Trash2,
+  Activity, Cpu, Disc3, HardDrive, LayoutDashboard, Loader2, LogOut, Minimize2, Network, Power, Rocket, Settings, Smartphone, Trash2,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -20,6 +20,7 @@ import { PowerModule } from "./components/modules/PowerModule";
 import { ProcessModule } from "./components/modules/ProcessModule";
 import { NetworkModule } from "./components/modules/NetworkModule";
 import { DropModule } from "./components/modules/DropModule";
+import { MusicModule } from "./components/modules/MusicModule";
 import { SettingsModule } from "./components/modules/SettingsModule";
 import "./App.css";
 
@@ -105,6 +106,7 @@ export default function App() {
             <div>
               <div className="px-3 py-1.5 text-[11px] font-medium uppercase tracking-wider text-slate-500">Обзор</div>
               <SidebarItem active={c.activeTab === "dashboard"} icon={LayoutDashboard} label="Главная" onClick={() => c.setActiveTab("dashboard")} />
+              <SidebarItem active={c.activeTab === "music"} icon={Disc3} label="Музыка" onClick={() => c.setActiveTab("music")} />
             </div>
 
             <div>
@@ -220,6 +222,7 @@ export default function App() {
             {c.activeTab === "processes" && <ProcessModule c={c} />}
             {c.activeTab === "network" && <NetworkModule c={c} />}
             {c.activeTab === "drop" && <DropModule />}
+            {c.activeTab === "music" && <MusicModule />}
             {c.activeTab === "settings" && <SettingsModule c={c} />}
           </motion.div>
         </AnimatePresence>

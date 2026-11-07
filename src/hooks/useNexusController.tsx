@@ -34,7 +34,7 @@ import {
 
 export function useNexusController() {
   const [activeTab, setActiveTab] = useState<
-    "dashboard" | "startup" | "storage" | "hardware" | "cleanup" | "power" | "processes" | "network" | "drop" | "settings"
+    "dashboard" | "startup" | "storage" | "hardware" | "cleanup" | "power" | "processes" | "network" | "drop" | "music" | "settings"
   >("dashboard");
   const [metricsReady, setMetricsReady] = useState(false);
   const [metrics, setMetrics] = useState<Metrics>({
