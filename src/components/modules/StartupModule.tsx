@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import {
   AlertTriangle,
@@ -12,8 +12,6 @@ import {
 } from "lucide-react";
 import type { StartupItem } from "../../lib/studio";
 import type { NexusController } from "../../hooks/useNexusController";
-
-type StartupFilter = "all" | "on" | "off";
 
 function sourceBadge(location: string): string {
   const value = location.toLowerCase();
@@ -47,6 +45,8 @@ export function StartupModule({ c }: { c: NexusController }) {
   const {
     startupSearch,
     setStartupSearch,
+    startupFilter: statusFilter,
+    setStartupFilter: setStatusFilter,
     startupLoading,
     startupError,
     fetchStartupItems,
@@ -57,17 +57,18 @@ export function StartupModule({ c }: { c: NexusController }) {
     filteredStartupItems,
     startupItems,
   } = c;
-  const [statusFilter, setStatusFilter] = useState<StartupFilter>("all");
   const [phantomsOnly, setPhantomsOnly] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<StartupItem | null>(null);
-  const phantomCount = startupItems.filter((item) => item.phantom).length;
+  const phantomCount = useMemo(
+    () => startupItems.filter((item) => item.phantom).length,
+    [startupItems]
+  );
 
-  const visibleItems = filteredStartupItems.filter((item) => {
-    if (phantomsOnly && !item.phantom) return false;
-    if (statusFilter === "on") return item.enabled && !item.phantom;
-    if (statusFilter === "off") return !item.enabled && !item.phantom;
-    return true;
-  });
+  const visibleItems = useMemo(() => {
+    if (!phantomsOnly) return filteredStartupItems;
+    return filteredStartupItems.filter((item) => item.phantom);
+  }, [filteredStartupItems, phantomsOnly]);
+
   const searchActive = startupSearch.trim().length > 0 || statusFilter !== "all" || phantomsOnly;
 
   return (
@@ -245,6 +246,7 @@ function StartupRow({
     !item.phantom &&
     (item.id.startsWith("reg|") ||
       item.id.startsWith("dir|") ||
+      item.id.startsWith("folder|") ||
       item.id.startsWith("msix|"));
 
   return (

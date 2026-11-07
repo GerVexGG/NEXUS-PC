@@ -1,5 +1,4 @@
 import { useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { AnimatePresence, motion } from "framer-motion";
 import { Lock, Moon, Play, Power, RotateCcw, XCircle } from "lucide-react";
 import { formatCountdown } from "../../lib/studio";
@@ -30,23 +29,11 @@ export function PowerModule({ c }: { c: NexusController }) {
     setPowerError,
     handleStartTimer,
     handleCancelTimer,
+    handleImmediateAction,
     timerProgress,
   } = c;
   const [confirmAction, setConfirmAction] = useState<ImmediateAction | null>(null);
   const timerActive = Boolean(timerState && remainingSeconds > 0);
-
-  const runImmediate = async (action: "shutdown" | "restart" | "sleep" | "lock") => {
-    setPowerError(null);
-    try {
-      if ((action === "shutdown" || action === "restart") && timerActive) {
-        const cancelled = await handleCancelTimer();
-        if (!cancelled) return;
-      }
-      await invoke("system_power_action", { action });
-    } catch (err) {
-      setPowerError(String(err));
-    }
-  };
 
   const plannedAt = timerState
     ? new Date(timerState.endTime).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })
@@ -114,7 +101,7 @@ export function PowerModule({ c }: { c: NexusController }) {
                   setConfirmAction(action.id);
                   return;
                 }
-                void runImmediate(action.id);
+                void handleImmediateAction(action.id);
               }}
               className={`flex flex-col items-start gap-3 rounded-xl border border-[#222b38] bg-[#111722] px-4 py-4 text-left text-slate-200 transition-colors ${action.hover}`}
             >
@@ -271,7 +258,7 @@ export function PowerModule({ c }: { c: NexusController }) {
                 onClick={() => {
                   const action = confirmAction;
                   setConfirmAction(null);
-                  void runImmediate(action);
+                  void handleImmediateAction(action);
                 }}
                 className="rounded-lg border border-rose-500/30 bg-rose-500/20 px-3 py-2 text-xs font-medium text-rose-300 hover:bg-rose-500/30"
               >

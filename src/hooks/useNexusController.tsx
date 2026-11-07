@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, type MouseEvent } from "react";
+import { useState, useEffect, useRef, useMemo, useCallback, type MouseEvent } from "react";
 import {
   ChevronDown,
   ChevronUp,
@@ -6,25 +6,16 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
-  CleanupCategory,
-  CleanupReport,
-  DriveVolumeInfo,
-  FolderNode,
   HISTORY_LENGTH,
-  HardwareTelemetry,
-  HistoryPoint,
-  Metrics,
+  type HardwareTelemetry,
+  type HistoryPoint,
+  type Metrics,
   PROCESS_REFRESH_MS,
-  ProcessContextMenuState,
-  ProcessItem,
-  ProcessSortKey,
-  ScanResult,
-  StartupItem,
-  DiagnosticsReport,
-  StoredTimerState,
-  TelemetrySnapshot,
-  TIMER_STORAGE_KEY,
-  computeTreemapRects,
+  type ProcessContextMenuState,
+  type ProcessItem,
+  type ProcessSortKey,
+  type DiagnosticsReport,
+  type TelemetrySnapshot,
   copyTextToClipboard,
   createInitialHistory,
   formatSpeedParts,
@@ -32,6 +23,10 @@ import {
   getPingHudStyle,
   getTempBadgeStyle,
 } from "../lib/studio";
+import { useStorageScanner } from "./useStorageScanner";
+import { useStartupManager } from "./useStartupManager";
+import { useCleanupCenter } from "./useCleanupCenter";
+import { usePowerTimer } from "./usePowerTimer";
 
 export function useNexusController() {
   const [activeTab, setActiveTab] = useState<
@@ -58,28 +53,13 @@ export function useNexusController() {
   const [adminMenuOpen, setAdminMenuOpen] = useState<boolean>(false);
   const [adminError, setAdminError] = useState<string | null>(null);
 
-  // Состояние модуля Startup Manager (Автозагрузка)
-  const [startupItems, setStartupItems] = useState<StartupItem[]>([]);
-  const [startupSearch, setStartupSearch] = useState<string>("");
-  const [startupLoading, setStartupLoading] = useState<boolean>(false);
-  const [startupError, setStartupError] = useState<string | null>(null);
-
-  // Состояние модуля Storage Analyzer (Анализатор накопителей)
-  const [availableDrives, setAvailableDrives] = useState<DriveVolumeInfo[]>([
-    { mount_point: "C:\\", total_bytes: 0, available_bytes: 0 },
-  ]);
-  const [selectedDriveOrPath, setSelectedDriveOrPath] = useState<string>("C:\\");
-  const selectedDriveRef = useRef(selectedDriveOrPath);
-  selectedDriveRef.current = selectedDriveOrPath;
-  const [isScanning, setIsScanning] = useState<boolean>(false);
-  const [scanElapsedSec, setScanElapsedSec] = useState<number>(0);
-  const [scanResult, setScanResult] = useState<ScanResult | null>(null);
-  const [scanError, setScanError] = useState<string | null>(null);
-  const [treemapStack, setTreemapStack] = useState<FolderNode[]>([]);
-  const [selectedTreemapNode, setSelectedTreemapNode] = useState<FolderNode | null>(
-    null
-  );
-  const [fileSearch, setFileSearch] = useState<string>("");
+  // Подключение изолированных доменных хуков
+  // В useStorageScanner передаём isolateTimer: true, чтобы 10 Гц тики секундомера
+  // не вызывали ре-рендер App и всех открытых вкладок (таймер локализован в плашке StorageModule).
+  const storage = useStorageScanner({ isolateTimer: true });
+  const startup = useStartupManager();
+  const cleanup = useCleanupCenter(isElevatedAdmin);
+  const power = usePowerTimer();
 
   // Состояние модуля Hardware Monitor (Мониторинг железа)
   const [hwData, setHwData] = useState<HardwareTelemetry | null>(null);
@@ -87,15 +67,6 @@ export function useNexusController() {
     cpu: 85,
     gpu: 83,
   });
-
-  // Состояние модуля Cleanup Center (Безопасная очистка накопителя)
-  const [cleanupCategories, setCleanupCategories] = useState<CleanupCategory[]>([]);
-  const [selectedCleanupIds, setSelectedCleanupIds] = useState<string[]>([]);
-  const [isScanningCleanup, setIsScanningCleanup] = useState<boolean>(false);
-  const [isCleaning, setIsCleaning] = useState<boolean>(false);
-  const [confirmCleanupOpen, setConfirmCleanupOpen] = useState<boolean>(false);
-  const [cleanupReport, setCleanupReport] = useState<CleanupReport | null>(null);
-  const [cleanupError, setCleanupError] = useState<string | null>(null);
 
   // Состояние модуля Process Explorer (Диспетчер процессов)
   const [processes, setProcesses] = useState<ProcessItem[]>([]);
@@ -111,30 +82,6 @@ export function useNexusController() {
   const [processMenu, setProcessMenu] = useState<ProcessContextMenuState | null>(null);
   const processMenuRef = useRef<ProcessContextMenuState | null>(null);
   processMenuRef.current = processMenu;
-
-  // Состояние модуля управления питанием
-  const [restartMode, setRestartMode] = useState<boolean>(false);
-  const [timerSleep, setTimerSleep] = useState<boolean>(false);
-  const [customMinutes, setCustomMinutes] = useState<string>("");
-  const [timerState, setTimerState] = useState<StoredTimerState | null>(() => {
-    try {
-      const raw = localStorage.getItem(TIMER_STORAGE_KEY);
-      if (!raw) return null;
-      const parsed: StoredTimerState = JSON.parse(raw);
-      if (parsed.endTime > Date.now()) {
-        return parsed;
-      }
-      localStorage.removeItem(TIMER_STORAGE_KEY);
-      return null;
-    } catch {
-      return null;
-    }
-  });
-  const [remainingSeconds, setRemainingSeconds] = useState<number>(() => {
-    if (!timerState) return 0;
-    return Math.max(0, Math.ceil((timerState.endTime - Date.now()) / 1000));
-  });
-  const [powerError, setPowerError] = useState<string | null>(null);
 
   // Проверка прав Администратора и загрузка порогов температур при старте приложения
   useEffect(() => {
@@ -178,7 +125,7 @@ export function useNexusController() {
   }, []);
 
   // Опрос списка процессов (Process Explorer) с интервалом автообновления
-  const fetchProcesses = async () => {
+  const fetchProcesses = useCallback(async () => {
     try {
       const list = await invoke<ProcessItem[]>("get_process_list");
       setProcesses(list);
@@ -191,16 +138,16 @@ export function useNexusController() {
     } finally {
       setProcessLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
     if (activeTab !== "processes") return;
     if (processes.length === 0) setProcessLoading(true);
-    fetchProcesses();
+    void fetchProcesses();
     if (!processAutoRefresh) return;
-    const interval = setInterval(fetchProcesses, PROCESS_REFRESH_MS);
-    return () => clearInterval(interval);
-  }, [activeTab, processAutoRefresh]);
+    const interval = window.setInterval(() => void fetchProcesses(), PROCESS_REFRESH_MS);
+    return () => window.clearInterval(interval);
+  }, [activeTab, processAutoRefresh, fetchProcesses, processes.length]);
 
   // Закрытие контекстного меню по клику вне области, Escape, прокрутке или смене вкладки
   useEffect(() => {
@@ -225,35 +172,43 @@ export function useNexusController() {
     setProcessMenu(null);
   }, [activeTab]);
 
-  const showProcessNotice = (msg: string) => {
+  const showProcessNotice = useCallback((msg: string) => {
     setProcessNotice(msg);
-    setTimeout(() => setProcessNotice((cur) => (cur === msg ? null : cur)), 2600);
-  };
+    window.setTimeout(() => setProcessNotice((cur) => (cur === msg ? null : cur)), 2600);
+  }, []);
 
-  const handleProcessContextMenu = (e: MouseEvent<HTMLDivElement>, proc: ProcessItem) => {
-    e.preventDefault();
-    e.stopPropagation();
-    const MENU_W = 248;
-    const MENU_H = 250;
-    const x = Math.min(e.clientX, window.innerWidth - MENU_W - 8);
-    const y = Math.min(e.clientY, window.innerHeight - MENU_H - 8);
-    setSelectedPid(proc.pid);
-    setProcessMenu({ x: Math.max(8, x), y: Math.max(8, y), process: proc });
-  };
+  const handleProcessContextMenu = useCallback(
+    (e: MouseEvent<HTMLDivElement>, proc: ProcessItem) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const MENU_W = 248;
+      const MENU_H = 250;
+      const x = Math.min(e.clientX, window.innerWidth - MENU_W - 8);
+      const y = Math.min(e.clientY, window.innerHeight - MENU_H - 8);
+      setSelectedPid(proc.pid);
+      setProcessMenu({ x: Math.max(8, x), y: Math.max(8, y), process: proc });
+    },
+    []
+  );
 
-  const handleProcessSort = (key: ProcessSortKey) => {
-    if (processSortKey === key) {
-      setProcessSortDesc((prev) => !prev);
-    } else {
-      setProcessSortKey(key);
-      setProcessSortDesc(key !== "name" && key !== "pid");
-    }
-  };
+  const handleProcessSort = useCallback(
+    (key: ProcessSortKey) => {
+      if (processSortKey === key) {
+        setProcessSortDesc((prev) => !prev);
+      } else {
+        setProcessSortKey(key);
+        setProcessSortDesc(key !== "name" && key !== "pid");
+      }
+    },
+    [processSortKey]
+  );
 
-  const handleProcessOpenLocation = async (proc: ProcessItem) => {
+  const handleProcessOpenLocation = useCallback(async (proc: ProcessItem) => {
     setProcessMenu(null);
     if (!proc.exe_path) {
-      setProcessError(`Путь к файлу процесса ${proc.name} недоступен (требуются права Администратора)`);
+      setProcessError(
+        `Путь к файлу процесса ${proc.name} недоступен (требуются права Администратора)`
+      );
       return;
     }
     try {
@@ -261,67 +216,76 @@ export function useNexusController() {
     } catch (err) {
       setProcessError(String(err));
     }
-  };
+  }, []);
 
-  const handleProcessCopyPath = async (proc: ProcessItem) => {
-    setProcessMenu(null);
-    const text = proc.exe_path || proc.name;
-    await copyTextToClipboard(text);
-    showProcessNotice(`Скопировано: ${text}`);
-  };
+  const handleProcessCopyPath = useCallback(
+    async (proc: ProcessItem) => {
+      setProcessMenu(null);
+      const text = proc.exe_path || proc.name;
+      await copyTextToClipboard(text);
+      showProcessNotice(`Скопировано: ${text}`);
+    },
+    [showProcessNotice]
+  );
 
-  const handleProcessSuspendToggle = async (proc: ProcessItem) => {
-    setProcessMenu(null);
-    const isSuspended = suspendedPids.includes(proc.pid);
-    try {
-      await invoke("suspend_process", { pid: proc.pid, suspend: !isSuspended });
-      setSuspendedPids((prev) =>
-        isSuspended ? prev.filter((p) => p !== proc.pid) : [...prev, proc.pid]
-      );
-      showProcessNotice(
-        isSuspended
-          ? `Процесс ${proc.name} (PID ${proc.pid}) возобновлён`
-          : `Процесс ${proc.name} (PID ${proc.pid}) заморожен`
-      );
-    } catch (err) {
-      setProcessError(String(err));
-    }
-  };
+  const handleProcessSuspendToggle = useCallback(
+    async (proc: ProcessItem) => {
+      setProcessMenu(null);
+      const isSuspended = suspendedPids.includes(proc.pid);
+      try {
+        await invoke("suspend_process", { pid: proc.pid, suspend: !isSuspended });
+        setSuspendedPids((prev) =>
+          isSuspended ? prev.filter((p) => p !== proc.pid) : [...prev, proc.pid]
+        );
+        showProcessNotice(
+          isSuspended
+            ? `Процесс ${proc.name} (PID ${proc.pid}) возобновлён`
+            : `Процесс ${proc.name} (PID ${proc.pid}) заморожен`
+        );
+      } catch (err) {
+        setProcessError(String(err));
+      }
+    },
+    [suspendedPids, showProcessNotice]
+  );
 
-  const handleProcessKill = async (proc: ProcessItem, tree: boolean) => {
-    setProcessMenu(null);
-    try {
-      await invoke("kill_process", { pid: proc.pid, tree });
-      setProcesses((prev) => prev.filter((p) => p.pid !== proc.pid));
-      showProcessNotice(
-        tree
-          ? `Дерево процессов ${proc.name} (PID ${proc.pid}) завершено`
-          : `Процесс ${proc.name} (PID ${proc.pid}) завершён`
-      );
-      setTimeout(fetchProcesses, 400);
-    } catch (err) {
-      setProcessError(String(err));
-    }
-  };
+  const handleProcessKill = useCallback(
+    async (proc: ProcessItem, tree: boolean) => {
+      setProcessMenu(null);
+      try {
+        await invoke("kill_process", { pid: proc.pid, tree });
+        setProcesses((prev) => prev.filter((p) => p.pid !== proc.pid));
+        showProcessNotice(
+          tree
+            ? `Дерево процессов ${proc.name} (PID ${proc.pid}) завершено`
+            : `Процесс ${proc.name} (PID ${proc.pid}) завершён`
+        );
+        window.setTimeout(() => void fetchProcesses(), 400);
+      } catch (err) {
+        setProcessError(String(err));
+      }
+    },
+    [fetchProcesses, showProcessNotice]
+  );
 
   // Обработчики безрамочного окна (Frameless Window Controls)
-  const handleWindowMinimize = async () => {
+  const handleWindowMinimize = useCallback(async () => {
     try {
       await getCurrentWindow().minimize();
     } catch (err) {
       console.error("Ошибка сворачивания окна:", err);
     }
-  };
+  }, []);
 
-  const handleWindowToggleMaximize = async () => {
+  const handleWindowToggleMaximize = useCallback(async () => {
     try {
       await getCurrentWindow().toggleMaximize();
     } catch (err) {
       console.error("Ошибка разворачивания окна:", err);
     }
-  };
+  }, []);
 
-  const handleWindowClose = async () => {
+  const handleWindowClose = useCallback(async () => {
     try {
       await invoke("app_exit");
     } catch {
@@ -331,9 +295,9 @@ export function useNexusController() {
         console.error("Ошибка закрытия окна:", err);
       }
     }
-  };
+  }, []);
 
-  const handleRestartAsAdmin = async () => {
+  const handleRestartAsAdmin = useCallback(async () => {
     setAdminError(null);
     setAdminMenuOpen(false);
     try {
@@ -342,63 +306,7 @@ export function useNexusController() {
       console.error("Ошибка перезапуска от имени Администратора:", err);
       setAdminError(String(err));
     }
-  };
-
-  // Обработчик анализа целей очистки (Cleanup Center)
-  const handleScanCleanup = async () => {
-    if (isScanningCleanup || isCleaning) return;
-    setIsScanningCleanup(true);
-    setCleanupError(null);
-    setConfirmCleanupOpen(false);
-    try {
-      const categories = await invoke<CleanupCategory[]>("scan_cleanup_targets");
-      setCleanupCategories(categories);
-      // По умолчанию отмечаем все непустые категории (кроме требующих прав админа, если нет админки)
-      const autoSelect = categories
-        .filter(
-          (c) =>
-            c.size_bytes > 0 &&
-            c.id !== "recycle_bin" &&
-            c.id !== "windows_update" &&
-            (!c.requires_admin || isElevatedAdmin),
-        )
-        .map((c) => c.id);
-      setSelectedCleanupIds(autoSelect.length > 0 ? autoSelect : []);
-    } catch (err) {
-      console.error("Ошибка сканирования категорий очистки:", err);
-      setCleanupError(String(err));
-    } finally {
-      setIsScanningCleanup(false);
-    }
-  };
-
-  const handleToggleCleanupCategory = (id: string) => {
-    setConfirmCleanupOpen(false);
-    setSelectedCleanupIds((prev) =>
-      prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
-    );
-  };
-
-  const handleExecuteCleanup = async () => {
-    if (selectedCleanupIds.length === 0 || isCleaning) return;
-    setIsCleaning(true);
-    setCleanupError(null);
-    setConfirmCleanupOpen(false);
-    try {
-      const report = await invoke<CleanupReport>("execute_cleanup", {
-        categoryIds: selectedCleanupIds,
-      });
-      setCleanupReport(report);
-      // Обновляем размеры категорий после завершения очистки
-      const refreshed = await invoke<CleanupCategory[]>("scan_cleanup_targets");
-      setCleanupCategories(refreshed);
-    } catch (err) {
-      console.error("Ошибка выполнения очистки:", err);
-      setCleanupError(String(err));
-    } finally {
-      setIsCleaning(false);
-    }
-  };
+  }, []);
 
   useEffect(() => {
     // Опрашиваем Rust раз в секунду и пополняем кольцевой буфер на 60 точек
@@ -428,12 +336,12 @@ export function useNexusController() {
       }
     };
 
-    fetchMetrics();
-    const interval = setInterval(fetchMetrics, 1000);
-    return () => clearInterval(interval);
+    void fetchMetrics();
+    const interval = window.setInterval(() => void fetchMetrics(), 1000);
+    return () => window.clearInterval(interval);
   }, []);
 
-  // Опрос датчиков LibreHardwareMonitor раз в 1 секунду при активной вкладке «Железо»
+  // Опрос датчиков LibreHardwareMonitor при активной вкладке «Железо»
   useEffect(() => {
     if (activeTab !== "hardware") return;
 
@@ -458,7 +366,11 @@ export function useNexusController() {
           alert_cpu_temp: number;
           alert_gpu_temp: number;
         }>("get_settings");
-        if (settings.polling_rate_ms === 1000 || settings.polling_rate_ms === 2000 || settings.polling_rate_ms === 5000) {
+        if (
+          settings.polling_rate_ms === 1000 ||
+          settings.polling_rate_ms === 2000 ||
+          settings.polling_rate_ms === 5000
+        ) {
           rate = settings.polling_rate_ms;
         }
         setAlertThresholds({
@@ -479,238 +391,20 @@ export function useNexusController() {
     };
   }, [activeTab]);
 
-  // Загрузка списка автозагрузки при переходе на вкладку «Автозагрузка»
-  const fetchStartupItems = async () => {
-    setStartupLoading(true);
-    setStartupError(null);
-    try {
-      const items = await invoke<StartupItem[]>("get_startup_items");
-      setStartupItems(items);
-    } catch (err) {
-      console.error("Ошибка чтения автозагрузки:", err);
-      setStartupError(String(err));
-    } finally {
-      setStartupLoading(false);
-    }
-  };
+  // Автозагрузка данных при переходе между вкладками
+  const { fetchStartupItems } = startup;
+  const { fetchAvailableDrives } = storage;
+  const { handleAnalyzeCleanup, cleanupCategories } = cleanup;
 
   useEffect(() => {
     if (activeTab === "startup") {
-      fetchStartupItems();
+      void fetchStartupItems();
     } else if (activeTab === "storage") {
-      invoke<DriveVolumeInfo[]>("get_available_drives")
-        .then((drives) => {
-          if (drives && drives.length > 0) {
-            setAvailableDrives(drives);
-            setSelectedDriveOrPath((prev) => (prev ? prev : drives[0].mount_point));
-          }
-        })
-        .catch((err) => console.error("Ошибка получения списка дисков:", err));
+      void fetchAvailableDrives();
     } else if (activeTab === "cleanup" && cleanupCategories.length === 0) {
-      handleScanCleanup();
+      void handleAnalyzeCleanup();
     }
-  }, [activeTab]);
-
-  // Секундомер ожидания во время многопоточного сканирования диска
-  useEffect(() => {
-    if (!isScanning) {
-      setScanElapsedSec(0);
-      return;
-    }
-    const start = Date.now();
-    const timer = setInterval(() => {
-      setScanElapsedSec((Date.now() - start) / 1000);
-    }, 100);
-    return () => clearInterval(timer);
-  }, [isScanning]);
-
-  const handleStartStorageScan = async (targetPathOverride?: string) => {
-    const pathToScan = (targetPathOverride ?? selectedDriveRef.current).trim();
-    if (!pathToScan || isScanning) return;
-
-    setIsScanning(true);
-    setScanError(null);
-    setScanResult(null);
-    try {
-      const res = await invoke<ScanResult>("scan_storage", { path: pathToScan });
-      const current = selectedDriveRef.current.trim().replace(/[\\/]+$/g, "").toUpperCase();
-      const scanned = res.target_path.trim().replace(/[\\/]+$/g, "").toUpperCase();
-      if (current.slice(0, 2) !== scanned.slice(0, 2)) {
-        return;
-      }
-      setScanResult(res);
-      setTreemapStack([res.root_node]);
-      setSelectedTreemapNode(res.root_node.children[0] ?? res.root_node);
-    } catch (err) {
-      console.error("Ошибка сканирования диска:", err);
-      setScanError(String(err));
-    } finally {
-      setIsScanning(false);
-    }
-  };
-
-  const handleOpenPathInExplorer = async (path: string) => {
-    try {
-      await invoke("open_item_location", { path });
-    } catch (err) {
-      console.error("Ошибка открытия пути в проводнике:", err);
-      setScanError(String(err));
-    }
-  };
-
-  const handleToggleStartup = async (item: StartupItem) => {
-    if (
-      item.phantom ||
-      (!item.id.startsWith("reg|") &&
-        !item.id.startsWith("dir|") &&
-        !item.id.startsWith("msix|"))
-    ) {
-      return;
-    }
-    const nextEnabled = !item.enabled;
-    setStartupError(null);
-
-    setStartupItems((prev) =>
-      prev.map((entry) =>
-        entry.id === item.id ? { ...entry, enabled: nextEnabled } : entry
-      )
-    );
-
-    try {
-      await invoke("toggle_startup_item", {
-        id: item.id,
-        enable: nextEnabled,
-      });
-    } catch (err) {
-      console.error("Ошибка переключения автозагрузки:", err);
-      setStartupError(String(err));
-      setStartupItems((prev) =>
-        prev.map((entry) =>
-          entry.id === item.id ? { ...entry, enabled: item.enabled } : entry
-        )
-      );
-    }
-  };
-
-  const handleRemoveStartup = async (item: StartupItem) => {
-    setStartupError(null);
-    try {
-      await invoke("remove_startup_entry", {
-        entryId: item.id,
-        source: item.location,
-      });
-      setStartupItems((prev) => prev.filter((entry) => entry.id !== item.id));
-    } catch (err) {
-      console.error("Ошибка удаления записи автозагрузки:", err);
-      setStartupError(String(err));
-    }
-  };
-
-  const handleOpenItemLocation = async (item: StartupItem) => {
-    setStartupError(null);
-    try {
-      await invoke("open_item_location", {
-        path: item.clean_path || item.command,
-      });
-    } catch (err) {
-      console.error("Ошибка открытия папки:", err);
-      setStartupError(String(err));
-    }
-  };
-
-  // Живой обратный отсчет таймера (работает независимо от выбранной вкладки Sidebar)
-  useEffect(() => {
-    if (!timerState) {
-      setRemainingSeconds(0);
-      return;
-    }
-
-    const updateRemaining = () => {
-      const diff = Math.ceil((timerState.endTime - Date.now()) / 1000);
-      if (diff <= 0) {
-        const shouldSleep = timerState.sleep === true;
-        setRemainingSeconds(0);
-        setTimerState(null);
-        localStorage.removeItem(TIMER_STORAGE_KEY);
-        if (shouldSleep) {
-          void invoke("system_power_action", { action: "sleep" }).catch((err) => {
-            setPowerError(String(err));
-          });
-        }
-      } else {
-        setRemainingSeconds(diff);
-      }
-    };
-
-    updateRemaining();
-    const interval = setInterval(updateRemaining, 1000);
-    return () => clearInterval(interval);
-  }, [timerState]);
-
-  const handleStartTimer = async (minutes: number) => {
-    setPowerError(null);
-    if (!Number.isFinite(minutes) || minutes <= 0) {
-      setPowerError("Введите корректное время в минутах (больше 0)");
-      return;
-    }
-
-    const seconds = Math.round(minutes * 60);
-    const sleep = timerSleep && !restartMode;
-    try {
-      if (sleep) {
-        await invoke("cancel_shutdown");
-      } else {
-        await invoke("schedule_shutdown", {
-          seconds,
-          restart: restartMode,
-        });
-      }
-
-      const newState: StoredTimerState = {
-        endTime: Date.now() + seconds * 1000,
-        totalSeconds: seconds,
-        restart: sleep ? false : restartMode,
-        sleep,
-      };
-      setTimerState(newState);
-      setRemainingSeconds(seconds);
-      localStorage.setItem(TIMER_STORAGE_KEY, JSON.stringify(newState));
-    } catch (err) {
-      console.error("Ошибка при запуске таймера:", err);
-      setPowerError(String(err));
-    }
-  };
-
-  const handleCancelTimer = async (): Promise<boolean> => {
-    setPowerError(null);
-    try {
-      await invoke("cancel_shutdown");
-      setTimerState(null);
-      setRemainingSeconds(0);
-      localStorage.removeItem(TIMER_STORAGE_KEY);
-      return true;
-    } catch (err) {
-      console.error("Ошибка при отмене таймера:", err);
-      setPowerError("Не удалось отменить системный таймер");
-      return false;
-    }
-  };
-
-  const handleCustomSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    const mins = parseFloat(customMinutes);
-    if (!isNaN(mins) && mins > 0) {
-      handleStartTimer(mins);
-      setCustomMinutes("");
-    } else {
-      setPowerError("Укажите положительное количество минут");
-    }
-  };
-
-  const timerProgress =
-    timerState && timerState.totalSeconds > 0
-      ? Math.min(100, Math.max(0, (remainingSeconds / timerState.totalSeconds) * 100))
-      : 0;
+  }, [activeTab, fetchStartupItems, fetchAvailableDrives, handleAnalyzeCleanup, cleanupCategories.length]);
 
   const swapPercentage =
     metrics.swap_total_gb > 0
@@ -743,127 +437,84 @@ export function useNexusController() {
   const ramLoadStyles = getLoadBarStyles(metrics.ram_percentage, "cyan");
   const diskLoadStyles = getLoadBarStyles(diskUsedPercentage, "emerald");
 
-  // Статистика и фильтрация автозагрузки
-  const totalStartupCount = startupItems.length;
-  const activeStartupCount = startupItems.filter((i) => i.enabled).length;
-  const brokenStartupCount = startupItems.filter((i) => !i.file_exists).length;
-
-  const filteredStartupItems = startupItems.filter((item) => {
-    const q = startupSearch.trim().toLowerCase();
-    if (!q) return true;
-    return (
-      item.name.toLowerCase().includes(q) ||
-      item.clean_path.toLowerCase().includes(q) ||
-      item.location.toLowerCase().includes(q)
-    );
-  });
-
-  // Данные текущего уровня Treemap и фильтрация ТОП-100 файлов
-  const currentTreemapRoot =
-    treemapStack.length > 0
-      ? treemapStack[treemapStack.length - 1]
-      : scanResult?.root_node ?? null;
-
-  const treemapRects = currentTreemapRoot
-    ? computeTreemapRects(currentTreemapRoot.children)
-    : [];
-
-  const filteredTopFiles = (scanResult?.top_files ?? []).filter((f) => {
-    const q = fileSearch.trim().toLowerCase();
-    if (!q) return true;
-    return (
-      f.name.toLowerCase().includes(q) ||
-      f.extension.toLowerCase().includes(q) ||
-      f.path.toLowerCase().includes(q)
-    );
-  });
-
   // Проверка перегрева для блока предупреждений Hardware Monitor по пользовательским порогам
-  const cpuWarnLimit = Number.isFinite(alertThresholds.cpu) ? alertThresholds.cpu : 85;
-  const gpuWarnLimit = Number.isFinite(alertThresholds.gpu) ? alertThresholds.gpu : 83;
-  const thermalWarnings: string[] = [];
-  if (hwData) {
-    if (hwData.cpu.package_temp_c !== null && hwData.cpu.package_temp_c >= cpuWarnLimit) {
-      thermalWarnings.push(
-        `Повышенный нагрев CPU Package: ${hwData.cpu.package_temp_c.toFixed(1)}°C (порог ${cpuWarnLimit}°C)`
-      );
-    }
-    for (const g of hwData.gpus) {
-      if (g.hotspot_temp_c !== null && g.hotspot_temp_c >= gpuWarnLimit) {
-        thermalWarnings.push(
-          `Повышенный нагрев GPU Hotspot (${g.name}): ${g.hotspot_temp_c.toFixed(1)}°C (порог ${gpuWarnLimit}°C)`
-        );
-      } else if (g.core_temp_c !== null && g.core_temp_c >= gpuWarnLimit) {
-        thermalWarnings.push(
-          `Повышенный нагрев GPU Core (${g.name}): ${g.core_temp_c.toFixed(1)}°C (порог ${gpuWarnLimit}°C)`
+  const thermalWarnings = useMemo<string[]>(() => {
+    const cpuWarnLimit = Number.isFinite(alertThresholds.cpu) ? alertThresholds.cpu : 85;
+    const gpuWarnLimit = Number.isFinite(alertThresholds.gpu) ? alertThresholds.gpu : 83;
+    const warnings: string[] = [];
+    if (hwData) {
+      if (hwData.cpu.package_temp_c !== null && hwData.cpu.package_temp_c >= cpuWarnLimit) {
+        warnings.push(
+          `Повышенный нагрев CPU Package: ${hwData.cpu.package_temp_c.toFixed(1)}°C (порог ${cpuWarnLimit}°C)`
         );
       }
+      for (const g of hwData.gpus) {
+        if (g.hotspot_temp_c !== null && g.hotspot_temp_c >= gpuWarnLimit) {
+          warnings.push(
+            `Повышенный нагрев GPU Hotspot (${g.name}): ${g.hotspot_temp_c.toFixed(1)}°C (порог ${gpuWarnLimit}°C)`
+          );
+        } else if (g.core_temp_c !== null && g.core_temp_c >= gpuWarnLimit) {
+          warnings.push(
+            `Повышенный нагрев GPU Core (${g.name}): ${g.core_temp_c.toFixed(1)}°C (порог ${gpuWarnLimit}°C)`
+          );
+        }
+      }
     }
-  }
+    return warnings;
+  }, [hwData, alertThresholds]);
 
   const cpuTempStyle = getTempBadgeStyle(hwData?.cpu.package_temp_c);
 
-  // Агрегированная статистика для Cleanup Center
-  const totalCleanupBytes = cleanupCategories.reduce(
-    (acc, cat) => acc + cat.size_bytes,
-    0
-  );
-  const selectedCleanupCategories = cleanupCategories.filter((cat) =>
-    selectedCleanupIds.includes(cat.id)
-  );
-  const selectedCleanupBytes = selectedCleanupCategories.reduce(
-    (acc, cat) => acc + cat.size_bytes,
-    0
-  );
-  const selectedCleanupFilesCount = selectedCleanupCategories.reduce(
-    (acc, cat) => acc + cat.files_count,
-    0
-  );
-
-  // Фильтрация и сортировка процессов (Process Explorer)
+  // Мемоизация фильтрации и сортировки процессов (Process Explorer)
   const processQuery = processSearch.trim().toLowerCase();
-  const visibleProcesses = processes
-    .filter((p) => {
-      if (!processQuery) return true;
-      return (
-        p.name.toLowerCase().includes(processQuery) ||
-        p.pid.toString().includes(processQuery) ||
-        p.exe_path.toLowerCase().includes(processQuery)
-      );
-    })
-    .sort((a, b) => {
-      let diff = 0;
-      switch (processSortKey) {
-        case "name":
-          diff = a.name.localeCompare(b.name, "ru");
-          break;
-        case "pid":
-          diff = a.pid - b.pid;
-          break;
-        case "cpu":
-          diff = a.cpu_usage - b.cpu_usage;
-          break;
-        case "memory":
-          diff = a.memory_mb - b.memory_mb;
-          break;
-        case "disk":
-          diff =
-            a.disk_read_bytes_sec + a.disk_write_bytes_sec -
-            (b.disk_read_bytes_sec + b.disk_write_bytes_sec);
-          break;
-        case "runtime":
-          diff = a.run_time_sec - b.run_time_sec;
-          break;
-      }
-      if (diff === 0) diff = a.pid - b.pid;
-      return processSortDesc ? -diff : diff;
-    });
+  const visibleProcesses = useMemo<ProcessItem[]>(() => {
+    return processes
+      .filter((p) => {
+        if (!processQuery) return true;
+        return (
+          p.name.toLowerCase().includes(processQuery) ||
+          p.pid.toString().includes(processQuery) ||
+          p.exe_path.toLowerCase().includes(processQuery)
+        );
+      })
+      .sort((a, b) => {
+        let diff = 0;
+        switch (processSortKey) {
+          case "name":
+            diff = a.name.localeCompare(b.name, "ru");
+            break;
+          case "pid":
+            diff = a.pid - b.pid;
+            break;
+          case "cpu":
+            diff = a.cpu_usage - b.cpu_usage;
+            break;
+          case "memory":
+            diff = a.memory_mb - b.memory_mb;
+            break;
+          case "disk":
+            diff =
+              a.disk_read_bytes_sec +
+              a.disk_write_bytes_sec -
+              (b.disk_read_bytes_sec + b.disk_write_bytes_sec);
+            break;
+          case "runtime":
+            diff = a.run_time_sec - b.run_time_sec;
+            break;
+        }
+        if (diff === 0) diff = a.pid - b.pid;
+        return processSortDesc ? -diff : diff;
+      });
+  }, [processes, processQuery, processSortKey, processSortDesc]);
 
-  const totalProcessCpu = Math.min(
-    100,
-    processes.reduce((acc, p) => acc + p.cpu_usage, 0)
+  const totalProcessCpu = useMemo(
+    () => Math.min(100, processes.reduce((acc, p) => acc + p.cpu_usage, 0)),
+    [processes]
   );
-  const totalProcessMemoryGb = processes.reduce((acc, p) => acc + p.memory_mb, 0) / 1024;
+  const totalProcessMemoryGb = useMemo(
+    () => processes.reduce((acc, p) => acc + p.memory_mb, 0) / 1024,
+    [processes]
+  );
   const menuProcessSuspended = processMenu
     ? suspendedPids.includes(processMenu.process.pid)
     : false;
@@ -928,50 +579,28 @@ export function useNexusController() {
     setAdminMenuOpen,
     adminError,
     setAdminError,
-    startupItems,
-    setStartupItems,
-    startupSearch,
-    setStartupSearch,
-    startupLoading,
-    setStartupLoading,
-    startupError,
-    setStartupError,
-    availableDrives,
-    setAvailableDrives,
-    selectedDriveOrPath,
-    setSelectedDriveOrPath,
-    isScanning,
-    setIsScanning,
-    scanElapsedSec,
-    setScanElapsedSec,
-    scanResult,
-    setScanResult,
-    scanError,
-    setScanError,
-    treemapStack,
-    setTreemapStack,
-    selectedTreemapNode,
-    setSelectedTreemapNode,
-    fileSearch,
-    setFileSearch,
+
+    // Startup Manager (useStartupManager)
+    ...startup,
+
+    // Storage Scanner (useStorageScanner)
+    ...storage,
+
+    // Cleanup Center (useCleanupCenter)
+    ...cleanup,
+
+    // Power Timer (usePowerTimer)
+    ...power,
+
+    // Hardware Monitor
     hwData,
     setHwData,
     alertThresholds,
     setAlertThresholds,
-    cleanupCategories,
-    setCleanupCategories,
-    selectedCleanupIds,
-    setSelectedCleanupIds,
-    isScanningCleanup,
-    setIsScanningCleanup,
-    isCleaning,
-    setIsCleaning,
-    confirmCleanupOpen,
-    setConfirmCleanupOpen,
-    cleanupReport,
-    setCleanupReport,
-    cleanupError,
-    setCleanupError,
+    thermalWarnings,
+    cpuTempStyle,
+
+    // Process Explorer
     processes,
     setProcesses,
     processSearch,
@@ -995,18 +624,6 @@ export function useNexusController() {
     processMenu,
     setProcessMenu,
     processMenuRef,
-    restartMode,
-    setRestartMode,
-    timerSleep,
-    setTimerSleep,
-    customMinutes,
-    setCustomMinutes,
-    timerState,
-    setTimerState,
-    remainingSeconds,
-    setRemainingSeconds,
-    powerError,
-    setPowerError,
     fetchProcesses,
     showProcessNotice,
     handleProcessContextMenu,
@@ -1015,23 +632,18 @@ export function useNexusController() {
     handleProcessCopyPath,
     handleProcessSuspendToggle,
     handleProcessKill,
+    processQuery,
+    visibleProcesses,
+    totalProcessCpu,
+    totalProcessMemoryGb,
+    menuProcessSuspended,
+    renderSortHeader,
+
+    // Window & Telemetry
     handleWindowMinimize,
     handleWindowToggleMaximize,
     handleWindowClose,
     handleRestartAsAdmin,
-    handleScanCleanup,
-    handleToggleCleanupCategory,
-    handleExecuteCleanup,
-    fetchStartupItems,
-    handleStartStorageScan,
-    handleOpenPathInExplorer,
-    handleToggleStartup,
-    handleRemoveStartup,
-    handleOpenItemLocation,
-    handleStartTimer,
-    handleCancelTimer,
-    handleCustomSubmit,
-    timerProgress,
     swapPercentage,
     diskUsedPercentage,
     isNetworkActive,
@@ -1044,25 +656,6 @@ export function useNexusController() {
     cpuLoadStyles,
     ramLoadStyles,
     diskLoadStyles,
-    totalStartupCount,
-    activeStartupCount,
-    brokenStartupCount,
-    filteredStartupItems,
-    currentTreemapRoot,
-    treemapRects,
-    filteredTopFiles,
-    thermalWarnings,
-    cpuTempStyle,
-    totalCleanupBytes,
-    selectedCleanupCategories,
-    selectedCleanupBytes,
-    selectedCleanupFilesCount,
-    processQuery,
-    visibleProcesses,
-    totalProcessCpu,
-    totalProcessMemoryGb,
-    menuProcessSuspended,
-    renderSortHeader,
     loadTelemetryBundle,
     exportTelemetryCsv,
   };

@@ -12,6 +12,7 @@ import {
   Search,
 } from "lucide-react";
 import { TREEMAP_PALETTE, formatBytes } from "../../lib/studio";
+import { useStorageScanElapsed } from "../../hooks/useStorageScanner";
 import type { NexusController } from "../../hooks/useNexusController";
 
 interface DiskHealthInfo {
@@ -71,6 +72,27 @@ function heavyGroup(path: string): { kind: "game" | "program" | "folder"; title:
   return { kind: "folder", title, folder: joinWin(parts.slice(0, nameAt + 1)) };
 }
 
+function StorageScanButton({
+  isScanning,
+  onStartScan,
+}: {
+  isScanning: boolean;
+  onStartScan: () => void;
+}) {
+  const scanElapsedSec = useStorageScanElapsed(isScanning);
+  return (
+    <button
+      type="button"
+      disabled={isScanning}
+      onClick={onStartScan}
+      className="inline-flex items-center gap-2 rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2 text-xs font-medium text-slate-200 hover:bg-[#1a2332] disabled:opacity-70"
+    >
+      {isScanning ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />}
+      {isScanning ? `Сканирование ${scanElapsedSec.toFixed(0)} с` : "Сканировать диск"}
+    </button>
+  );
+}
+
 export function StorageModule({ c }: { c: NexusController }) {
   const {
     metrics,
@@ -79,7 +101,6 @@ export function StorageModule({ c }: { c: NexusController }) {
     selectedDriveOrPath,
     setSelectedDriveOrPath,
     isScanning,
-    scanElapsedSec,
     scanResult,
     scanError,
     treemapStack,
@@ -202,15 +223,10 @@ export function StorageModule({ c }: { c: NexusController }) {
           </div>
 
           <div className="flex shrink-0 items-center gap-2">
-            <button
-              type="button"
-              disabled={isScanning}
-              onClick={() => void handleStartStorageScan()}
-              className="inline-flex items-center gap-2 rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2 text-xs font-medium text-slate-200 hover:bg-[#1a2332] disabled:opacity-70"
-            >
-              {isScanning ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />}
-              {isScanning ? `Сканирование ${scanElapsedSec.toFixed(0)} с` : "Сканировать диск"}
-            </button>
+            <StorageScanButton
+              isScanning={isScanning}
+              onStartScan={() => void handleStartStorageScan()}
+            />
           </div>
         </div>
         {scanError && (
