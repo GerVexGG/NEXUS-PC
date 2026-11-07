@@ -195,31 +195,28 @@ fn unix_now() -> u64 {
 }
 
 pub fn start_sampler(
-    sys: Arc<Mutex<System>>,
     hw_telemetry: Arc<Mutex<Option<HardwareTelemetry>>>,
     buffer: Arc<RwLock<VecDeque<TelemetrySnapshot>>>,
 ) {
     std::thread::spawn(move || {
-        if let Ok(mut guard) = sys.lock() {
-            guard.refresh_cpu_usage();
-            let _ = guard.refresh_processes_specifics(
-                ProcessesToUpdate::All,
-                true,
-                ProcessRefreshKind::nothing().with_cpu(),
-            );
-        }
+        // Изолированный экземпляр System для фоновой истории телеметрии,
+        // чтобы не сбрасывать дельты CPU% и Disk I/O основного диспетчера процессов.
+        let mut system = System::new();
+        system.refresh_cpu_usage();
+        let _ = system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing().with_cpu(),
+        );
         loop {
             std::thread::sleep(SAMPLE_GAP);
-            let Some(snapshot) = capture(&sys, &hw_telemetry) else {
-                continue;
-            };
+            let snapshot = capture(&mut system, &hw_telemetry);
             push_snapshot(&buffer, snapshot);
         }
     });
 }
 
-fn capture(sys: &Mutex<System>, hw_telemetry: &Mutex<Option<HardwareTelemetry>>) -> Option<TelemetrySnapshot> {
-    let mut system = sys.lock().ok()?;
+fn capture(system: &mut System, hw_telemetry: &Mutex<Option<HardwareTelemetry>>) -> TelemetrySnapshot {
     system.refresh_cpu_usage();
     system.refresh_memory();
     let _ = system.refresh_processes_specifics(
@@ -251,7 +248,6 @@ fn capture(sys: &Mutex<System>, hw_telemetry: &Mutex<Option<HardwareTelemetry>>)
             top_process_name = name.into_owned();
         }
     }
-    drop(system);
 
     let (cpu_temp, gpu_temp, gpu_usage) = hw_telemetry
         .lock()
@@ -266,7 +262,7 @@ fn capture(sys: &Mutex<System>, hw_telemetry: &Mutex<Option<HardwareTelemetry>>)
         })
         .unwrap_or((None, None, 0.0));
 
-    Some(TelemetrySnapshot {
+    TelemetrySnapshot {
         timestamp: unix_now(),
         cpu_usage,
         cpu_temp,
@@ -275,5 +271,5 @@ fn capture(sys: &Mutex<System>, hw_telemetry: &Mutex<Option<HardwareTelemetry>>)
         ram_used_percent,
         top_process_name,
         top_process_cpu,
-    })
+    }
 }

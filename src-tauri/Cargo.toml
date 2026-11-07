@@ -29,10 +29,6 @@ rayon = "1"
 png = "0.18"
 qrcode = "0.14"
 
-[target.'cfg(windows)'.dependencies.windows]
-version = "0.57"
-features = ["Media_Control", "Storage_Streams", "Foundation", "Foundation_Collections"]
-
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

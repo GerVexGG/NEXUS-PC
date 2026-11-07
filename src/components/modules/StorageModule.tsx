@@ -123,10 +123,28 @@ export function StorageModule({ c }: { c: NexusController }) {
   }, []);
 
   const selectedLetter = selectedDriveOrPath.trim().slice(0, 2).toUpperCase();
+  const matchedVolume = availableDrives.find(
+    (d) => d.mount_point.trim().slice(0, 2).toUpperCase() === selectedLetter
+  );
   const showsSystemVolume = selectedLetter.startsWith("C") || selectedDriveOrPath.trim() === "";
-  const freeGb = showsSystemVolume ? metrics.disk_free_gb : null;
-  const totalGb = showsSystemVolume ? metrics.disk_total_gb : null;
-  const usedPct = showsSystemVolume ? diskUsedPercentage : 0;
+  const freeGb =
+    matchedVolume && matchedVolume.total_bytes > 0
+      ? matchedVolume.available_bytes / 1024 / 1024 / 1024
+      : showsSystemVolume
+        ? metrics.disk_free_gb
+        : null;
+  const totalGb =
+    matchedVolume && matchedVolume.total_bytes > 0
+      ? matchedVolume.total_bytes / 1024 / 1024 / 1024
+      : showsSystemVolume
+        ? metrics.disk_total_gb
+        : null;
+  const usedPct =
+    freeGb !== null && totalGb !== null && totalGb > 0
+      ? Math.min(100, Math.max(0, ((totalGb - freeGb) / totalGb) * 100))
+      : showsSystemVolume
+        ? diskUsedPercentage
+        : 0;
 
   return (
     <motion.div
@@ -142,14 +160,15 @@ export function StorageModule({ c }: { c: NexusController }) {
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap gap-2">
               {availableDrives.map((drive) => {
-                const selected = selectedDriveOrPath.toUpperCase() === drive.toUpperCase();
+                const mount = drive.mount_point;
+                const selected = selectedDriveOrPath.toUpperCase() === mount.toUpperCase();
                 return (
                   <button
-                    key={drive}
+                    key={mount}
                     type="button"
                     onClick={() => {
                       if (selected) return;
-                      setSelectedDriveOrPath(drive);
+                      setSelectedDriveOrPath(mount);
                       setScanResult(null);
                       setTreemapStack([]);
                     }}
@@ -159,7 +178,7 @@ export function StorageModule({ c }: { c: NexusController }) {
                         : "border-[#222b38] bg-[#151c27] text-slate-300 hover:bg-[#1a2332]"
                     }`}
                   >
-                    {driveLabel(drive)}
+                    {driveLabel(mount)}
                   </button>
                 );
               })}
@@ -171,8 +190,8 @@ export function StorageModule({ c }: { c: NexusController }) {
             </div>
             <p className="mt-1 text-sm text-slate-400">
               {freeGb !== null && totalGb !== null
-                ? `из ${totalGb.toFixed(0)} ГБ на системном томе`
-                : "Свободное место этого тома появится в метриках только для системного диска"}
+                ? `из ${totalGb.toFixed(0)} ГБ (${showsSystemVolume ? "системный том" : `том ${selectedLetter}`})`
+                : "Свободное место этого тома недоступно"}
             </p>
             <div className="mt-3 h-2 overflow-hidden rounded-full bg-[#151c27]">
               <div className="flex h-full">

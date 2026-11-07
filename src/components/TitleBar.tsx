@@ -10,7 +10,6 @@ const TAB_TITLES: Record<string, string> = {
   cleanup: "Центр очистки системы",
   power: "Управление питанием",
   drop: "NEXUS Drop",
-  music: "NEXUS Music",
   settings: "Настройки и журнал",
 };
 

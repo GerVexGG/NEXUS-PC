@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
@@ -105,24 +105,62 @@ pub fn normalize_settings(mut settings: NexusSettings) -> NexusSettings {
     settings
 }
 
-pub fn load_settings() -> NexusSettings {
+struct SettingsMemoryState {
+    settings: NexusSettings,
+    load_error: Option<String>,
+}
+
+static SETTINGS: LazyLock<RwLock<SettingsMemoryState>> = LazyLock::new(|| {
+    let (settings, load_error) = read_settings_once();
+    RwLock::new(SettingsMemoryState {
+        settings,
+        load_error,
+    })
+});
+
+fn read_settings_once() -> (NexusSettings, Option<String>) {
     let path = settings_path();
     if !path.exists() {
         let settings = NexusSettings::default();
         let _ = write_settings_file(&settings);
-        return settings;
+        return (settings, None);
     }
     match fs::read_to_string(&path) {
         Ok(raw) => match serde_json::from_str::<NexusSettings>(&raw) {
-            Ok(settings) => normalize_settings(settings),
-            Err(_) => {
-                let settings = NexusSettings::default();
-                let _ = write_settings_file(&settings);
-                settings
-            }
+            Ok(settings) => (normalize_settings(settings), None),
+            Err(err) => (
+                NexusSettings::default(),
+                Some(format!(
+                    "Файл settings.json повреждён и оставлен без перезаписи: {err}"
+                )),
+            ),
         },
-        Err(_) => NexusSettings::default(),
+        Err(err) => (
+            NexusSettings::default(),
+            Some(format!("Не удалось прочитать settings.json: {err}")),
+        ),
     }
+}
+
+pub fn init_settings() {
+    let _ = &*SETTINGS;
+}
+
+pub fn load_settings() -> NexusSettings {
+    SETTINGS
+        .read()
+        .map(|guard| guard.settings.clone())
+        .unwrap_or_default()
+}
+
+pub fn get_settings() -> Result<NexusSettings, String> {
+    let guard = SETTINGS
+        .read()
+        .map_err(|_| "Хранилище настроек в памяти заблокировано".to_string())?;
+    if let Some(err) = &guard.load_error {
+        return Err(err.clone());
+    }
+    Ok(guard.settings.clone())
 }
 
 fn write_settings_file(settings: &NexusSettings) -> Result<(), String> {
@@ -134,6 +172,10 @@ fn write_settings_file(settings: &NexusSettings) -> Result<(), String> {
 pub fn save_settings(settings: NexusSettings) -> Result<(), String> {
     let settings = normalize_settings(settings);
     write_settings_file(&settings)?;
+    if let Ok(mut guard) = SETTINGS.write() {
+        guard.settings = settings.clone();
+        guard.load_error = None;
+    }
     sync_autostart(settings.autostart)
 }
 

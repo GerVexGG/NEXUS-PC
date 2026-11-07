@@ -1,4 +1,4 @@
-import { useEffect, useState, type MouseEvent } from "react";
+import { useEffect, useRef, useState, type MouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { AnimatePresence, motion } from "framer-motion";
 import { AppWindow, Copy, Loader2, RefreshCw, Search, X } from "lucide-react";
@@ -449,6 +449,15 @@ function NetworkToolkit() {
   const [dnsRows, setDnsRows] = useState<DnsBenchRow[]>([]);
   const [dnsBusy, setDnsBusy] = useState(false);
   const [dnsError, setDnsError] = useState("");
+  const progressTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (progressTimerRef.current) {
+        clearInterval(progressTimerRef.current);
+      }
+    };
+  }, []);
 
   const fastest = dnsRows.reduce<number | null>((best, row) => {
     if (row.ms == null) return best;
@@ -489,7 +498,10 @@ function NetworkToolkit() {
             setProgress(0);
             setProbeError("");
             setReport(null);
-            const timer = window.setInterval(() => {
+            if (progressTimerRef.current) {
+              clearInterval(progressTimerRef.current);
+            }
+            progressTimerRef.current = window.setInterval(() => {
               void invoke<number>("get_stability_progress").then(setProgress).catch(() => undefined);
             }, 250);
             void invoke<StabilityReport>("run_stability_probe", { host })
@@ -499,7 +511,10 @@ function NetworkToolkit() {
               })
               .catch((err) => setProbeError(String(err)))
               .finally(() => {
-                window.clearInterval(timer);
+                if (progressTimerRef.current) {
+                  clearInterval(progressTimerRef.current);
+                  progressTimerRef.current = null;
+                }
                 setRunning(false);
               });
           }}

@@ -14,7 +14,6 @@ use sysinfo::{Disks, Networks, System};
 mod drop_server;
 mod settings;
 mod telemetry;
-mod media;
 
 use tauri::{Manager, State};
 
@@ -212,13 +211,21 @@ pub struct NetworkConnection {
     pub icon_base64: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DriveVolumeInfo {
+    pub mount_point: String,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+}
+
 // Хранилище состояния приложения
 pub struct AppState {
     pub sys: Arc<Mutex<System>>,
     pub networks: Arc<Mutex<Networks>>,
     pub disk_space: Arc<Mutex<(u64, u64)>>,
-    pub ping_cache: Mutex<(u32, Option<Instant>)>,
+    pub ping_cache: Arc<Mutex<(u32, Option<Instant>, bool)>>,
     pub process_last_refresh: Mutex<Option<Instant>>,
+    pub pid_cache: Mutex<HashMap<u32, (String, String)>>,
     pub hw_telemetry: Arc<Mutex<Option<HardwareTelemetry>>>,
     pub hw_sidecar_child: Arc<Mutex<Option<Child>>>,
     pub icon_cache: Mutex<HashMap<String, String>>,
@@ -606,6 +613,38 @@ fn startup_approved_disabled(root: winreg::HKEY, subkey: &str, name: &str) -> bo
     }
 }
 
+#[cfg(target_os = "windows")]
+fn restore_startup_approved_if_disabled(
+    root: winreg::HKEY,
+    subkey: &str,
+    name: &str,
+) -> Result<bool, String> {
+    if !startup_approved_disabled(root, subkey, name) {
+        return Ok(false);
+    }
+    let key = RegKey::predef(root)
+        .open_subkey_with_flags(subkey, KEY_READ | KEY_SET_VALUE | KEY_WOW64_64KEY)
+        .map_err(|e| {
+            format!(
+                "Не удалось открыть StartupApproved для включения записи (для HKLM требуются права Администратора): {e}"
+            )
+        })?;
+    let mut raw = key.get_raw_value(name).unwrap_or(winreg::RegValue {
+        bytes: vec![0u8; 12],
+        vtype: RegType::REG_BINARY,
+    });
+    if raw.bytes.len() < 12 {
+        raw.bytes.resize(12, 0);
+    }
+    raw.bytes[0] = 0x02;
+    for byte in raw.bytes.iter_mut().skip(4) {
+        *byte = 0;
+    }
+    key.set_raw_value(name, &raw)
+        .map_err(|e| format!("Не удалось выставить флаг 0x02 в StartupApproved: {e}"))?;
+    Ok(true)
+}
+
 fn read_registry_run_items(
     root: winreg::HKEY,
     subkey_path: &str,
@@ -763,117 +802,121 @@ fn scan_startup_folder(
 }
 
 #[tauri::command]
-fn get_startup_items() -> Result<Vec<StartupItem>, String> {
-    let mut items = Vec::new();
-    let mut seen_ids = HashSet::new();
+async fn get_startup_items() -> Result<Vec<StartupItem>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut items = Vec::new();
+        let mut seen_ids = HashSet::new();
 
-    #[cfg(target_os = "windows")]
-    {
-        read_registry_run_items(
-            HKEY_CURRENT_USER,
-            RUN_KEY_PATH,
-            KEY_READ,
-            "HKCU_RUN",
-            "HKCU (Реестр)",
-            true,
-            &mut seen_ids,
-            &mut items,
-        );
-        read_registry_run_items(
-            HKEY_LOCAL_MACHINE,
-            RUN_KEY_PATH,
-            KEY_READ | KEY_WOW64_64KEY,
-            "HKLM_RUN",
-            "HKLM (Система)",
-            true,
-            &mut seen_ids,
-            &mut items,
-        );
-        read_registry_run_items(
-            HKEY_LOCAL_MACHINE,
-            RUN_WOW64_KEY_PATH,
-            KEY_READ | KEY_WOW64_64KEY,
-            "HKLM_WOW64_RUN",
-            "HKLM (Система)",
-            true,
-            &mut seen_ids,
-            &mut items,
-        );
-
-        let disabled_sources = [
-            ("HKCU_RUN", "HKCU (Реестр)"),
-            ("HKLM_RUN", "HKLM (Система)"),
-            ("HKLM_WOW64_RUN", "HKLM (Система)"),
-        ];
-        for (source_tag, location_label) in disabled_sources {
-            let subkey = format!(r"{}\{}", NEXUS_DISABLED_REG_BASE, source_tag);
+        #[cfg(target_os = "windows")]
+        {
             read_registry_run_items(
                 HKEY_CURRENT_USER,
-                &subkey,
+                RUN_KEY_PATH,
                 KEY_READ,
-                source_tag,
-                location_label,
+                "HKCU_RUN",
+                "HKCU (Реестр)",
+                true,
+                &mut seen_ids,
+                &mut items,
+            );
+            read_registry_run_items(
+                HKEY_LOCAL_MACHINE,
+                RUN_KEY_PATH,
+                KEY_READ | KEY_WOW64_64KEY,
+                "HKLM_RUN",
+                "HKLM (Система)",
+                true,
+                &mut seen_ids,
+                &mut items,
+            );
+            read_registry_run_items(
+                HKEY_LOCAL_MACHINE,
+                RUN_WOW64_KEY_PATH,
+                KEY_READ | KEY_WOW64_64KEY,
+                "HKLM_WOW64_RUN",
+                "HKLM (Система)",
+                true,
+                &mut seen_ids,
+                &mut items,
+            );
+
+            let disabled_sources = [
+                ("HKCU_RUN", "HKCU (Реестр)"),
+                ("HKLM_RUN", "HKLM (Система)"),
+                ("HKLM_WOW64_RUN", "HKLM (Система)"),
+            ];
+            for (source_tag, location_label) in disabled_sources {
+                let subkey = format!(r"{}\{}", NEXUS_DISABLED_REG_BASE, source_tag);
+                read_registry_run_items(
+                    HKEY_CURRENT_USER,
+                    &subkey,
+                    KEY_READ,
+                    source_tag,
+                    location_label,
+                    false,
+                    &mut seen_ids,
+                    &mut items,
+                );
+            }
+
+            read_registry_run_items(
+                HKEY_CURRENT_USER,
+                NEXUS_DISABLED_REG_BASE,
+                KEY_READ,
+                "HKCU_RUN",
+                "HKCU (Реестр)",
                 false,
                 &mut seen_ids,
                 &mut items,
             );
         }
 
-        read_registry_run_items(
-            HKEY_CURRENT_USER,
-            NEXUS_DISABLED_REG_BASE,
-            KEY_READ,
-            "HKCU_RUN",
-            "HKCU (Реестр)",
-            false,
-            &mut seen_ids,
-            &mut items,
-        );
-    }
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let user_startup: PathBuf = Path::new(&appdata)
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs")
+                .join("Startup");
+            scan_startup_folder(
+                &user_startup,
+                "Папка Автозагрузка",
+                Some(HKEY_CURRENT_USER),
+                &mut items,
+                &mut seen_ids,
+            );
+        }
 
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        let user_startup: PathBuf = Path::new(&appdata)
-            .join("Microsoft")
-            .join("Windows")
-            .join("Start Menu")
-            .join("Programs")
-            .join("Startup");
-        scan_startup_folder(
-            &user_startup,
-            "Папка Автозагрузка",
-            Some(HKEY_CURRENT_USER),
-            &mut items,
-            &mut seen_ids,
-        );
-    }
+        let program_data = std::env::var("PROGRAMDATA")
+            .or_else(|_| std::env::var("ALLUSERSPROFILE"))
+            .ok();
+        if let Some(program_data) = program_data {
+            let common_startup: PathBuf = Path::new(&program_data)
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs")
+                .join("Startup");
+            scan_startup_folder(
+                &common_startup,
+                "Общая автозагрузка",
+                Some(HKEY_LOCAL_MACHINE),
+                &mut items,
+                &mut seen_ids,
+            );
+        }
 
-    let program_data = std::env::var("PROGRAMDATA")
-        .or_else(|_| std::env::var("ALLUSERSPROFILE"))
-        .ok();
-    if let Some(program_data) = program_data {
-        let common_startup: PathBuf = Path::new(&program_data)
-            .join("Microsoft")
-            .join("Windows")
-            .join("Start Menu")
-            .join("Programs")
-            .join("Startup");
-        scan_startup_folder(
-            &common_startup,
-            "Общая автозагрузка",
-            Some(HKEY_LOCAL_MACHINE),
-            &mut items,
-            &mut seen_ids,
-        );
-    }
+        #[cfg(target_os = "windows")]
+        {
+            append_msix_startup(&mut items, &mut seen_ids);
+            append_orphan_approved(&mut items, &mut seen_ids);
+        }
 
-    #[cfg(target_os = "windows")]
-    {
-        append_msix_startup(&mut items, &mut seen_ids);
-        append_orphan_approved(&mut items, &mut seen_ids);
-    }
-
-    items.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    Ok(items)
+        items.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        Ok(items)
+    })
+    .await
+    .map_err(|e| format!("Ошибка потока чтения автозагрузки: {e}"))?
 }
 
 fn pretty_store_name(family: &str) -> String {
@@ -1349,6 +1392,10 @@ fn append_logon_tasks(items: &mut Vec<StartupItem>, seen_ids: &mut HashSet<Strin
 
 #[tauri::command]
 fn toggle_startup_item(id: String, enable: bool) -> Result<(), String> {
+    if id.starts_with("approved|") {
+        return Err("Осиротевшую запись реестра нельзя переключить — её можно только удалить".to_string());
+    }
+
     if let Some(base_path) = id.strip_prefix("dir|") {
         let disabled_path = format!("{}.disabled", base_path);
         if enable {
@@ -1356,6 +1403,21 @@ fn toggle_startup_item(id: String, enable: bool) -> Result<(), String> {
                 std::fs::rename(&disabled_path, base_path).map_err(|e| {
                     format!("Не удалось включить ярлык автозагрузки (проверьте права доступа): {}", e)
                 })?;
+            }
+            #[cfg(target_os = "windows")]
+            if let Some(file_name) = Path::new(base_path).file_name().and_then(|n| n.to_str()) {
+                let folder_approved =
+                    r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder";
+                let _ = restore_startup_approved_if_disabled(
+                    HKEY_CURRENT_USER,
+                    folder_approved,
+                    file_name,
+                );
+                let _ = restore_startup_approved_if_disabled(
+                    HKEY_LOCAL_MACHINE,
+                    folder_approved,
+                    file_name,
+                );
             }
         } else if Path::new(base_path).exists() {
             std::fs::rename(base_path, &disabled_path).map_err(|e| {
@@ -1366,15 +1428,47 @@ fn toggle_startup_item(id: String, enable: bool) -> Result<(), String> {
     }
 
     #[cfg(target_os = "windows")]
+    if let Some(rest) = id.strip_prefix("msix|") {
+        let mut parts = rest.splitn(2, '|');
+        let family = parts.next().ok_or("Не указано приложение Store")?;
+        let task = parts.next().ok_or("Не указана задача Store")?;
+        let task_path = format!(
+            r"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData\{family}\StartupTasks\{task}"
+        );
+        let key = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags(&task_path, KEY_SET_VALUE)
+            .map_err(|e| format!("Не удалось открыть задачу автозапуска Store: {e}"))?;
+        let next_state: u32 = if enable { 2 } else { 1 };
+        key.set_value("State", &next_state)
+            .map_err(|e| format!("Не удалось изменить состояние задачи Store: {e}"))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
     if let Some(rest) = id.strip_prefix("reg|") {
         let mut parts = rest.splitn(2, '|');
         let source_tag = parts.next().ok_or("Некорректный ID записи реестра")?;
         let value_name = parts.next().ok_or("Не указано имя параметра реестра")?;
 
-        let (active_root, active_subkey) = match source_tag {
-            "HKCU_RUN" => (HKEY_CURRENT_USER, RUN_KEY_PATH),
-            "HKLM_RUN" => (HKEY_LOCAL_MACHINE, RUN_KEY_PATH),
-            "HKLM_WOW64_RUN" => (HKEY_LOCAL_MACHINE, RUN_WOW64_KEY_PATH),
+        let (active_root, active_subkey, approved_root, approved_subkey) = match source_tag {
+            "HKCU_RUN" => (
+                HKEY_CURRENT_USER,
+                RUN_KEY_PATH,
+                HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
+            ),
+            "HKLM_RUN" => (
+                HKEY_LOCAL_MACHINE,
+                RUN_KEY_PATH,
+                HKEY_LOCAL_MACHINE,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run",
+            ),
+            "HKLM_WOW64_RUN" => (
+                HKEY_LOCAL_MACHINE,
+                RUN_WOW64_KEY_PATH,
+                HKEY_LOCAL_MACHINE,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32",
+            ),
             _ => return Err(format!("Неизвестный источник реестра: {}", source_tag)),
         };
 
@@ -1384,7 +1478,7 @@ fn toggle_startup_item(id: String, enable: bool) -> Result<(), String> {
 
         if !enable {
             let active_key = active_hive
-                .open_subkey_with_flags(active_subkey, KEY_READ | KEY_SET_VALUE)
+                .open_subkey_with_flags(active_subkey, KEY_READ | KEY_SET_VALUE | KEY_WOW64_64KEY)
                 .map_err(|e| {
                     format!(
                         "Не удалось открыть ветку реестра для изменения (для HKLM требуются права администратора): {}",
@@ -1412,37 +1506,55 @@ fn toggle_startup_item(id: String, enable: bool) -> Result<(), String> {
                 ));
             }
         } else {
-            let backup_key = hkcu
+            // Сначала проверяем, не осталась ли запись в активной ветке Run,
+            // будучи отключённой через стандартный Диспетчер задач Windows (StartupApproved\Run).
+            let already_in_active = active_hive
+                .open_subkey_with_flags(active_subkey, KEY_READ | KEY_WOW64_64KEY)
+                .and_then(|key| key.get_value::<String, _>(value_name))
+                .is_ok();
+
+            let backup_entry = hkcu
                 .open_subkey_with_flags(&backup_subkey_path, KEY_READ | KEY_SET_VALUE)
+                .and_then(|key| key.get_value::<String, _>(value_name).map(|cmd| (key, cmd)))
                 .or_else(|_| {
                     hkcu.open_subkey_with_flags(NEXUS_DISABLED_REG_BASE, KEY_READ | KEY_SET_VALUE)
-                })
-                .map_err(|e| format!("Резервная запись не найдена: {}", e))?;
+                        .and_then(|key| key.get_value::<String, _>(value_name).map(|cmd| (key, cmd)))
+                });
 
-            let command: String = backup_key
-                .get_value(value_name)
-                .map_err(|e| format!("Не удалось прочитать отключенную запись '{}': {}", value_name, e))?;
+            if let Ok((backup_key, command)) = backup_entry {
+                let active_key = active_hive
+                    .open_subkey_with_flags(active_subkey, KEY_SET_VALUE | KEY_WOW64_64KEY)
+                    .map_err(|e| {
+                        format!(
+                            "Не удалось открыть ветку автозагрузки для записи (для HKLM нужны права администратора): {}",
+                            e
+                        )
+                    })?;
 
-            let active_key = active_hive
-                .open_subkey_with_flags(active_subkey, KEY_SET_VALUE)
-                .map_err(|e| {
-                    format!(
-                        "Не удалось открыть ветку автозагрузки для записи (для HKLM нужны права администратора): {}",
-                        e
-                    )
-                })?;
+                active_key
+                    .set_value(value_name, &command)
+                    .map_err(|e| format!("Не удалось восстановить запись в Run: {}", e))?;
 
-            active_key
-                .set_value(value_name, &command)
-                .map_err(|e| format!("Не удалось восстановить запись в Run: {}", e))?;
-
-            let _ = backup_key.delete_value(value_name);
+                let _ = backup_key.delete_value(value_name);
+                let _ = restore_startup_approved_if_disabled(
+                    approved_root,
+                    approved_subkey,
+                    value_name,
+                );
+            } else if already_in_active {
+                restore_startup_approved_if_disabled(approved_root, approved_subkey, value_name)?;
+            } else {
+                return Err(format!(
+                    "Резервная запись для '{}' не найдена в реестре",
+                    value_name
+                ));
+            }
         }
 
         return Ok(());
     }
 
-    Err("Неизвестный формат идентификатора автозагрузки".to_string())
+    Err("Данный тип записи автозагрузки не поддерживает переключение".to_string())
 }
 
 fn startup_target_exists(clean_path: &str) -> bool {
@@ -1841,24 +1953,72 @@ fn open_item_location(path: String) -> Result<(), String> {
     Err(format!("Файл не найден: {cleaned}"))
 }
 
-// Возвращает список доступных дисков системы (C:\, D:\ и т.д.)
+fn system_drive_prefix() -> String {
+    let raw = std::env::var("SystemDrive")
+        .unwrap_or_else(|_| "C:".to_string())
+        .trim()
+        .to_uppercase();
+    if raw.len() >= 2 && raw.as_bytes()[1] == b':' {
+        raw[..2].to_string()
+    } else {
+        "C:".to_string()
+    }
+}
+
+fn system_drive_space_gb(disks: &Disks) -> (u64, u64) {
+    let sys_prefix = system_drive_prefix();
+    let matched = disks
+        .iter()
+        .find(|disk| {
+            let mount = disk.mount_point().to_string_lossy().to_uppercase();
+            mount.starts_with(&sys_prefix)
+        })
+        .or_else(|| disks.first());
+
+    matched
+        .map(|disk| {
+            (
+                disk.available_space() / 1024 / 1024 / 1024,
+                disk.total_space() / 1024 / 1024 / 1024,
+            )
+        })
+        .unwrap_or((0, 0))
+}
+
+// Возвращает список доступных дисков системы (C:\, D:\ и т.д.) с их общим и свободным объёмом
 #[tauri::command]
-fn get_available_drives() -> Vec<String> {
-    let disks = Disks::new_with_refreshed_list();
-    let mut drives: Vec<String> = Vec::new();
+async fn get_available_drives() -> Result<Vec<DriveVolumeInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let disks = Disks::new_with_refreshed_list();
+        let mut drives: Vec<DriveVolumeInfo> = Vec::new();
 
-    for disk in disks.iter() {
-        let mount = disk.mount_point().to_string_lossy().to_string();
-        if !mount.is_empty() && !drives.contains(&mount) {
-            drives.push(mount);
+        for disk in disks.iter() {
+            let mount = disk.mount_point().to_string_lossy().to_string();
+            if !mount.is_empty()
+                && !drives
+                    .iter()
+                    .any(|d| d.mount_point.eq_ignore_ascii_case(&mount))
+            {
+                drives.push(DriveVolumeInfo {
+                    mount_point: mount,
+                    total_bytes: disk.total_space(),
+                    available_bytes: disk.available_space(),
+                });
+            }
         }
-    }
 
-    drives.sort();
-    if drives.is_empty() {
-        drives.push(r"C:\".to_string());
-    }
-    drives
+        drives.sort_by(|a, b| a.mount_point.cmp(&b.mount_point));
+        if drives.is_empty() {
+            drives.push(DriveVolumeInfo {
+                mount_point: format!("{}\\", system_drive_prefix()),
+                total_bytes: 0,
+                available_bytes: 0,
+            });
+        }
+        Ok(drives)
+    })
+    .await
+    .map_err(|e| format!("Ошибка потока чтения томов: {e}"))?
 }
 
 fn classify_extension(ext: &str) -> &'static str {
@@ -2192,59 +2352,84 @@ async fn scan_storage(path: String) -> Result<ScanResult, String> {
     .map_err(|e| format!("Ошибка выполнения фонового потока сканирования: {}", e))?
 }
 
-// Замер реального TCP-пинга до DNS-шлюзов (1.1.1.1:53 / 8.8.8.8:53) с кэшированием на 2.5 сек
-fn measure_network_ping_ms(state: &AppState) -> u32 {
-    if let Ok(guard) = state.ping_cache.lock() {
-        if let (cached_ms, Some(last_checked)) = *guard {
-            if last_checked.elapsed() < Duration::from_millis(2500) {
-                return cached_ms;
-            }
-        }
-    }
-
+fn probe_gateway_ping_ms() -> u32 {
     let targets = [
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
     ];
     let timeout = Duration::from_millis(450);
 
-    let mut measured_ms: u32 = 0;
     for addr in &targets {
         let start = Instant::now();
         if TcpStream::connect_timeout(addr, timeout).is_ok() {
             let ms = start.elapsed().as_millis() as u32;
-            measured_ms = ms.max(1);
-            break;
+            return ms.max(1);
+        }
+    }
+    0
+}
+
+// Неблокирующий замер TCP-пинга до DNS-шлюзов (1.1.1.1:53 / 8.8.8.8:53) с фоновым обновлением кэша раз в 2.5 сек
+fn measure_network_ping_ms(state: &AppState) -> u32 {
+    let mut should_spawn = false;
+    let mut cached_ms = 0u32;
+
+    if let Ok(mut guard) = state.ping_cache.lock() {
+        cached_ms = guard.0;
+        let expired = guard
+            .1
+            .map(|last| last.elapsed() >= Duration::from_millis(2500))
+            .unwrap_or(true);
+        if expired && !guard.2 {
+            guard.2 = true;
+            should_spawn = true;
         }
     }
 
-    if let Ok(mut guard) = state.ping_cache.lock() {
-        *guard = (measured_ms, Some(Instant::now()));
+    if should_spawn {
+        let cache = Arc::clone(&state.ping_cache);
+        tauri::async_runtime::spawn_blocking(move || {
+            let measured = probe_gateway_ping_ms();
+            if let Ok(mut guard) = cache.lock() {
+                *guard = (measured, Some(Instant::now()), false);
+            }
+        });
     }
 
-    measured_ms
+    cached_ms
 }
 
 #[tauri::command]
-fn get_system_metrics(state: State<'_, AppState>) -> SystemMetrics {
-    let mut sys = state.sys.lock().unwrap();
+async fn get_system_metrics(state: State<'_, AppState>) -> Result<SystemMetrics, String> {
+    let (cpu_usage, ram_used, ram_total, ram_percentage, swap_used_gb, swap_total_gb) = {
+        let mut sys = state
+            .sys
+            .lock()
+            .map_err(|_| "Системный монитор заблокирован".to_string())?;
 
-    sys.refresh_cpu_usage();
-    sys.refresh_memory();
+        sys.refresh_cpu_usage();
+        sys.refresh_memory();
 
-    let cpu_usage = sys.global_cpu_usage();
-    let ram_used = sys.used_memory() as f32 / 1024.0 / 1024.0 / 1024.0;
-    let ram_total = sys.total_memory() as f32 / 1024.0 / 1024.0 / 1024.0;
-    let ram_percentage = if ram_total > 0.0 {
-        (ram_used / ram_total) * 100.0
-    } else {
-        0.0
+        let cpu_usage = sys.global_cpu_usage();
+        let ram_used = sys.used_memory() as f32 / 1024.0 / 1024.0 / 1024.0;
+        let ram_total = sys.total_memory() as f32 / 1024.0 / 1024.0 / 1024.0;
+        let ram_percentage = if ram_total > 0.0 {
+            (ram_used / ram_total) * 100.0
+        } else {
+            0.0
+        };
+
+        let swap_used_gb = sys.used_swap() as f32 / 1024.0 / 1024.0 / 1024.0;
+        let swap_total_gb = sys.total_swap() as f32 / 1024.0 / 1024.0 / 1024.0;
+        (
+            cpu_usage,
+            ram_used,
+            ram_total,
+            ram_percentage,
+            swap_used_gb,
+            swap_total_gb,
+        )
     };
-
-    let swap_used_gb = sys.used_swap() as f32 / 1024.0 / 1024.0 / 1024.0;
-    let swap_total_gb = sys.total_swap() as f32 / 1024.0 / 1024.0 / 1024.0;
-
-    drop(sys);
 
     let (net_rx_kbps, net_tx_kbps) = if let Ok(mut networks) = state.networks.lock() {
         networks.refresh(true);
@@ -2267,14 +2452,23 @@ fn get_system_metrics(state: State<'_, AppState>) -> SystemMetrics {
     let net_ping_ms = measure_network_ping_ms(&state);
     update_tray_ping(&state, net_ping_ms);
 
-    let (disk_free_gb, disk_total_gb) = state
+    let (mut disk_free_gb, mut disk_total_gb) = state
         .disk_space
         .lock()
         .map(|slot| *slot)
         .unwrap_or((0, 0));
+    if disk_total_gb == 0 {
+        let disks = Disks::new_with_refreshed_list();
+        let sample = system_drive_space_gb(&disks);
+        disk_free_gb = sample.0;
+        disk_total_gb = sample.1;
+        if let Ok(mut slot) = state.disk_space.lock() {
+            *slot = sample;
+        }
+    }
     settings::consider_disk(disk_free_gb, disk_total_gb);
 
-    SystemMetrics {
+    Ok(SystemMetrics {
         cpu_usage,
         ram_used_gb: ram_used,
         ram_total_gb: ram_total,
@@ -2286,7 +2480,7 @@ fn get_system_metrics(state: State<'_, AppState>) -> SystemMetrics {
         net_rx_kbps,
         net_tx_kbps,
         net_ping_ms,
-    }
+    })
 }
 
 #[tauri::command]
@@ -2496,35 +2690,41 @@ fn sample_tcp_route(ip: Ipv4Addr, port: u16) -> (u32, u32) {
 }
 
 #[tauri::command]
-fn probe_game_routes() -> Vec<RouteProbe> {
-    let targets = [
-        ("DNS / Магистраль", Ipv4Addr::new(1, 1, 1, 1), 53u16),
-        ("СНГ / Москва", Ipv4Addr::new(162, 159, 135, 234), 443u16),
-        ("Европа / Cloudflare", Ipv4Addr::new(1, 0, 0, 1), 53u16),
-    ];
-    std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for (label, ip, port) in targets {
-            handles.push(scope.spawn(move || {
-                let (ping_ms, jitter_ms) = sample_tcp_route(ip, port);
-                RouteProbe {
-                    label: label.to_string(),
-                    host: ip.to_string(),
-                    ping_ms,
-                    jitter_ms,
-                }
-            }));
-        }
-        handles
-            .into_iter()
-            .map(|handle| handle.join().unwrap_or(RouteProbe {
-                label: String::new(),
-                host: String::new(),
-                ping_ms: 0,
-                jitter_ms: 0,
-            }))
-            .collect()
+async fn probe_game_routes() -> Result<Vec<RouteProbe>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let targets = [
+            ("DNS / Магистраль", Ipv4Addr::new(1, 1, 1, 1), 53u16),
+            ("СНГ / Москва", Ipv4Addr::new(162, 159, 135, 234), 443u16),
+            ("Европа / Cloudflare", Ipv4Addr::new(1, 0, 0, 1), 53u16),
+        ];
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (label, ip, port) in targets {
+                handles.push(scope.spawn(move || {
+                    let (ping_ms, jitter_ms) = sample_tcp_route(ip, port);
+                    RouteProbe {
+                        label: label.to_string(),
+                        host: ip.to_string(),
+                        ping_ms,
+                        jitter_ms,
+                    }
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().unwrap_or(RouteProbe {
+                        label: String::new(),
+                        host: String::new(),
+                        ping_ms: 0,
+                        jitter_ms: 0,
+                    })
+                })
+                .collect()
+        })
     })
+    .await
+    .map_err(|e| format!("Ошибка потока проверки маршрутов: {e}"))
 }
 
 #[derive(Serialize, Clone)]
@@ -2588,8 +2788,9 @@ fn health_label(percent: Option<u32>, status: &str) -> String {
 }
 
 #[tauri::command]
-fn get_disk_health_info() -> Result<Vec<DiskHealthInfo>, String> {
-    let script = r#"
+async fn get_disk_health_info() -> Result<Vec<DiskHealthInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let script = r#"
 $ErrorActionPreference='SilentlyContinue'
 $rows = New-Object System.Collections.Generic.List[object]
 Get-PhysicalDisk | ForEach-Object {
@@ -2617,49 +2818,65 @@ Get-PhysicalDisk | ForEach-Object {
 }
 ConvertTo-Json -InputObject @($rows.ToArray()) -Compress
 "#;
-    let mut cmd = Command::new("powershell.exe");
-    cmd.args(["-NoProfile", "-NonInteractive", "-Command", script]);
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    let output = cmd.output().map_err(|err| format!("Не удалось опросить накопители: {err}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(if stderr.trim().is_empty() {
-            "Windows не вернула сведения S.M.A.R.T.".to_string()
-        } else {
-            stderr.trim().to_string()
-        });
-    }
-    let raw = String::from_utf8_lossy(&output.stdout);
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed == "null" {
-        return Ok(Vec::new());
-    }
-    let rows: Vec<RawDiskHealth> = serde_json::from_str(trimmed).or_else(|_| {
-        serde_json::from_str::<RawDiskHealth>(trimmed).map(|row| vec![row])
-    }).map_err(|err| format!("Не удалось разобрать ответ накопителей: {err}"))?;
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            let status = row.health.unwrap_or_default();
-            let health_percent = row.wear.filter(|value| *value >= 0.0).map(|value| (100.0 - value.clamp(0.0, 100.0)).round() as u32).or_else(|| match status.to_ascii_lowercase().as_str() {
-                "healthy" => Some(100),
-                "warning" => Some(60),
-                "unhealthy" => Some(20),
-                _ => None,
+        let mut cmd = Command::new("powershell.exe");
+        cmd.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        let output = cmd.output().map_err(|err| format!("Не удалось опросить накопители: {err}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(if stderr.trim().is_empty() {
+                "Windows не вернула сведения S.M.A.R.T.".to_string()
+            } else {
+                stderr.trim().to_string()
             });
-            let temp = row.temp_c.filter(|value| *value > 0.0 && *value < 120.0).map(|value| value.round() as u32);
-            DiskHealthInfo {
-                model: row.model.unwrap_or_else(|| "Накопитель".to_string()),
-                kind: disk_kind(row.media.as_deref().unwrap_or(""), row.bus.as_deref().unwrap_or("")),
-                health_label: health_label(health_percent, &status),
-                health_percent,
-                power_on_hours: row.power_on_hours.filter(|value| *value >= 0.0).map(|value| value.round() as u64),
-                temp_c: temp,
-                tbw_tb: row.bytes_written.filter(|value| *value > 0.0).map(|value| value / 1_000_000_000_000.0),
-            }
-        })
-        .collect())
+        }
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed == "null" {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<RawDiskHealth> = serde_json::from_str(trimmed)
+            .or_else(|_| serde_json::from_str::<RawDiskHealth>(trimmed).map(|row| vec![row]))
+            .map_err(|err| format!("Не удалось разобрать ответ накопителей: {err}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let status = row.health.unwrap_or_default();
+                let health_percent = row
+                    .wear
+                    .filter(|value| *value >= 0.0)
+                    .map(|value| (100.0 - value.clamp(0.0, 100.0)).round() as u32)
+                    .or_else(|| match status.to_ascii_lowercase().as_str() {
+                        "healthy" => Some(100),
+                        "warning" => Some(60),
+                        "unhealthy" => Some(20),
+                        _ => None,
+                    });
+                let temp = row
+                    .temp_c
+                    .filter(|value| *value > 0.0 && *value < 120.0)
+                    .map(|value| value.round() as u32);
+                DiskHealthInfo {
+                    model: row.model.unwrap_or_else(|| "Накопитель".to_string()),
+                    kind: disk_kind(row.media.as_deref().unwrap_or(""), row.bus.as_deref().unwrap_or("")),
+                    health_label: health_label(health_percent, &status),
+                    health_percent,
+                    power_on_hours: row
+                        .power_on_hours
+                        .filter(|value| *value >= 0.0)
+                        .map(|value| value.round() as u64),
+                    temp_c: temp,
+                    tbw_tb: row
+                        .bytes_written
+                        .filter(|value| *value > 0.0)
+                        .map(|value| value / 1_000_000_000_000.0),
+                }
+            })
+            .collect())
+    })
+    .await
+    .map_err(|e| format!("Ошибка потока опроса SMART: {e}"))?
 }
 
 #[derive(Serialize, Clone)]
@@ -2713,48 +2930,56 @@ fn get_stability_progress() -> u32 {
 }
 
 #[tauri::command]
-fn run_stability_probe(host: String) -> Result<StabilityReport, String> {
-    if !allowed_probe_host(&host) {
-        return Err("Неизвестный узел диагностики".to_string());
-    }
-    STABILITY_DONE.store(0, Ordering::Relaxed);
-    let mut samples = Vec::new();
-    let sent = 30u32;
-    for index in 1..=sent {
-        if let Some(ms) = ping_once(&host) {
-            samples.push(ms);
+async fn run_stability_probe(host: String) -> Result<StabilityReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if !allowed_probe_host(&host) {
+            return Err("Неизвестный узел диагностики".to_string());
         }
-        STABILITY_DONE.store(index, Ordering::Relaxed);
-    }
-    let received = samples.len() as u32;
-    let loss_percent = ((sent - received) as f32 / sent as f32) * 100.0;
-    if samples.is_empty() {
-        return Ok(StabilityReport {
+        STABILITY_DONE.store(0, Ordering::Relaxed);
+        let mut samples = Vec::new();
+        let sent = 30u32;
+        for index in 1..=sent {
+            if let Some(ms) = ping_once(&host) {
+                samples.push(ms);
+            }
+            STABILITY_DONE.store(index, Ordering::Relaxed);
+        }
+        let received = samples.len() as u32;
+        let loss_percent = ((sent - received) as f32 / sent as f32) * 100.0;
+        if samples.is_empty() {
+            return Ok(StabilityReport {
+                sent,
+                received: 0,
+                loss_percent,
+                min_ms: 0,
+                avg_ms: 0.0,
+                max_ms: 0,
+                jitter_ms: 0.0,
+            });
+        }
+        let min_ms = *samples.iter().min().unwrap_or(&0);
+        let max_ms = *samples.iter().max().unwrap_or(&0);
+        let avg_ms = samples.iter().map(|value| *value as f32).sum::<f32>() / received as f32;
+        let variance = samples
+            .iter()
+            .map(|value| {
+                let delta = *value as f32 - avg_ms;
+                delta * delta
+            })
+            .sum::<f32>()
+            / received as f32;
+        Ok(StabilityReport {
             sent,
-            received: 0,
+            received,
             loss_percent,
-            min_ms: 0,
-            avg_ms: 0.0,
-            max_ms: 0,
-            jitter_ms: 0.0,
-        });
-    }
-    let min_ms = *samples.iter().min().unwrap_or(&0);
-    let max_ms = *samples.iter().max().unwrap_or(&0);
-    let avg_ms = samples.iter().map(|value| *value as f32).sum::<f32>() / received as f32;
-    let variance = samples.iter().map(|value| {
-        let delta = *value as f32 - avg_ms;
-        delta * delta
-    }).sum::<f32>() / received as f32;
-    Ok(StabilityReport {
-        sent,
-        received,
-        loss_percent,
-        min_ms,
-        avg_ms,
-        max_ms,
-        jitter_ms: variance.sqrt(),
+            min_ms,
+            avg_ms,
+            max_ms,
+            jitter_ms: variance.sqrt(),
+        })
     })
+    .await
+    .map_err(|e| format!("Ошибка потока теста стабильности: {e}"))?
 }
 
 #[derive(Serialize, Clone)]
@@ -2785,20 +3010,24 @@ fn time_dns(server: Option<&str>) -> Option<u32> {
 }
 
 #[tauri::command]
-fn benchmark_dns() -> Vec<DnsBenchRow> {
-    [
-        ("Cloudflare DNS", Some("1.1.1.1")),
-        ("Google Public DNS", Some("8.8.8.8")),
-        ("Quad9", Some("9.9.9.9")),
-        ("Текущий провайдер", None),
-    ]
-    .into_iter()
-    .map(|(name, server)| DnsBenchRow {
-        name: name.to_string(),
-        server: server.unwrap_or("Системный").to_string(),
-        ms: time_dns(server),
+async fn benchmark_dns() -> Result<Vec<DnsBenchRow>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        [
+            ("Cloudflare DNS", Some("1.1.1.1")),
+            ("Google Public DNS", Some("8.8.8.8")),
+            ("Quad9", Some("9.9.9.9")),
+            ("Текущий провайдер", None),
+        ]
+        .into_iter()
+        .map(|(name, server)| DnsBenchRow {
+            name: name.to_string(),
+            server: server.unwrap_or("Системный").to_string(),
+            ms: time_dns(server),
+        })
+        .collect()
     })
-    .collect()
+    .await
+    .map_err(|e| format!("Ошибка потока замера DNS: {e}"))
 }
 
 #[cfg(target_os = "windows")]
@@ -2855,8 +3084,7 @@ fn set_packet_priority(enabled: bool) -> Result<(), String> {
     }
 }
 
-#[tauri::command]
-fn tune_ethernet_adapter() -> Result<String, String> {
+fn tune_ethernet_adapter_sync() -> Result<String, String> {
     if !check_is_elevated_admin() {
         return Err("Требуются права Администратора (кнопка в шапке)".to_string());
     }
@@ -2896,8 +3124,16 @@ Write-Output $script:changed
 }
 
 #[tauri::command]
-fn get_ethernet_tuned() -> Result<bool, String> {
-    let script = r#"
+async fn tune_ethernet_adapter() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(tune_ethernet_adapter_sync)
+        .await
+        .map_err(|e| format!("Ошибка потока настройки адаптера: {e}"))?
+}
+
+#[tauri::command]
+async fn get_ethernet_tuned() -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let script = r#"
 $seen = 0
 $tuned = 0
 Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
@@ -2913,19 +3149,23 @@ Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Statu
 }
 if ($seen -gt 0 -and $tuned -eq $seen) { '1' } else { '0' }
 "#;
-    let text = hidden_powershell(script)?;
-    Ok(text.lines().last().unwrap_or("0").trim() == "1")
+        let text = hidden_powershell(script)?;
+        Ok(text.lines().last().unwrap_or("0").trim() == "1")
+    })
+    .await
+    .map_err(|e| format!("Ошибка потока проверки адаптера: {e}"))?
 }
 
 #[tauri::command]
-fn set_ethernet_tuned(enabled: bool) -> Result<String, String> {
-    if enabled {
-        return tune_ethernet_adapter();
-    }
-    if !check_is_elevated_admin() {
-        return Err("Требуются права Администратора (кнопка в шапке)".to_string());
-    }
-    let script = r#"
+async fn set_ethernet_tuned(enabled: bool) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if enabled {
+            return tune_ethernet_adapter_sync();
+        }
+        if !check_is_elevated_admin() {
+            return Err("Требуются права Администратора (кнопка в шапке)".to_string());
+        }
+        let script = r#"
 $script:changed = 0
 Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
   $props = Get-NetAdapterAdvancedProperty -Name $_.Name -ErrorAction SilentlyContinue
@@ -2948,12 +3188,15 @@ Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Statu
 }
 Write-Output $script:changed
 "#;
-    let text = hidden_powershell(script)?;
-    let changed = text.lines().last().unwrap_or("0").trim().parse::<u32>().unwrap_or(0);
-    if changed == 0 {
-        return Err("Не удалось вернуть энергосбережение сетевого адаптера".to_string());
-    }
-    Ok(format!("Возвращено параметров адаптера: {}", changed))
+        let text = hidden_powershell(script)?;
+        let changed = text.lines().last().unwrap_or("0").trim().parse::<u32>().unwrap_or(0);
+        if changed == 0 {
+            return Err("Не удалось вернуть энергосбережение сетевого адаптера".to_string());
+        }
+        Ok(format!("Возвращено параметров адаптера: {}", changed))
+    })
+    .await
+    .map_err(|e| format!("Ошибка потока переключения адаптера: {e}"))?
 }
 
 fn update_tray_ping(state: &AppState, ping_ms: u32) {
@@ -3494,6 +3737,15 @@ fn get_process_list(state: State<'_, AppState>) -> Result<Vec<ProcessItem>, Stri
     drop(sys);
 
     let mut list: Vec<ProcessItem> = list;
+    if let Ok(mut pid_guard) = state.pid_cache.lock() {
+        pid_guard.clear();
+        pid_guard.insert(0, ("System Idle Process".to_string(), String::new()));
+        pid_guard.insert(4, ("System".to_string(), String::new()));
+        for item in &list {
+            pid_guard.insert(item.pid, (item.name.clone(), item.exe_path.clone()));
+        }
+    }
+
     for item in &mut list {
         item.icon_base64 = cached_process_icon(&state.icon_cache, &item.exe_path);
     }
@@ -4127,8 +4379,8 @@ fn open_drop_folder(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_settings() -> settings::NexusSettings {
-    settings::load_settings()
+fn get_settings() -> Result<settings::NexusSettings, String> {
+    settings::get_settings()
 }
 
 #[tauri::command]
@@ -4161,28 +4413,97 @@ fn export_telemetry_csv(state: State<'_, AppState>) -> Result<String, String> {
     telemetry::export_csv(&state.history_buffer)
 }
 
+#[cfg(target_os = "windows")]
+fn query_pid_name_and_exe(pid: u32) -> Option<(String, String)> {
+    if pid == 0 {
+        return Some(("System Idle Process".to_string(), String::new()));
+    }
+    if pid == 4 {
+        return Some(("System".to_string(), String::new()));
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut std::ffi::c_void;
+        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        fn QueryFullProcessImageNameW(
+            process: *mut std::ffi::c_void,
+            flags: u32,
+            exe_name: *mut u16,
+            size: *mut u32,
+        ) -> i32;
+    }
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len);
+        CloseHandle(handle);
+        if ok == 0 || len == 0 {
+            return None;
+        }
+        let exe_path = String::from_utf16_lossy(&buf[..len as usize]);
+        let name = Path::new(&exe_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| exe_path.clone());
+        Some((name, exe_path))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn query_pid_name_and_exe(_pid: u32) -> Option<(String, String)> {
+    None
+}
+
 #[tauri::command]
 fn get_network_connections(state: State<'_, AppState>) -> Result<Vec<NetworkConnection>, String> {
     let sockets = collect_socket_rows()?;
 
-    let mut names: HashMap<u32, (String, String)> = HashMap::new();
-    {
-        let mut sys = state
-            .sys
-            .lock()
-            .map_err(|_| "Системный монитор заблокирован".to_string())?;
-        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    // Читаем кэш PID -> (Name, ExePath) без вызова sys.refresh_processes(),
+    // чтобы не сбрасывать дельты CPU% и Disk I/O для диспетчера процессов.
+    let mut names: HashMap<u32, (String, String)> = state
+        .pid_cache
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+
+    if let Ok(sys) = state.sys.lock() {
         for process in sys.processes().values() {
-            names.insert(
-                process.pid().as_u32(),
+            let pid = process.pid().as_u32();
+            names.entry(pid).or_insert_with(|| {
                 (
                     process.name().to_string_lossy().to_string(),
                     process
                         .exe()
                         .map(|path| path.to_string_lossy().to_string())
                         .unwrap_or_default(),
-                ),
-            );
+                )
+            });
+        }
+    }
+
+    let mut newly_resolved: Vec<(u32, (String, String))> = Vec::new();
+    for (_protocol, _local_addr, _remote_addr, _socket_state, pid) in &sockets {
+        if !names.contains_key(pid) {
+            if let Some(resolved) = query_pid_name_and_exe(*pid) {
+                names.insert(*pid, resolved.clone());
+                newly_resolved.push((*pid, resolved));
+            }
+        }
+    }
+
+    if !newly_resolved.is_empty() {
+        if let Ok(mut pid_guard) = state.pid_cache.lock() {
+            for (pid, info) in newly_resolved {
+                pid_guard.insert(pid, info);
+            }
         }
     }
 
@@ -4266,15 +4587,7 @@ fn start_background_services(
         }
         loop {
             let disks = Disks::new_with_refreshed_list();
-            let sample = disks
-                .first()
-                .map(|disk| {
-                    (
-                        disk.available_space() / 1024 / 1024 / 1024,
-                        disk.total_space() / 1024 / 1024 / 1024,
-                    )
-                })
-                .unwrap_or((0, 0));
+            let sample = system_drive_space_gb(&disks);
             if let Ok(mut slot) = disk_space.lock() {
                 *slot = sample;
             }
@@ -4285,6 +4598,7 @@ fn start_background_services(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    settings::init_settings();
     let sys = Arc::new(Mutex::new(System::new()));
     let networks = Arc::new(Mutex::new(Networks::new()));
     let disk_space = Arc::new(Mutex::new((0u64, 0u64)));
@@ -4292,7 +4606,6 @@ pub fn run() {
     let hw_sidecar_child = Arc::new(Mutex::new(None));
     let history_buffer = Arc::new(RwLock::new(VecDeque::new()));
     telemetry::start_sampler(
-        Arc::clone(&sys),
         Arc::clone(&hw_telemetry),
         Arc::clone(&history_buffer),
     );
@@ -4312,8 +4625,9 @@ pub fn run() {
             sys,
             networks,
             disk_space,
-            ping_cache: Mutex::new((0, None)),
+            ping_cache: Arc::new(Mutex::new((0, None, false))),
             process_last_refresh: Mutex::new(None),
+            pid_cache: Mutex::new(HashMap::new()),
             hw_telemetry,
             hw_sidecar_child,
             icon_cache: Mutex::new(HashMap::new()),
@@ -4439,12 +4753,7 @@ pub fn run() {
             get_disk_health_info,
             get_stability_progress,
             run_stability_probe,
-            benchmark_dns,
-            media::get_media_track,
-            media::media_play_pause,
-            media::media_next,
-            media::media_previous,
-            media::media_seek
+            benchmark_dns
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

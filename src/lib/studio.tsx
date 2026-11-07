@@ -18,6 +18,12 @@ export interface Metrics {
   net_ping_ms: number;
 }
 
+export interface DriveVolumeInfo {
+  mount_point: string;
+  total_bytes: number;
+  available_bytes: number;
+}
+
 export interface StartupItem {
   id: string;
   name: string;
@@ -1006,4 +1012,3 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
     </SpotlightCard>
   );
 });
-

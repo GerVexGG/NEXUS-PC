@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Serialize, Clone, Debug)]
@@ -62,7 +62,7 @@ struct DropInner {
     transfer: Option<LiveTransfer>,
 }
 
-pub struct DropHub {
+struct DropHubInner {
     inner: Mutex<DropInner>,
     shutdown: AtomicBool,
     alive: AtomicBool,
@@ -70,25 +70,39 @@ pub struct DropHub {
     seq: AtomicU64,
 }
 
+pub struct DropHub {
+    shared: Arc<DropHubInner>,
+}
+
+impl Drop for DropHub {
+    fn drop(&mut self) {
+        let _ = self.stop();
+        self.wait_until_stopped();
+    }
+}
+
 impl DropHub {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(DropInner {
-                running: false,
-                info: idle_info(),
-                files: Vec::new(),
-                texts: Vec::new(),
-                transfer: None,
+            shared: Arc::new(DropHubInner {
+                inner: Mutex::new(DropInner {
+                    running: false,
+                    info: idle_info(),
+                    files: Vec::new(),
+                    texts: Vec::new(),
+                    transfer: None,
+                }),
+                shutdown: AtomicBool::new(true),
+                alive: AtomicBool::new(false),
+                generation: AtomicU64::new(0),
+                seq: AtomicU64::new(1),
             }),
-            shutdown: AtomicBool::new(true),
-            alive: AtomicBool::new(false),
-            generation: AtomicU64::new(0),
-            seq: AtomicU64::new(1),
         }
     }
 
     pub fn session(&self) -> DropSessionInfo {
-        self.inner
+        self.shared
+            .inner
             .lock()
             .map(|guard| {
                 let mut info = guard.info.clone();
@@ -104,14 +118,16 @@ impl DropHub {
     }
 
     pub fn history(&self) -> Vec<DroppedFileItem> {
-        self.inner
+        self.shared
+            .inner
             .lock()
             .map(|guard| guard.files.clone())
             .unwrap_or_default()
     }
 
     pub fn texts(&self) -> Vec<DropTextItem> {
-        self.inner
+        self.shared
+            .inner
             .lock()
             .map(|guard| guard.texts.clone())
             .unwrap_or_default()
@@ -119,6 +135,7 @@ impl DropHub {
 
     pub fn open_folder(&self) -> Result<(), String> {
         let dir = self
+            .shared
             .inner
             .lock()
             .map(|guard| {
@@ -135,7 +152,7 @@ impl DropHub {
     }
 
     pub fn start(&self) -> Result<DropSessionInfo, String> {
-        if let Ok(guard) = self.inner.lock() {
+        if let Ok(guard) = self.shared.inner.lock() {
             if guard.running {
                 return Ok(guard.info.clone());
             }
@@ -165,20 +182,20 @@ impl DropHub {
             transfer: None,
         };
 
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        self.shutdown.store(false, Ordering::SeqCst);
-        if let Ok(mut guard) = self.inner.lock() {
+        let generation = self.shared.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.shared.shutdown.store(false, Ordering::SeqCst);
+        if let Ok(mut guard) = self.shared.inner.lock() {
             guard.running = true;
             guard.info = info.clone();
         }
 
-        let handle = unsafe_share(self);
+        let shared = Arc::clone(&self.shared);
         std::thread::Builder::new()
             .name("nexus-drop".into())
             .spawn(move || {
-                unsafe { &*handle.alive }.store(true, Ordering::SeqCst);
-                serve(listener, generation, handle);
-                unsafe { &*handle.alive }.store(false, Ordering::SeqCst);
+                shared.alive.store(true, Ordering::SeqCst);
+                serve(listener, generation, &shared);
+                shared.alive.store(false, Ordering::SeqCst);
             })
             .map_err(|err| format!("Не удалось запустить поток приёма: {err}"))?;
 
@@ -186,9 +203,9 @@ impl DropHub {
     }
 
     pub fn stop(&self) -> Result<(), String> {
-        self.shutdown.store(true, Ordering::SeqCst);
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        if let Ok(mut guard) = self.inner.lock() {
+        self.shared.shutdown.store(true, Ordering::SeqCst);
+        self.shared.generation.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut guard) = self.shared.inner.lock() {
             guard.running = false;
             guard.info.is_running = false;
             guard.info.token.clear();
@@ -202,7 +219,7 @@ impl DropHub {
 
     fn wait_until_stopped(&self) {
         for _ in 0..40 {
-            if !self.alive.load(Ordering::SeqCst) {
+            if !self.shared.alive.load(Ordering::SeqCst) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -210,35 +227,15 @@ impl DropHub {
     }
 }
 
-fn unsafe_share(hub: &DropHub) -> HubHandle {
-    HubHandle {
-        files: &hub.inner,
-        shutdown_gen: &hub.generation,
-        seq: &hub.seq,
-        alive: &hub.alive,
-    }
-}
-
-#[derive(Copy, Clone)]
-struct HubHandle {
-    files: *const Mutex<DropInner>,
-    shutdown_gen: *const AtomicU64,
-    seq: *const AtomicU64,
-    alive: *const AtomicBool,
-}
-
-unsafe impl Send for HubHandle {}
-
-fn serve(listener: TcpListener, generation: u64, hub: HubHandle) {
+fn serve(listener: TcpListener, generation: u64, hub: &DropHubInner) {
     let _ = listener.set_nonblocking(true);
     loop {
-        let current = unsafe { &*hub.shutdown_gen }.load(Ordering::SeqCst);
-        if current != generation {
+        if hub.shutdown.load(Ordering::SeqCst) || hub.generation.load(Ordering::SeqCst) != generation {
             break;
         }
         match listener.accept() {
             Ok((stream, _)) => {
-                let _ = handle_client(stream, generation, &hub);
+                let _ = handle_client(stream, generation, hub);
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(40));
@@ -247,8 +244,8 @@ fn serve(listener: TcpListener, generation: u64, hub: HubHandle) {
         }
     }
     drop(listener);
-    if unsafe { &*hub.shutdown_gen }.load(Ordering::SeqCst) == generation {
-        if let Ok(mut guard) = unsafe { &*hub.files }.lock() {
+    if hub.generation.load(Ordering::SeqCst) == generation {
+        if let Ok(mut guard) = hub.inner.lock() {
             guard.running = false;
             guard.info.is_running = false;
             guard.transfer = None;
@@ -261,7 +258,7 @@ const BODY_CHUNK: usize = 128 * 1024;
 const READ_WAIT: Duration = Duration::from_secs(60);
 const MAX_UPLOAD: u64 = 200_000_000;
 
-fn handle_client(mut stream: TcpStream, generation: u64, hub: &HubHandle) -> Result<(), ()> {
+fn handle_client(mut stream: TcpStream, generation: u64, hub: &DropHubInner) -> Result<(), ()> {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(READ_WAIT));
@@ -277,7 +274,7 @@ fn handle_client(mut stream: TcpStream, generation: u64, hub: &HubHandle) -> Res
     let target = parts.next().unwrap_or("/");
     let token = query_param(target, "token").unwrap_or_default();
     let path = target.split('?').next().unwrap_or("/");
-    let stopped = unsafe { &*hub.shutdown_gen }.load(Ordering::SeqCst) != generation;
+    let stopped = hub.shutdown.load(Ordering::SeqCst) || hub.generation.load(Ordering::SeqCst) != generation;
 
     if method == "GET" && (path == "/" || path.is_empty()) {
         if stopped || !session_token_ok(hub, &token) {
@@ -330,7 +327,7 @@ enum UploadOutcome {
 
 fn receive_upload(
     stream: &mut TcpStream,
-    hub: &HubHandle,
+    hub: &DropHubInner,
     headers: &str,
     pending: Vec<u8>,
     token: &str,
@@ -369,7 +366,7 @@ fn receive_upload(
 
 fn receive_text(
     stream: &mut TcpStream,
-    hub: &HubHandle,
+    hub: &DropHubInner,
     headers: &str,
     pending: Vec<u8>,
     token: &str,
@@ -402,7 +399,7 @@ fn receive_text(
     };
     let _ = copy_to_clipboard(&clipped);
     let _ = append_text_log(hub, &clipped);
-    if let Ok(mut guard) = unsafe { &*hub.files }.lock() {
+    if let Ok(mut guard) = hub.inner.lock() {
         guard.texts.insert(
             0,
             DropTextItem {
@@ -416,18 +413,18 @@ fn receive_text(
     UploadOutcome::Ok
 }
 
-fn session_token_ok(hub: &HubHandle, token: &str) -> bool {
+fn session_token_ok(hub: &DropHubInner, token: &str) -> bool {
     if token.is_empty() {
         return false;
     }
-    unsafe { &*hub.files }
+    hub.inner
         .lock()
         .map(|guard| guard.running && guard.info.token == token)
         .unwrap_or(false)
 }
 
-fn note_transfer(hub: &HubHandle, filename: &str, received: u64, total: u64) {
-    let Ok(mut guard) = unsafe { &*hub.files }.lock() else {
+fn note_transfer(hub: &DropHubInner, filename: &str, received: u64, total: u64) {
+    let Ok(mut guard) = hub.inner.lock() else {
         return;
     };
     let now = Instant::now();
@@ -459,15 +456,15 @@ fn note_transfer(hub: &HubHandle, filename: &str, received: u64, total: u64) {
     });
 }
 
-fn clear_transfer(hub: &HubHandle) {
-    if let Ok(mut guard) = unsafe { &*hub.files }.lock() {
+fn clear_transfer(hub: &DropHubInner) {
+    if let Ok(mut guard) = hub.inner.lock() {
         guard.transfer = None;
         guard.info.transfer = None;
     }
 }
 
-fn hub_save_dir(hub: &HubHandle) -> PathBuf {
-    unsafe { &*hub.files }
+fn hub_save_dir(hub: &DropHubInner) -> PathBuf {
+    hub.inner
         .lock()
         .map(|guard| PathBuf::from(&guard.info.save_dir))
         .unwrap_or_else(|_| default_save_dir())
@@ -586,7 +583,7 @@ fn read_headers(stream: &mut TcpStream) -> Result<(String, Vec<u8>), String> {
     Err("Заголовки не завершены".to_string())
 }
 
-fn save_raw(hub: &HubHandle, reader: &mut BodyReader<'_>, save_dir: &Path, total: u64) -> Result<(), String> {
+fn save_raw(hub: &DropHubInner, reader: &mut BodyReader<'_>, save_dir: &Path, total: u64) -> Result<(), String> {
     let path = unique_path(save_dir, "upload.bin");
     let mut file = fs::File::create(&path).map_err(|err| format!("Не удалось создать файл: {err}"))?;
     file.write_all(&reader.pending).map_err(|err| format!("Запись файла: {err}"))?;
@@ -611,7 +608,7 @@ fn save_raw(hub: &HubHandle, reader: &mut BodyReader<'_>, save_dir: &Path, total
 }
 
 fn save_multipart(
-    hub: &HubHandle,
+    hub: &DropHubInner,
     reader: &mut BodyReader<'_>,
     save_dir: &Path,
     boundary: &str,
@@ -671,7 +668,7 @@ fn save_multipart(
 }
 
 fn write_until_mark(
-    hub: &HubHandle,
+    hub: &DropHubInner,
     reader: &mut BodyReader<'_>,
     path: &Path,
     mark: &[u8],
@@ -734,7 +731,7 @@ fn skip_until_mark(reader: &mut BodyReader<'_>, mark: &[u8]) -> Result<(), Strin
     }
 }
 
-fn remember_file(hub: &HubHandle, path: &Path, size: u64, status: &str) {
+fn remember_file(hub: &DropHubInner, path: &Path, size: u64, status: &str) {
     push_file(
         hub,
         DroppedFileItem {
@@ -769,8 +766,9 @@ fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8])
     Ok(())
 }
 
-fn append_text_log(hub: &HubHandle, text: &str) -> Result<(), String> {
-    let save_dir = unsafe { &*hub.files }
+fn append_text_log(hub: &DropHubInner, text: &str) -> Result<(), String> {
+    let save_dir = hub
+        .inner
         .lock()
         .map(|guard| PathBuf::from(&guard.info.save_dir))
         .unwrap_or_else(|_| default_save_dir());
@@ -783,15 +781,15 @@ fn append_text_log(hub: &HubHandle, text: &str) -> Result<(), String> {
     writeln!(file, "[{}] {text}", local_now()).map_err(|err| err.to_string())
 }
 
-fn push_file(hub: &HubHandle, item: DroppedFileItem) {
-    if let Ok(mut guard) = unsafe { &*hub.files }.lock() {
+fn push_file(hub: &DropHubInner, item: DroppedFileItem) {
+    if let Ok(mut guard) = hub.inner.lock() {
         guard.files.insert(0, item);
         guard.files.truncate(120);
     }
 }
 
-fn next_seq(hub: &HubHandle, prefix: &str) -> String {
-    format!("{prefix}-{}", unsafe { &*hub.seq }.fetch_add(1, Ordering::SeqCst))
+fn next_seq(hub: &DropHubInner, prefix: &str) -> String {
+    format!("{prefix}-{}", hub.seq.fetch_add(1, Ordering::SeqCst))
 }
 
 fn content_length(headers: &str) -> Option<u64> {

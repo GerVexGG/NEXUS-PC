@@ -8,6 +8,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   CleanupCategory,
   CleanupReport,
+  DriveVolumeInfo,
   FolderNode,
   HISTORY_LENGTH,
   HardwareTelemetry,
@@ -34,7 +35,7 @@ import {
 
 export function useNexusController() {
   const [activeTab, setActiveTab] = useState<
-    "dashboard" | "startup" | "storage" | "hardware" | "cleanup" | "power" | "processes" | "network" | "drop" | "music" | "settings"
+    "dashboard" | "startup" | "storage" | "hardware" | "cleanup" | "power" | "processes" | "network" | "drop" | "settings"
   >("dashboard");
   const [metricsReady, setMetricsReady] = useState(false);
   const [metrics, setMetrics] = useState<Metrics>({
@@ -64,7 +65,9 @@ export function useNexusController() {
   const [startupError, setStartupError] = useState<string | null>(null);
 
   // Состояние модуля Storage Analyzer (Анализатор накопителей)
-  const [availableDrives, setAvailableDrives] = useState<string[]>(["C:\\"]);
+  const [availableDrives, setAvailableDrives] = useState<DriveVolumeInfo[]>([
+    { mount_point: "C:\\", total_bytes: 0, available_bytes: 0 },
+  ]);
   const [selectedDriveOrPath, setSelectedDriveOrPath] = useState<string>("C:\\");
   const selectedDriveRef = useRef(selectedDriveOrPath);
   selectedDriveRef.current = selectedDriveOrPath;
@@ -495,11 +498,11 @@ export function useNexusController() {
     if (activeTab === "startup") {
       fetchStartupItems();
     } else if (activeTab === "storage") {
-      invoke<string[]>("get_available_drives")
+      invoke<DriveVolumeInfo[]>("get_available_drives")
         .then((drives) => {
           if (drives && drives.length > 0) {
             setAvailableDrives(drives);
-            setSelectedDriveOrPath((prev) => (prev ? prev : drives[0]));
+            setSelectedDriveOrPath((prev) => (prev ? prev : drives[0].mount_point));
           }
         })
         .catch((err) => console.error("Ошибка получения списка дисков:", err));
@@ -556,6 +559,14 @@ export function useNexusController() {
   };
 
   const handleToggleStartup = async (item: StartupItem) => {
+    if (
+      item.phantom ||
+      (!item.id.startsWith("reg|") &&
+        !item.id.startsWith("dir|") &&
+        !item.id.startsWith("msix|"))
+    ) {
+      return;
+    }
     const nextEnabled = !item.enabled;
     setStartupError(null);
 

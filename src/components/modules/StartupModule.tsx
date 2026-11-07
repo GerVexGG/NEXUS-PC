@@ -241,6 +241,11 @@ function StartupRow({
 }) {
   const path = item.clean_path || item.command;
   const hint = folderHint(path);
+  const canToggle =
+    !item.phantom &&
+    (item.id.startsWith("reg|") ||
+      item.id.startsWith("dir|") ||
+      item.id.startsWith("msix|"));
 
   return (
     <div className="flex items-center gap-3 px-4 py-3">
@@ -299,9 +304,10 @@ function StartupRow({
         <button
           type="button"
           role="switch"
+          disabled={!canToggle}
           aria-checked={item.enabled}
           onClick={onToggle}
-          className={`relative h-5 w-9 shrink-0 rounded-full border transition-colors ${
+          className={`relative h-5 w-9 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
             item.enabled ? "border-sky-500/40 bg-sky-500/30" : "border-[#222b38] bg-[#151c27]"
           }`}
         >
