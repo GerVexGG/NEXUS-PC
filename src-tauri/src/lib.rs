@@ -14,6 +14,7 @@ use sysinfo::{Disks, Networks, System};
 mod drop_server;
 mod settings;
 mod telemetry;
+mod media;
 
 use tauri::{Manager, State};
 
@@ -4438,7 +4439,12 @@ pub fn run() {
             get_disk_health_info,
             get_stability_progress,
             run_stability_probe,
-            benchmark_dns
+            benchmark_dns,
+            media::get_media_track,
+            media::media_play_pause,
+            media::media_next,
+            media::media_previous,
+            media::media_seek
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
