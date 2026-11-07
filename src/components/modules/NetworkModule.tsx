@@ -82,10 +82,11 @@ export function NetworkModule({ c }: { c: NexusController }) {
   };
 
   useEffect(() => {
-    fetchConnections();
-    const timer = setInterval(fetchConnections, REFRESH_MS);
+    if (view !== "sockets") return;
+    void fetchConnections();
+    const timer = setInterval(() => void fetchConnections(), REFRESH_MS);
     return () => clearInterval(timer);
-  }, []);
+  }, [view]);
 
   useEffect(() => {
     if (!menu) return;
@@ -465,7 +466,7 @@ function NetworkToolkit() {
   return (
     <div className="space-y-4">
       <section className="rounded-xl border border-[#222b38] bg-[#111722] p-4">
-        <h3 className="text-sm font-semibold text-slate-100">Стресс-тест канала (Packet Loss & Jitter)</h3>
+        <h3 className="text-sm font-semibold text-slate-100">Тест стабильности соединения</h3>
         <div className="mt-3 flex flex-wrap gap-2">
           {PROBE_TARGETS.map((target) => (
             <button

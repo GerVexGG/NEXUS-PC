@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { invoke } from "@tauri-apps/api/core";
 import { Archive, Copy, FileText, FolderOpen, Image, Smartphone, Square } from "lucide-react";
@@ -69,25 +69,28 @@ export function DropModule() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState("");
+  const inFlightRef = useRef(false);
 
   const refresh = useCallback(async () => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
     try {
-      const [nextSession, nextFiles, nextTexts] = await Promise.all([
-        invoke<DropSessionInfo>("get_drop_session"),
-        invoke<DroppedFileItem[]>("get_drop_history"),
-        invoke<DropTextItem[]>("get_drop_texts"),
-      ]);
+      const nextSession = await invoke<DropSessionInfo>("get_drop_session");
+      const nextFiles = await invoke<DroppedFileItem[]>("get_drop_history");
+      const nextTexts = await invoke<DropTextItem[]>("get_drop_texts");
       setSession(nextSession);
       setFiles(nextFiles);
       setTexts(nextTexts);
     } catch (err) {
       setError(String(err));
+    } finally {
+      inFlightRef.current = false;
     }
   }, []);
 
   useEffect(() => {
     void refresh();
-    const timer = window.setInterval(() => void refresh(), 800);
+    const timer = window.setInterval(() => void refresh(), 1500);
     return () => window.clearInterval(timer);
   }, [refresh]);
 

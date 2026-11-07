@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { motion } from "framer-motion";
 import { Check, Trash2 } from "lucide-react";
+import type { NexusController } from "../../hooks/useNexusController";
 
 interface NexusSettings {
   autostart: boolean;
@@ -76,8 +77,9 @@ function levelLabel(level: string): string {
   return "Инфо";
 }
 
-export function SettingsModule() {
+export function SettingsModule({ c }: { c?: NexusController }) {
   const [draft, setDraft] = useState<NexusSettings>(defaultSettings);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [events, setEvents] = useState<NexusEvent[]>([]);
   const [filter, setFilter] = useState<"all" | "warnings">("all");
   const [error, setError] = useState("");
@@ -85,19 +87,30 @@ export function SettingsModule() {
   const [loading, setLoading] = useState(true);
 
   const load = async () => {
-    try {
-      const [settings, log] = await Promise.all([
-        invoke<NexusSettings>("get_settings"),
-        invoke<NexusEvent[]>("get_event_log"),
-      ]);
-      setDraft(settings);
-      setEvents(log);
+    setLoading(true);
+    const [settingsRes, logRes] = await Promise.allSettled([
+      invoke<NexusSettings>("get_settings"),
+      invoke<NexusEvent[]>("get_event_log"),
+    ]);
+
+    if (settingsRes.status === "fulfilled") {
+      setDraft(settingsRes.value);
+      setSettingsLoaded(true);
       setError("");
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setLoading(false);
+      c?.setAlertThresholds({
+        cpu: settingsRes.value.alert_cpu_temp,
+        gpu: settingsRes.value.alert_gpu_temp,
+      });
+    } else {
+      setSettingsLoaded(false);
+      setError(`Ошибка чтения конфигурации: ${String(settingsRes.reason)}`);
     }
+
+    if (logRes.status === "fulfilled") {
+      setEvents(logRes.value);
+    }
+
+    setLoading(false);
   };
 
   useEffect(() => {
@@ -105,6 +118,10 @@ export function SettingsModule() {
   }, []);
 
   const save = async () => {
+    if (!settingsLoaded) {
+      setError("Ошибка чтения конфигурации: сохранение заблокировано для защиты настроек");
+      return;
+    }
     if (draft.alert_cpu_temp < 70 || draft.alert_cpu_temp > 100) {
       setError("Порог CPU должен быть от 70 до 100 °C");
       return;
@@ -120,6 +137,10 @@ export function SettingsModule() {
     setError("");
     try {
       await invoke("save_settings", { settings: draft });
+      c?.setAlertThresholds({
+        cpu: draft.alert_cpu_temp,
+        gpu: draft.alert_gpu_temp,
+      });
       setSaved(true);
       window.setTimeout(() => setSaved(false), 2200);
     } catch (err) {
@@ -226,9 +247,9 @@ export function SettingsModule() {
         <div className="flex items-center gap-3">
           <button
             type="button"
-            disabled={loading}
+            disabled={loading || !settingsLoaded}
             onClick={() => void save()}
-            className="rounded-lg border border-sky-500/30 bg-sky-500/20 px-4 py-2 text-xs font-medium text-sky-300 hover:bg-sky-500/30 disabled:opacity-50"
+            className="rounded-lg border border-sky-500/30 bg-sky-500/20 px-4 py-2 text-xs font-medium text-sky-300 hover:bg-sky-500/30 disabled:cursor-not-allowed disabled:opacity-50"
           >
             Сохранить настройки
           </button>

@@ -80,6 +80,10 @@ export function useNexusController() {
 
   // Состояние модуля Hardware Monitor (Мониторинг железа)
   const [hwData, setHwData] = useState<HardwareTelemetry | null>(null);
+  const [alertThresholds, setAlertThresholds] = useState<{ cpu: number; gpu: number }>({
+    cpu: 85,
+    gpu: 83,
+  });
 
   // Состояние модуля Cleanup Center (Безопасная очистка накопителя)
   const [cleanupCategories, setCleanupCategories] = useState<CleanupCategory[]>([]);
@@ -129,11 +133,22 @@ export function useNexusController() {
   });
   const [powerError, setPowerError] = useState<string | null>(null);
 
-  // Проверка прав Администратора при старте приложения
+  // Проверка прав Администратора и загрузка порогов температур при старте приложения
   useEffect(() => {
     invoke<boolean>("is_elevated_admin")
       .then((elevated) => setIsElevatedAdmin(Boolean(elevated)))
       .catch((err) => console.error("Ошибка проверки прав администратора:", err));
+
+    invoke<{ alert_cpu_temp: number; alert_gpu_temp: number }>("get_settings")
+      .then((s) => {
+        setAlertThresholds({
+          cpu: Number.isFinite(s?.alert_cpu_temp) ? s.alert_cpu_temp : 85,
+          gpu: Number.isFinite(s?.alert_gpu_temp) ? s.alert_gpu_temp : 83,
+        });
+      })
+      .catch(() => {
+        /* используем фоллбэк 85 / 83 */
+      });
   }, []);
 
   // Глобальные горячие клавиши: F11 — полноэкранный режим, Escape — выход из Fullscreen
@@ -435,10 +450,18 @@ export function useNexusController() {
     void (async () => {
       let rate = 2000;
       try {
-        const settings = await invoke<{ polling_rate_ms: number }>("get_settings");
+        const settings = await invoke<{
+          polling_rate_ms: number;
+          alert_cpu_temp: number;
+          alert_gpu_temp: number;
+        }>("get_settings");
         if (settings.polling_rate_ms === 1000 || settings.polling_rate_ms === 2000 || settings.polling_rate_ms === 5000) {
           rate = settings.polling_rate_ms;
         }
+        setAlertThresholds({
+          cpu: Number.isFinite(settings?.alert_cpu_temp) ? settings.alert_cpu_temp : 85,
+          gpu: Number.isFinite(settings?.alert_gpu_temp) ? settings.alert_gpu_temp : 83,
+        });
       } catch {
         rate = 2000;
       }
@@ -647,17 +670,18 @@ export function useNexusController() {
     }
   };
 
-  const handleCancelTimer = async () => {
+  const handleCancelTimer = async (): Promise<boolean> => {
     setPowerError(null);
     try {
       await invoke("cancel_shutdown");
-    } catch (err) {
-      console.error("Ошибка при отмене таймера:", err);
-      setPowerError(String(err));
-    } finally {
       setTimerState(null);
       setRemainingSeconds(0);
       localStorage.removeItem(TIMER_STORAGE_KEY);
+      return true;
+    } catch (err) {
+      console.error("Ошибка при отмене таймера:", err);
+      setPowerError("Не удалось отменить системный таймер");
+      return false;
     }
   };
 
@@ -743,22 +767,24 @@ export function useNexusController() {
     );
   });
 
-  // Проверка перегрева для блока предупреждений Hardware Monitor (> 85°C)
+  // Проверка перегрева для блока предупреждений Hardware Monitor по пользовательским порогам
+  const cpuWarnLimit = Number.isFinite(alertThresholds.cpu) ? alertThresholds.cpu : 85;
+  const gpuWarnLimit = Number.isFinite(alertThresholds.gpu) ? alertThresholds.gpu : 83;
   const thermalWarnings: string[] = [];
   if (hwData) {
-    if (hwData.cpu.package_temp_c !== null && hwData.cpu.package_temp_c > 85) {
+    if (hwData.cpu.package_temp_c !== null && hwData.cpu.package_temp_c >= cpuWarnLimit) {
       thermalWarnings.push(
-        `Повышенный нагрев CPU Package: ${hwData.cpu.package_temp_c.toFixed(1)}°C`
+        `Повышенный нагрев CPU Package: ${hwData.cpu.package_temp_c.toFixed(1)}°C (порог ${cpuWarnLimit}°C)`
       );
     }
     for (const g of hwData.gpus) {
-      if (g.hotspot_temp_c !== null && g.hotspot_temp_c > 85) {
+      if (g.hotspot_temp_c !== null && g.hotspot_temp_c >= gpuWarnLimit) {
         thermalWarnings.push(
-          `Повышенный нагрев GPU Hotspot (${g.name}): ${g.hotspot_temp_c.toFixed(1)}°C`
+          `Повышенный нагрев GPU Hotspot (${g.name}): ${g.hotspot_temp_c.toFixed(1)}°C (порог ${gpuWarnLimit}°C)`
         );
-      } else if (g.core_temp_c !== null && g.core_temp_c > 85) {
+      } else if (g.core_temp_c !== null && g.core_temp_c >= gpuWarnLimit) {
         thermalWarnings.push(
-          `Повышенный нагрев GPU Core (${g.name}): ${g.core_temp_c.toFixed(1)}°C`
+          `Повышенный нагрев GPU Core (${g.name}): ${g.core_temp_c.toFixed(1)}°C (порог ${gpuWarnLimit}°C)`
         );
       }
     }
@@ -856,12 +882,23 @@ export function useNexusController() {
   };
 
   const loadTelemetryBundle = useCallback(async (minutes: number) => {
-    const [history, report, settings] = await Promise.all([
+    const [historyRes, reportRes, settingsRes] = await Promise.allSettled([
       invoke<TelemetrySnapshot[]>("get_telemetry_history", { minutes }),
       invoke<DiagnosticsReport>("get_diagnostics_verdict", { minutes }),
       invoke<{ alert_cpu_temp: number; alert_gpu_temp: number }>("get_settings"),
     ]);
-    return { history, report, cpuThreshold: settings.alert_cpu_temp, gpuThreshold: settings.alert_gpu_temp };
+    const history = historyRes.status === "fulfilled" ? historyRes.value : [];
+    const report = reportRes.status === "fulfilled" ? reportRes.value : null;
+    const cpuThreshold =
+      settingsRes.status === "fulfilled" && Number.isFinite(settingsRes.value.alert_cpu_temp)
+        ? settingsRes.value.alert_cpu_temp
+        : 85;
+    const gpuThreshold =
+      settingsRes.status === "fulfilled" && Number.isFinite(settingsRes.value.alert_gpu_temp)
+        ? settingsRes.value.alert_gpu_temp
+        : 83;
+    setAlertThresholds({ cpu: cpuThreshold, gpu: gpuThreshold });
+    return { history, report, cpuThreshold, gpuThreshold };
   }, []);
 
   const exportTelemetryCsv = useCallback(() => invoke<string>("export_telemetry_csv"), []);
@@ -908,6 +945,8 @@ export function useNexusController() {
     setFileSearch,
     hwData,
     setHwData,
+    alertThresholds,
+    setAlertThresholds,
     cleanupCategories,
     setCleanupCategories,
     selectedCleanupIds,

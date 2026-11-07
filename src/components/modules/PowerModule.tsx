@@ -20,6 +20,7 @@ export function PowerModule({ c }: { c: NexusController }) {
   const {
     timerSleep,
     setTimerSleep,
+    restartMode,
     setRestartMode,
     customMinutes,
     setCustomMinutes,
@@ -37,8 +38,9 @@ export function PowerModule({ c }: { c: NexusController }) {
   const runImmediate = async (action: "shutdown" | "restart" | "sleep" | "lock") => {
     setPowerError(null);
     try {
-      if (action === "shutdown" || action === "restart") {
-        await handleCancelTimer();
+      if ((action === "shutdown" || action === "restart") && timerActive) {
+        const cancelled = await handleCancelTimer();
+        if (!cancelled) return;
       }
       await invoke("system_power_action", { action });
     } catch (err) {
@@ -149,13 +151,27 @@ export function PowerModule({ c }: { c: NexusController }) {
                   setTimerSleep(false);
                   setRestartMode(false);
                 }}
-                className={`rounded-lg border px-3 py-1.5 text-xs font-medium ${
-                  !timerSleep
+                className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
+                  !timerSleep && !restartMode
                     ? "border-sky-500/30 bg-sky-500/10 text-sky-300"
-                    : "border-[#222b38] bg-[#151c27] text-slate-400"
+                    : "border-[#222b38] bg-[#151c27] text-slate-400 hover:text-slate-200"
                 }`}
               >
-                Выключить ПК
+                Выключение ПК
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setTimerSleep(false);
+                  setRestartMode(true);
+                }}
+                className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
+                  !timerSleep && restartMode
+                    ? "border-amber-500/30 bg-amber-500/10 text-amber-300"
+                    : "border-[#222b38] bg-[#151c27] text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                Перезагрузка ПК
               </button>
               <button
                 type="button"
@@ -163,13 +179,13 @@ export function PowerModule({ c }: { c: NexusController }) {
                   setTimerSleep(true);
                   setRestartMode(false);
                 }}
-                className={`rounded-lg border px-3 py-1.5 text-xs font-medium ${
+                className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
                   timerSleep
                     ? "border-sky-500/30 bg-sky-500/10 text-sky-300"
-                    : "border-[#222b38] bg-[#151c27] text-slate-400"
+                    : "border-[#222b38] bg-[#151c27] text-slate-400 hover:text-slate-200"
                 }`}
               >
-                Перейти в спящий режим
+                Спящий режим
               </button>
             </div>
             <div className="flex flex-wrap gap-2">

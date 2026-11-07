@@ -220,7 +220,7 @@ export default function App() {
             {c.activeTab === "processes" && <ProcessModule c={c} />}
             {c.activeTab === "network" && <NetworkModule c={c} />}
             {c.activeTab === "drop" && <DropModule />}
-            {c.activeTab === "settings" && <SettingsModule />}
+            {c.activeTab === "settings" && <SettingsModule c={c} />}
           </motion.div>
         </AnimatePresence>
       </main>

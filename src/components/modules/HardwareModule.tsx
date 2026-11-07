@@ -96,7 +96,17 @@ export function HardwareModule({ c }: { c: NexusController }) {
   const [minutes, setMinutes] = useState(60);
   const [history, setHistory] = useState<TelemetrySnapshot[]>([]);
   const [report, setReport] = useState<DiagnosticsReport | null>(null);
-  const [thresholds, setThresholds] = useState({ cpu: 85, gpu: 83 });
+  const [thresholds, setThresholds] = useState(() => ({
+    cpu: c.alertThresholds?.cpu ?? 85,
+    gpu: c.alertThresholds?.gpu ?? 83,
+  }));
+
+  useEffect(() => {
+    setThresholds({
+      cpu: c.alertThresholds?.cpu ?? 85,
+      gpu: c.alertThresholds?.gpu ?? 83,
+    });
+  }, [c.alertThresholds?.cpu, c.alertThresholds?.gpu]);
   const [exportPath, setExportPath] = useState("");
   const [exportError, setExportError] = useState("");
   const [filter, setFilter] = useState<SensorFilter>("all");
@@ -474,7 +484,7 @@ function HistoryPanel({
       </div>
 
       <section className="overflow-hidden rounded-xl border border-[#222b38] bg-[#111722]">
-        <div className="border-b border-[#222b38] px-4 py-3 text-sm font-semibold text-slate-100">Хроника спайков</div>
+        <div className="border-b border-[#222b38] px-4 py-3 text-sm font-semibold text-slate-100">Пиковые нагрузки ЦП</div>
         {spikes.length === 0 ? (
           <p className="px-4 py-6 text-sm text-slate-400">Пиковых точек пока нет</p>
         ) : (

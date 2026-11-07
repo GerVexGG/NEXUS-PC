@@ -209,8 +209,17 @@ export function StorageModule({ c }: { c: NexusController }) {
         ) : (
           <div className="mt-3 grid gap-3 lg:grid-cols-2">
             {diskHealth.map((disk) => {
-              const percent = disk.health_percent ?? 0;
-              const tone = percent >= 90 ? "bg-emerald-400" : percent >= 70 ? "bg-cyan-400" : percent >= 40 ? "bg-amber-400" : "bg-rose-400";
+              const hasSmart = disk.health_percent !== null && disk.health_percent !== undefined;
+              const percent = hasSmart ? disk.health_percent! : 0;
+              const tone = !hasSmart
+                ? "bg-slate-700/40"
+                : percent >= 90
+                  ? "bg-emerald-400"
+                  : percent >= 70
+                    ? "bg-cyan-400"
+                    : percent >= 40
+                      ? "bg-amber-400"
+                      : "bg-rose-400";
               return (
                 <div key={disk.model + disk.kind} className="rounded-lg border border-[#222b38] bg-[#151c27] p-3">
                   <div className="flex items-start justify-between gap-2">
@@ -219,15 +228,24 @@ export function StorageModule({ c }: { c: NexusController }) {
                       {disk.kind}
                     </span>
                   </div>
-                  <div className="mt-2 text-xs text-slate-300">
-                    Здоровье:{" "}
-                    <span className="font-mono text-slate-100">
-                      {disk.health_percent == null ? "—" : `${disk.health_percent}%`}
-                    </span>{" "}
-                    ({disk.health_label})
+                  <div className="mt-2 flex items-center justify-between gap-2 text-xs text-slate-300">
+                    <span>
+                      Здоровье:{" "}
+                      <span className="font-mono text-slate-100">
+                        {hasSmart ? `${percent}%` : "—"}
+                      </span>
+                      {hasSmart ? ` (${disk.health_label})` : ""}
+                    </span>
+                    {!hasSmart && (
+                      <span className="rounded-md border border-slate-700/40 bg-slate-800/40 px-1.5 py-0.5 text-[11px] text-slate-400">
+                        Нет данных SMART
+                      </span>
+                    )}
                   </div>
                   <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-[#0e1118]">
-                    <div className={`h-full ${tone}`} style={{ width: `${disk.health_percent ?? 0}%` }} />
+                    {hasSmart && (
+                      <div className={`h-full ${tone}`} style={{ width: `${percent}%` }} />
+                    )}
                   </div>
                   <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px] text-slate-400">
                     <span>Наработка {disk.power_on_hours == null ? "—" : `${disk.power_on_hours} ч`}</span>
