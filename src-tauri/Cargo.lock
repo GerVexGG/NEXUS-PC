@@ -2182,6 +2182,8 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 name = "nexus"
 version = "0.2.2"
 dependencies = [
+ "crc32fast",
+ "flate2",
  "jwalk",
  "png",
  "qrcode",
@@ -2192,6 +2194,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "windows 0.62.2",
  "winreg 0.52.0",
 ]
 

@@ -10,17 +10,17 @@ import {
   ShieldCheck,
   Trash2,
 } from "lucide-react";
-import type { StartupItem } from "../../lib/studio";
+import { PageHeader, getLocationBadgeStyles, type StartupItem } from "../../lib/studio";
 import type { NexusController } from "../../hooks/useNexusController";
 
 function sourceBadge(location: string): string {
   const value = location.toLowerCase();
-  if (value.includes("store") || value.includes("приложен")) return "Store";
-  if (value.includes("планировщик") || value.includes("cim")) return "Вход в систему";
+  if (value.includes("store") || value.includes("приложен")) return "Microsoft Store";
+  if (value.includes("планировщик") || value.includes("cim")) return "Планировщик";
   if (value.includes("общая")) return "Общая папка";
   if (value.includes("hkcu")) return "HKCU Run";
   if (value.includes("hklm")) return "HKLM Run";
-  if (value.includes("папк")) return "Папка Автозапуск";
+  if (value.includes("папк")) return "Autorun";
   return location;
 }
 
@@ -54,6 +54,7 @@ export function StartupModule({ c }: { c: NexusController }) {
     handleRemoveStartup,
     handleOpenItemLocation,
     totalStartupCount,
+    activeStartupCount,
     filteredStartupItems,
     startupItems,
   } = c;
@@ -61,6 +62,14 @@ export function StartupModule({ c }: { c: NexusController }) {
   const [pendingDelete, setPendingDelete] = useState<StartupItem | null>(null);
   const phantomCount = useMemo(
     () => startupItems.filter((item) => item.phantom).length,
+    [startupItems]
+  );
+  const enabledNonPhantomCount = useMemo(
+    () => startupItems.filter((item) => item.enabled && !item.phantom).length,
+    [startupItems]
+  );
+  const disabledNonPhantomCount = useMemo(
+    () => startupItems.filter((item) => !item.enabled && !item.phantom).length,
     [startupItems]
   );
 
@@ -74,139 +83,163 @@ export function StartupModule({ c }: { c: NexusController }) {
   return (
     <motion.div
       key="startup"
-      initial={{ opacity: 0, y: 8 }}
+      initial={{ opacity: 0, y: 6 }}
       animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -6 }}
-      transition={{ duration: 0.18, ease: "easeOut" }}
-      className="w-full max-w-6xl space-y-4"
+      exit={{ opacity: 0, y: -4 }}
+      transition={{ duration: 0.16, ease: "easeOut" }}
+      className="w-full space-y-4"
     >
-      <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-end">
-        <div>
-          <h2 className="text-2xl font-semibold text-slate-100">Автозагрузка программ</h2>
-          <p className="mt-1 text-sm text-slate-400">Управление приложениями при старте Windows</p>
-        </div>
-        <button
-          type="button"
-          onClick={() => void fetchStartupItems()}
-          disabled={startupLoading}
-          className="inline-flex items-center gap-2 self-start rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2 text-xs font-medium text-slate-200 transition-colors hover:bg-[#1a2332] disabled:opacity-60"
-        >
-          <RefreshCw size={14} className={startupLoading ? "animate-spin" : ""} />
-          Обновить список
-        </button>
-      </div>
+      <PageHeader
+        title="Автозагрузка"
+        description="Управление программами, службами и ключами реестра, запускаемыми вместе с Windows"
+        badge={
+          <span className="rounded-md border border-[#202B38] bg-[#151C26] px-2.5 py-0.5 font-mono text-xs text-[#8292A3]">
+            Активно: <span className="font-semibold text-[#00D5E8]">{activeStartupCount}</span> из {totalStartupCount}
+          </span>
+        }
+        actions={
+          <button
+            type="button"
+            onClick={() => void fetchStartupItems()}
+            disabled={startupLoading}
+            className="cyber-btn inline-flex cursor-pointer items-center gap-2 px-3.5 py-2 text-xs font-medium text-[#00D5E8] disabled:opacity-60"
+          >
+            <RefreshCw size={14} className={startupLoading ? "animate-spin" : ""} />
+            Обновить список
+          </button>
+        }
+      />
 
       <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
         <div className="flex flex-wrap gap-2">
           {(
             [
-              ["all", "Все"],
-              ["on", "Включенные"],
-              ["off", "Отключенные"],
+              ["all", `Все (${totalStartupCount})`],
+              ["on", `Включено (${enabledNonPhantomCount})`],
+              ["off", `Отключено (${disabledNonPhantomCount})`],
             ] as const
           ).map(([id, label]) => (
             <button
               key={id}
               type="button"
               onClick={() => setStatusFilter(id)}
-              className={`rounded-full border px-3 py-1 text-xs font-medium transition-colors ${
+              className={`cursor-pointer rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
                 statusFilter === id
-                  ? "border-sky-500/30 bg-sky-500/10 text-sky-300"
-                  : "border-[#222b38] bg-[#111722] text-slate-400 hover:text-slate-200"
+                  ? "border-[#00D5E8]/40 bg-[#00D5E8]/12 text-[#00D5E8]"
+                  : "border-[#202B38] bg-[#10151D] text-[#8292A3] hover:text-[#E5EDF5]"
               }`}
             >
               {label}
             </button>
           ))}
         </div>
+
         {phantomCount > 0 && (
           <button
             type="button"
             onClick={() => setPhantomsOnly((value) => !value)}
-            className={`rounded-full border px-3 py-1 text-xs font-medium transition-colors ${
+            className={`cursor-pointer rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
               phantomsOnly
-                ? "border-rose-500/30 bg-rose-500/10 text-rose-300"
-                : "border-[#222b38] bg-[#111722] text-rose-300 hover:bg-rose-500/10"
+                ? "border-rose-500/40 bg-rose-500/15 text-rose-300"
+                : "border-rose-500/25 bg-[#10151D] text-rose-300 hover:bg-rose-500/10"
             }`}
           >
-            Найдено фантомных записей в реестре: {phantomCount}
+            Осиротевшие ключи реестра: {phantomCount}
           </button>
         )}
+
         <div className="relative min-w-0 flex-1">
-          <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
+          <Search
+            size={14}
+            className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[#526170]"
+          />
           <input
             type="text"
             value={startupSearch}
             onChange={(e) => setStartupSearch(e.target.value)}
-            placeholder="Поиск по имени"
-            className="w-full rounded-lg border border-[#222b38] bg-[#111722] py-2 pl-9 pr-3 text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:border-slate-500"
+            placeholder="Поиск по названию, пути или издателю…"
+            className="w-full rounded-lg border border-[#202B38] bg-[#10151D] py-2 pl-9 pr-3 text-sm text-[#E5EDF5] outline-none placeholder:text-[#526170] focus:border-[#00D5E8]/50"
           />
         </div>
       </div>
 
       {startupError && (
-        <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+        <div className="rounded-xl border border-rose-500/35 bg-rose-500/12 px-4 py-2.5 text-xs text-rose-300">
           {startupError}
         </div>
       )}
 
       {visibleItems.length === 0 ? (
-        <div className="flex flex-col items-center rounded-xl border border-[#222b38] bg-[#111722] px-6 py-16 text-center">
+        <div className="tactical-card flex flex-col items-center rounded-xl px-6 py-16 text-center">
           {searchActive ? (
-            <SearchX size={28} className="mb-3 text-slate-500" />
+            <SearchX size={28} className="mb-3 text-[#526170]" />
           ) : (
-            <ShieldCheck size={28} className="mb-3 text-slate-500" />
+            <ShieldCheck size={28} className="mb-3 text-[#00D5E8]" />
           )}
-          <h3 className="text-base font-semibold text-slate-100">
+          <h3 className="text-base font-semibold text-[#E5EDF5]">
             {startupLoading
-              ? "Читаем список автозагрузки"
+              ? "Опрос источников автозагрузки…"
               : searchActive
-                ? "Ничего не найдено"
-                : "Записей автозапуска не обнаружено"}
+              ? "Совпадений не найдено"
+              : "Элементы автозагрузки не обнаружены"}
           </h3>
-          <p className="mt-1 max-w-md text-sm text-slate-400">
+          <p className="mt-1 max-w-md text-sm text-[#8292A3]">
             {searchActive
-              ? "Измените фильтр или строку поиска."
+              ? "Попробуйте изменить фильтр состояния или поисковый запрос."
               : totalStartupCount === 0
-                ? "Реестр и папка автозапуска сейчас пусты."
-                : "Подходящих записей нет."}
+              ? "Ветви реестра Run и папки автозапуска сейчас чисты."
+              : "Подходящих записей в выбранной категории нет."}
           </p>
           <button
             type="button"
             onClick={() => void fetchStartupItems()}
             disabled={startupLoading}
-            className="mt-4 inline-flex items-center gap-2 rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2 text-xs font-medium text-slate-200 hover:bg-[#1a2332] disabled:opacity-60"
+            className="cyber-btn mt-4 inline-flex cursor-pointer items-center gap-2 px-3.5 py-2 text-xs font-medium text-[#00D5E8] disabled:opacity-60"
           >
             <RefreshCw size={14} className={startupLoading ? "animate-spin" : ""} />
             Повторить сканирование
           </button>
         </div>
       ) : (
-        <div className="divide-y divide-[#222b38]/50 overflow-hidden rounded-xl border border-[#222b38] bg-[#111722]">
-          {visibleItems.map((item) => (
-            <StartupRow
-              key={item.id}
-              item={item}
-              onOpen={() => void handleOpenItemLocation(item)}
-              onToggle={() => void handleToggleStartup(item)}
-              onRemove={() => setPendingDelete(item)}
-            />
-          ))}
+        <div className="tactical-card tactical-brackets overflow-hidden rounded-xl">
+          <div className="hidden grid-cols-12 items-center border-b border-[#202B38] bg-[#0B0E14] px-4 py-2.5 text-xs font-medium text-[#8292A3] sm:grid">
+            <div className="col-span-6">Приложение и исполняемый путь</div>
+            <div className="col-span-2">Источник</div>
+            <div className="col-span-2">Состояние</div>
+            <div className="col-span-2 text-right">Управление</div>
+          </div>
+          <div className="divide-y divide-[#202B38]/60">
+            {visibleItems.map((item) => (
+              <StartupRow
+                key={item.id}
+                item={item}
+                onOpen={() => void handleOpenItemLocation(item)}
+                onToggle={() => void handleToggleStartup(item)}
+                onRemove={() => setPendingDelete(item)}
+              />
+            ))}
+          </div>
         </div>
       )}
+
       {pendingDelete && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4">
-          <div className="w-full max-w-md rounded-xl border border-[#222b38] bg-[#111722] p-4 shadow-2xl">
-            <h3 className="text-base font-semibold text-slate-100">Удаление записи автозагрузки</h3>
-            <p className="mt-2 text-sm text-slate-300">
-              Вы действительно хотите удалить запись {pendingDelete.name} из {sourceBadge(pendingDelete.location)}? Путь:{" "}
-              <span className="font-mono text-xs text-slate-400">{pendingDelete.clean_path || pendingDelete.command || "не указан"}</span>
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-md rounded-xl border border-[#202B38] bg-[#10151D] p-5 shadow-2xl">
+            <h3 className="text-base font-semibold text-[#E5EDF5]">
+              Удаление записи автозагрузки
+            </h3>
+            <p className="mt-2 text-sm text-[#8292A3]">
+              Удалить запись <span className="font-semibold text-[#E5EDF5]">{pendingDelete.name}</span> из источника{" "}
+              <span className="font-mono text-xs text-[#00D5E8]">{sourceBadge(pendingDelete.location)}</span>?
             </p>
+            <div className="mt-2 rounded-lg border border-[#202B38] bg-[#0B0E14] p-2.5 font-mono text-xs text-[#8292A3] break-all">
+              {pendingDelete.clean_path || pendingDelete.command || "Путь не указан"}
+            </div>
             <div className="mt-4 flex justify-end gap-2">
               <button
                 type="button"
                 onClick={() => setPendingDelete(null)}
-                className="rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2 text-xs font-medium text-slate-300 hover:bg-[#1a2332]"
+                className="cursor-pointer rounded-lg border border-[#202B38] bg-[#151C26] px-3.5 py-2 text-xs font-medium text-[#8292A3] hover:text-[#E5EDF5]"
               >
                 Отмена
               </button>
@@ -217,9 +250,9 @@ export function StartupModule({ c }: { c: NexusController }) {
                   setPendingDelete(null);
                   void handleRemoveStartup(item);
                 }}
-                className="rounded-lg border border-rose-500/30 bg-rose-500/20 px-3 py-2 text-xs font-medium text-rose-300 hover:bg-rose-500/30"
+                className="cyber-btn-danger cursor-pointer px-3.5 py-2 text-xs font-semibold text-rose-300"
               >
-                Удалить
+                Удалить запись
               </button>
             </div>
           </div>
@@ -242,6 +275,8 @@ function StartupRow({
 }) {
   const path = item.clean_path || item.command;
   const hint = folderHint(path);
+  const badgeText = sourceBadge(item.location);
+  const badgeStyle = getLocationBadgeStyles(badgeText);
   const canToggle =
     !item.phantom &&
     (item.id.startsWith("reg|") ||
@@ -250,85 +285,114 @@ function StartupRow({
       item.id.startsWith("msix|"));
 
   return (
-    <div className="flex items-center gap-3 px-4 py-3">
-      <div
-        className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border ${
-          item.file_exists
-            ? "border-[#222b38] bg-[#151c27] text-slate-300"
-            : "border-rose-500/30 bg-rose-500/10 text-rose-300"
-        }`}
-      >
-        {item.file_exists ? <AppWindow size={16} /> : <AlertTriangle size={16} />}
-      </div>
-      <div className="min-w-0 flex-1">
-        <div className="flex min-w-0 items-center gap-2">
-          <div className="truncate text-sm font-medium text-slate-100">{item.name}</div>
-          {item.phantom ? (
-            <span className="shrink-0 rounded-md border border-rose-500/20 bg-rose-500/10 px-1.5 py-0.5 text-[11px] text-rose-400">
-              Осиротевшая запись реестра
-            </span>
-          ) : (
-            !item.file_exists && (
-              <span className="shrink-0 rounded-md border border-rose-500/20 bg-rose-500/10 px-1.5 py-0.5 text-[11px] text-rose-400">
-                Мертвая запись
-              </span>
-            )
-          )}
-        </div>
-        <div className="truncate text-xs text-slate-400">
-          {hint && <span>{hint} · </span>}
-          <span className="font-mono">{path}</span>
-        </div>
-      </div>
-      <span className="hidden shrink-0 rounded-md border border-[#222b38] px-2 py-1 text-xs text-slate-400 sm:inline">
-        {sourceBadge(item.location)}
-      </span>
-      {!item.phantom && (
-        <button
-          type="button"
-          onClick={onOpen}
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-[#222b38] bg-[#151c27] px-2.5 py-1.5 text-xs font-medium text-slate-200 hover:bg-[#1a2332]"
-        >
-          <FolderOpen size={13} />
-          Открыть папку
-        </button>
-      )}
-      {item.phantom ? (
-        <button
-          type="button"
-          onClick={onRemove}
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-rose-500/20 bg-rose-500/10 px-2.5 py-1.5 text-xs font-medium text-rose-400 hover:bg-rose-500/15"
-        >
-          <Trash2 size={13} />
-          Удалить ключ
-        </button>
-      ) : item.file_exists ? (
-        <button
-          type="button"
-          role="switch"
-          disabled={!canToggle}
-          aria-checked={item.enabled}
-          onClick={onToggle}
-          className={`relative h-5 w-9 shrink-0 rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-            item.enabled ? "border-sky-500/40 bg-sky-500/30" : "border-[#222b38] bg-[#151c27]"
+    <div className="flex flex-col gap-3 px-4 py-3 transition-colors hover:bg-[#151C26]/50 sm:grid sm:grid-cols-12 sm:items-center">
+      <div className="flex min-w-0 items-center gap-3 sm:col-span-6">
+        <div
+          className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border ${
+            item.file_exists
+              ? "border-[#202B38] bg-[#0B0E14] text-[#00D5E8]"
+              : "border-rose-500/35 bg-rose-500/12 text-rose-300"
           }`}
         >
-          <span
-            className={`absolute top-0.5 h-3.5 w-3.5 rounded-full transition-all ${
-              item.enabled ? "left-4 bg-sky-300" : "left-0.5 bg-slate-500"
+          {item.file_exists ? <AppWindow size={16} /> : <AlertTriangle size={16} />}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-center gap-2">
+            <div className="truncate text-sm font-medium text-[#E5EDF5]">{item.name}</div>
+            {item.phantom ? (
+              <span className="shrink-0 rounded border border-rose-500/30 bg-rose-500/10 px-1.5 py-0.5 font-mono text-[10px] text-rose-300">
+                Осиротевший ключ
+              </span>
+            ) : (
+              !item.file_exists && (
+                <span className="shrink-0 rounded border border-rose-500/30 bg-rose-500/10 px-1.5 py-0.5 font-mono text-[10px] text-rose-300">
+                  Файл отсутствует
+                </span>
+              )
+            )}
+          </div>
+          <div className="mt-0.5 truncate text-xs text-[#8292A3]" title={path}>
+            {hint && <span className="text-[#E5EDF5]/80">{hint} · </span>}
+            <span className="font-mono text-[11px]">{path}</span>
+          </div>
+        </div>
+      </div>
+
+      <div className="flex items-center sm:col-span-2">
+        <span className={`inline-flex rounded-md border px-2 py-0.5 font-mono text-[11px] font-medium ${badgeStyle}`}>
+          {badgeText}
+        </span>
+      </div>
+
+      <div className="flex items-center gap-2 sm:col-span-2">
+        {item.phantom || !item.file_exists ? (
+          <span className="inline-flex items-center gap-1.5 rounded-md border border-rose-500/30 bg-rose-500/10 px-2 py-0.5 font-mono text-[11px] font-medium text-rose-300">
+            <span className="h-1.5 w-1.5 rounded-full bg-rose-400" />
+            Недействителен
+          </span>
+        ) : item.enabled ? (
+          <span className="inline-flex items-center gap-1.5 rounded-md border border-[#00D5E8]/30 bg-[#00D5E8]/10 px-2 py-0.5 font-mono text-[11px] font-semibold text-[#00D5E8]">
+            <span className="h-1.5 w-1.5 rounded-full bg-[#00D5E8]" />
+            Включено
+          </span>
+        ) : (
+          <span className="inline-flex items-center gap-1.5 rounded-md border border-[#202B38] bg-[#151C26] px-2 py-0.5 font-mono text-[11px] font-medium text-[#8292A3]">
+            <span className="h-1.5 w-1.5 rounded-full bg-[#526170]" />
+            Отключено
+          </span>
+        )}
+      </div>
+
+      <div className="flex items-center justify-end gap-2 sm:col-span-2">
+        {!item.phantom && item.file_exists && (
+          <button
+            type="button"
+            onClick={onOpen}
+            title="Показать файл в проводнике Windows"
+            className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-[#202B38] bg-[#0B0E14] px-2.5 py-1.5 text-xs font-medium text-[#8292A3] transition-colors hover:border-[#00D5E8]/40 hover:text-[#E5EDF5]"
+          >
+            <FolderOpen size={13} />
+            <span className="hidden xl:inline">Папка</span>
+          </button>
+        )}
+
+        {item.phantom || !item.file_exists ? (
+          <button
+            type="button"
+            onClick={onRemove}
+            className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-rose-500/30 bg-rose-500/12 px-2.5 py-1.5 text-xs font-medium text-rose-300 transition-colors hover:bg-rose-500/20"
+          >
+            <Trash2 size={13} />
+            Удалить
+          </button>
+        ) : (
+          <button
+            type="button"
+            role="switch"
+            disabled={!canToggle}
+            aria-checked={item.enabled}
+            title={
+              canToggle
+                ? item.enabled
+                  ? "Отключить автозапуск"
+                  : "Включить автозапуск"
+                : "Запись управляется системной политикой"
+            }
+            onClick={onToggle}
+            className={`relative h-5 w-9 shrink-0 cursor-pointer rounded-full border transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+              item.enabled
+                ? "border-[#00D5E8]/50 bg-[#00D5E8]/25"
+                : "border-[#202B38] bg-[#0B0E14]"
             }`}
-          />
-        </button>
-      ) : (
-        <button
-          type="button"
-          onClick={onRemove}
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-rose-500/20 bg-rose-500/10 px-2.5 py-1.5 text-xs font-medium text-rose-400 hover:bg-rose-500/15"
-        >
-          <Trash2 size={13} />
-          Удалить хвост
-        </button>
-      )}
+          >
+            <span
+              className={`absolute top-0.5 h-3.5 w-3.5 rounded-full transition-all ${
+                item.enabled ? "left-4 bg-[#00D5E8] shadow-[0_0_6px_rgba(0,213,232,0.8)]" : "left-0.5 bg-[#526170]"
+              }`}
+            />
+          </button>
+        )}
+      </div>
     </div>
   );
 }

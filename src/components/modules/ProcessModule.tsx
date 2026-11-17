@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
+import { invoke } from "@tauri-apps/api/core";
 import {
   XCircle,
   Play,
@@ -14,8 +15,22 @@ import {
   Copy,
   ChevronUp,
   ChevronDown,
+  ChevronRight,
+  ChevronsDownUp,
+  ChevronsUpDown,
+  Info,
+  GitBranch,
 } from "lucide-react";
-import type { ProcessItem, ProcessSortKey } from "../../lib/studio";
+import {
+  PageHeader,
+  copyTextToClipboard,
+  formatRate,
+  formatUptime,
+  type ProcessDetails,
+  type ProcessItem,
+  type ProcessSortKey,
+} from "../../lib/studio";
+import { buildProcessTree } from "../../lib/processTree";
 import type { NexusController } from "../../hooks/useNexusController";
 
 const CRITICAL_PROCESSES = new Set([
@@ -44,18 +59,33 @@ function formatRam(mb: number): string {
   return `${mb.toFixed(1)} МБ`;
 }
 
+function formatStartTime(epochSec: number): string {
+  if (!epochSec || epochSec <= 0) return "Н/Д";
+  return new Date(epochSec * 1000).toLocaleString("ru-RU", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
 function cpuTone(value: number): { text: string; bar: string } {
-  if (value > 30) return { text: "text-rose-400", bar: "bg-rose-400" };
-  if (value > 10) return { text: "text-amber-400", bar: "bg-amber-400" };
-  return { text: "text-slate-200", bar: "bg-slate-400" };
+  if (value > 30) return { text: "text-rose-400 font-semibold", bar: "bg-rose-400" };
+  if (value > 10) return { text: "text-amber-300 font-semibold", bar: "bg-amber-400" };
+  if (value > 1) return { text: "text-[#00D5E8]", bar: "bg-[#00D5E8]" };
+  return { text: "text-[#8292A3]", bar: "bg-[#36AFC0]/60" };
 }
 
 export function ProcessModule({ c }: { c: NexusController }) {
   const {
+    metrics,
     processes,
     processSearch,
     setProcessSearch,
     processAutoRefresh,
+    setProcessAutoRefresh,
     processError,
     setProcessError,
     processNotice,
@@ -77,16 +107,112 @@ export function ProcessModule({ c }: { c: NexusController }) {
     visibleProcesses,
     totalProcessCpu,
     menuProcessSuspended,
+    showProcessNotice,
   } = c;
-  const [pendingKill, setPendingKill] = useState<ProcessItem | null>(null);
+  const [viewMode, setViewMode] = useState<"tree" | "flat">("tree");
+  const [expandedPids, setExpandedPids] = useState<Set<number>>(() => new Set());
+  const [pendingKill, setPendingKill] = useState<{
+    proc: ProcessItem;
+    tree: boolean;
+    directCount: number;
+    totalDescendants: number;
+    isCritical: boolean;
+  } | null>(null);
+  const [detailsModal, setDetailsModal] = useState<{
+    loading: boolean;
+    error: string | null;
+    data: ProcessDetails | null;
+    fallbackProc: ProcessItem;
+  } | null>(null);
 
-  const requestKill = (proc: ProcessItem) => {
-    if (isCriticalProcess(proc.name)) {
-      setPendingKill(proc);
+  // Удаляем из expandedPids завершившиеся PID, чтобы повторно использованные PID не унаследовали состояние раскрытия.
+  useEffect(() => {
+    if (processes.length === 0) return;
+    const activePids = new Set(processes.map((p) => p.pid));
+    setExpandedPids((prev) => {
+      if (prev.size === 0) return prev;
+      let changed = false;
+      const next = new Set<number>();
+      for (const pid of prev) {
+        if (activePids.has(pid)) {
+          next.add(pid);
+        } else {
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [processes]);
+
+  const treeData = useMemo(
+    () => buildProcessTree(processes, processSortKey, processSortDesc, processSearch, expandedPids),
+    [processes, processSortKey, processSortDesc, processSearch, expandedPids]
+  );
+
+  const displayRows = useMemo(() => {
+    if (viewMode === "tree") return treeData.rows;
+    return visibleProcesses.map((proc) => {
+      const stats = treeData.statsByPid.get(proc.pid);
+      return {
+        process: proc,
+        depth: 0,
+        hasChildren: (stats?.directChildCount ?? 0) > 0,
+        directChildCount: stats?.directChildCount ?? 0,
+        childCount: stats?.directChildCount ?? 0,
+        totalDescendants: stats?.totalDescendants ?? 0,
+        subtreeCpu: stats?.subtreeCpu ?? proc.cpu_usage,
+        subtreeMemoryMb: stats?.subtreeMemoryMb ?? proc.memory_mb,
+        isExpanded: false,
+        matchedSelf: false,
+        ancestorHasNext: [],
+        isLastChild: false,
+      };
+    });
+  }, [viewMode, treeData.rows, treeData.statsByPid, visibleProcesses]);
+
+  const toggleExpand = useCallback((pid: number) => {
+    setExpandedPids((prev) => {
+      const next = new Set(prev);
+      if (next.has(pid)) next.delete(pid);
+      else next.add(pid);
+      return next;
+    });
+  }, []);
+
+  const expandAll = useCallback(() => {
+    setExpandedPids(new Set(treeData.parentPids));
+  }, [treeData.parentPids]);
+
+  const collapseAll = useCallback(() => {
+    setExpandedPids(new Set());
+  }, []);
+
+  const requestKill = (proc: ProcessItem, tree = false) => {
+    const critical = isCriticalProcess(proc.name);
+    const stats = treeData.statsByPid.get(proc.pid);
+    const directCount = stats?.directChildCount ?? 0;
+    const totalDescendants = stats?.totalDescendants ?? 0;
+    if (critical || (tree && totalDescendants > 0)) {
+      setPendingKill({ proc, tree, directCount, totalDescendants, isCritical: critical });
       return;
     }
-    void handleProcessKill(proc, false);
+    void handleProcessKill(proc, tree);
   };
+
+  const openProcessDetails = useCallback(async (proc: ProcessItem) => {
+    setDetailsModal({ loading: true, error: null, data: null, fallbackProc: proc });
+    try {
+      const details = await invoke<ProcessDetails>("get_process_details", { pid: proc.pid });
+      setDetailsModal({ loading: false, error: null, data: details, fallbackProc: proc });
+    } catch (err) {
+      setDetailsModal({
+        loading: false,
+        error: String(err),
+        data: null,
+        fallbackProc: proc,
+      });
+    }
+  }, []);
 
   const header = (key: ProcessSortKey, label: string, alignRight = false) => {
     const active = processSortKey === key;
@@ -94,70 +220,150 @@ export function ProcessModule({ c }: { c: NexusController }) {
       <button
         type="button"
         onClick={() => handleProcessSort(key)}
-        className={`flex items-center gap-1 text-[11px] font-medium ${
+        className={`inline-flex cursor-pointer items-center gap-1 text-xs font-medium transition-colors ${
           alignRight ? "justify-end" : "justify-start"
-        } ${active ? "text-slate-100" : "text-slate-400 hover:text-slate-200"}`}
+        } ${active ? "text-[#00D5E8]" : "text-[#8292A3] hover:text-[#E5EDF5]"}`}
       >
         <span>{label}</span>
-        {active ? processSortDesc ? <ChevronDown size={12} /> : <ChevronUp size={12} /> : <span className="w-3" />}
+        {active ? (
+          processSortDesc ? (
+            <ChevronDown size={13} className="text-[#00D5E8]" />
+          ) : (
+            <ChevronUp size={13} className="text-[#00D5E8]" />
+          )
+        ) : (
+          <span className="w-3" />
+        )}
       </button>
     );
   };
 
   const searching = processSearch.trim().length > 0;
+  const totalRamMb = Math.max(4096, metrics.ram_total_gb * 1024);
 
   return (
     <>
       <motion.div
         key="processes"
-        initial={{ opacity: 0, y: 8 }}
+        initial={{ opacity: 0, y: 6 }}
         animate={{ opacity: 1, y: 0 }}
-        exit={{ opacity: 0, y: -6 }}
-        transition={{ duration: 0.18, ease: "easeOut" }}
-        className="w-full max-w-6xl space-y-4"
+        exit={{ opacity: 0, y: -4 }}
+        transition={{ duration: 0.16, ease: "easeOut" }}
+        className="w-full space-y-4"
       >
-        <div className="flex flex-col justify-between gap-4 border-b border-[#222b38] pb-3.5 lg:flex-row lg:items-end">
-          <div>
-            <h2 className="text-2xl font-semibold tracking-tight text-slate-100">Диспетчер процессов</h2>
-            <p className="mt-0.5 text-sm text-slate-400">Мониторинг системных ресурсов и запущенных задач</p>
-          </div>
-          <span className="inline-flex items-center rounded-lg border border-[#222b38] bg-[#111722] px-3 py-2 font-mono text-xs text-slate-300">
-            Всего процессов: {processes.length} | Нагрузка ЦП: {totalProcessCpu.toFixed(1)}%
-          </span>
-        </div>
+        <PageHeader
+          title="Диспетчер процессов"
+          description="Дерево процессов (PID / PPID), распределение CPU/RAM и управление выполнением задач"
+          actions={
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="inline-flex items-center gap-2 rounded-lg border border-[#202B38] bg-[#10151D] px-3 py-1.5 font-mono text-xs text-[#8292A3]">
+                <GitBranch size={12} className="text-[#00D5E8]" />
+                Корней: <span className="font-semibold text-[#E5EDF5]">{treeData.rootCount}</span>
+                <span className="text-[#202B38]">|</span>
+                Всего: <span className="font-semibold text-[#E5EDF5]">{processes.length}</span>
+                <span className="text-[#202B38]">|</span>
+                ЦП: <span className="font-semibold text-[#00D5E8]">{totalProcessCpu.toFixed(1)}%</span>
+              </span>
+            </div>
+          }
+        />
 
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-          <div className="relative min-w-0 flex-1">
-            <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="inline-flex rounded-lg border border-[#202B38] bg-[#10151D] p-0.5">
+            {(
+              [
+                ["tree", "Дерево"],
+                ["flat", "Список"],
+              ] as const
+            ).map(([mode, label]) => (
+              <button
+                key={mode}
+                type="button"
+                onClick={() => setViewMode(mode)}
+                className={`cursor-pointer rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                  viewMode === mode
+                    ? "bg-[#151C26] text-[#00D5E8]"
+                    : "text-[#8292A3] hover:text-[#E5EDF5]"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          <div className="relative min-w-[200px] flex-1">
+            <Search
+              size={14}
+              className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[#526170]"
+            />
             <input
               type="text"
               value={processSearch}
               onChange={(event) => setProcessSearch(event.target.value)}
-              placeholder="Поиск по имени .exe или PID"
-              className="w-full rounded-lg border border-[#222b38] bg-[#111722] py-2 pr-16 pl-9 text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:border-slate-500"
+              placeholder="Фильтр по имени (.exe), пути или PID…"
+              className="w-full rounded-lg border border-[#202B38] bg-[#10151D] py-2 pr-20 pl-9 text-sm text-[#E5EDF5] outline-none placeholder:text-[#526170] focus:border-[#00D5E8]/50"
             />
-            <span className="absolute top-1/2 right-3 -translate-y-1/2 font-mono text-[10px] text-slate-500">
-              {visibleProcesses.length}/{processes.length}
+            <span className="absolute top-1/2 right-3 -translate-y-1/2 font-mono text-[11px] text-[#526170]">
+              {viewMode === "flat"
+                ? `${visibleProcesses.length}/${processes.length}`
+                : searching
+                ? `${treeData.matchedCount}/${processes.length}`
+                : `${treeData.rows.length}/${processes.length}`}
             </span>
           </div>
+
+          {viewMode === "tree" && (
+            <>
+              <button
+                type="button"
+                disabled={searching || treeData.parentPids.length === 0}
+                onClick={expandAll}
+                title="Развернуть все ветки процессов"
+                className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-[#202B38] bg-[#10151D] px-3 py-2 text-xs font-medium text-[#8292A3] transition-colors hover:border-[#00D5E8]/35 hover:text-[#E5EDF5] disabled:cursor-not-allowed disabled:opacity-45"
+              >
+                <ChevronsUpDown size={13} />
+                Развернуть
+              </button>
+
+              <button
+                type="button"
+                disabled={searching || expandedPids.size === 0}
+                onClick={collapseAll}
+                title="Свернуть все ветки процессов"
+                className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-[#202B38] bg-[#10151D] px-3 py-2 text-xs font-medium text-[#8292A3] transition-colors hover:border-[#00D5E8]/35 hover:text-[#E5EDF5] disabled:cursor-not-allowed disabled:opacity-45"
+              >
+                <ChevronsDownUp size={13} />
+                Свернуть
+              </button>
+            </>
+          )}
+
           <button
             type="button"
             onClick={() => void fetchProcesses()}
-            className="inline-flex items-center justify-center gap-2 rounded-lg border border-[#222b38] bg-[#111722] px-3 py-2 text-xs font-medium text-slate-200 hover:bg-[#151c27]"
+            className="cyber-btn inline-flex cursor-pointer items-center justify-center gap-2 px-3.5 py-2 text-xs font-medium text-[#00D5E8]"
           >
             <RefreshCw size={13} className={processLoading ? "animate-spin" : ""} />
-            Обновить список
+            Обновить
           </button>
-          <span
-            className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-2 text-[11px] ${
+
+          <button
+            type="button"
+            onClick={() => setProcessAutoRefresh((prev) => !prev)}
+            title={processAutoRefresh ? "Приостановить автообновление" : "Возобновить автообновление"}
+            className={`inline-flex cursor-pointer items-center gap-1.5 rounded-lg border px-3 py-2 font-mono text-[11px] font-medium transition-colors ${
               processAutoRefresh
-                ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-400"
-                : "border-[#222b38] bg-[#151c27] text-slate-400"
+                ? "border-[#00D5E8]/30 bg-[#00D5E8]/10 text-[#00D5E8] hover:border-[#00D5E8]/50"
+                : "border-[#202B38] bg-[#10151D] text-[#8292A3] hover:text-[#E5EDF5]"
             }`}
           >
-            <span className={`h-1.5 w-1.5 rounded-full ${processAutoRefresh ? "bg-emerald-400" : "bg-slate-500"}`} />
-            {processAutoRefresh ? "Автообновление" : "Пауза"}
-          </span>
+            <span
+              className={`h-1.5 w-1.5 rounded-full ${
+                processAutoRefresh ? "bg-[#00D5E8] shadow-[0_0_6px_rgba(0,213,232,0.8)]" : "bg-[#526170]"
+              }`}
+            />
+            {processAutoRefresh ? "АВТООПРОС" : "ПАУЗА"}
+          </button>
         </div>
 
         <AnimatePresence>
@@ -166,10 +372,10 @@ export function ProcessModule({ c }: { c: NexusController }) {
               initial={{ opacity: 0, y: -6 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -6 }}
-              className="flex items-center justify-between gap-3 rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300"
+              className="flex items-center justify-between gap-3 rounded-xl border border-rose-500/35 bg-rose-500/12 px-4 py-2.5 text-xs text-rose-300"
             >
               <span>{processError}</span>
-              <button type="button" onClick={() => setProcessError(null)} className="shrink-0">
+              <button type="button" onClick={() => setProcessError(null)} className="shrink-0 cursor-pointer">
                 <X size={13} />
               </button>
             </motion.div>
@@ -179,54 +385,119 @@ export function ProcessModule({ c }: { c: NexusController }) {
               initial={{ opacity: 0, y: -6 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -6 }}
-              className="truncate rounded-xl border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-xs text-sky-300"
+              className="truncate rounded-xl border border-[#00D5E8]/35 bg-[#00D5E8]/12 px-4 py-2.5 text-xs text-[#00D5E8]"
             >
               {processNotice}
             </motion.div>
           )}
         </AnimatePresence>
 
-        <div className="overflow-hidden rounded-xl border border-[#222b38] bg-[#111722]">
-          <div className="grid grid-cols-[minmax(0,1.6fr)_90px_150px_120px_120px] gap-3 border-b border-[#222b38] bg-[#151c27] px-4 py-2.5">
-            {header("name", "Имя процесса")}
+        <div className="tactical-card tactical-brackets overflow-x-auto rounded-xl">
+          <div className="min-w-[554px]">
+          <div className="grid grid-cols-[minmax(140px,1.7fr)_56px_78px_90px_118px] gap-2.5 border-b border-[#202B38] bg-[#0B0E14] px-4 py-2.5 lg:grid-cols-[minmax(0,1.7fr)_90px_150px_150px_122px] lg:gap-3 xl:grid-cols-[minmax(200px,2.2fr)_88px_72px_92px_136px_136px_122px]">
+            {header("name", "Процесс")}
             {header("pid", "PID")}
-            {header("cpu", "CPU %", true)}
-            {header("memory", "Память (RAM)", true)}
-            <span className="text-right text-[11px] font-medium text-slate-400">Действия</span>
+            <div className="hidden text-right xl:flex xl:justify-end">
+              {header("threads", "Потоки", true)}
+            </div>
+            <div className="hidden text-right xl:flex xl:justify-end">
+              {header("handles", "Дескрипторы", true)}
+            </div>
+            {header("cpu", "Нагрузка CPU", true)}
+            {header("memory", "Память RAM", true)}
+            <span className="text-right text-xs font-medium text-[#8292A3]">Управление</span>
           </div>
 
           <div
             onScroll={() => setProcessMenu(null)}
-            className="max-h-[calc(100vh-340px)] min-h-[240px] divide-y divide-[#222b38] overflow-y-auto"
+            className="max-h-[calc(100vh-310px)] min-h-[260px] divide-y divide-[#202B38]/60 overflow-y-auto"
           >
             {processLoading && processes.length === 0 ? (
-              <div className="flex items-center justify-center gap-2 p-10 text-xs text-slate-400">
-                <Loader2 size={14} className="animate-spin text-sky-400" />
-                Чтение списка процессов...
+              <div className="flex items-center justify-center gap-2 p-12 text-xs text-[#8292A3]">
+                <Loader2 size={15} className="animate-spin text-[#00D5E8]" />
+                Построение дерева процессов…
               </div>
-            ) : visibleProcesses.length === 0 ? (
-              <div className="flex flex-col items-center gap-2 p-10 text-sm text-slate-400">
-                <Search size={18} />
-                {searching ? "Процесс не найден" : "Список процессов пуст"}
+            ) : displayRows.length === 0 ? (
+              <div className="flex flex-col items-center gap-2 p-12 text-sm text-[#8292A3]">
+                <Search size={18} className="text-[#526170]" />
+                {searching ? "По заданному фильтру процессы не найдены" : "Список процессов пуст"}
               </div>
             ) : (
-              visibleProcesses.map((proc) => {
+              displayRows.map((row) => {
+                const proc = row.process;
                 const isSelected = selectedPid === proc.pid;
                 const isSuspended = suspendedPids.includes(proc.pid);
+                const isShell = proc.name.toLowerCase() === "explorer.exe";
+                const diskBytesPerSec = proc.disk_read_bytes_sec + proc.disk_write_bytes_sec;
                 const tone = cpuTone(proc.cpu_usage);
+                const ramPct = Math.min(100, Math.max(2, (proc.memory_mb / (totalRamMb * 0.25)) * 100));
+                const visualDepth = Math.min(row.depth, 7);
+
                 return (
                   <div
                     key={proc.pid}
                     onClick={() => setSelectedPid(proc.pid)}
+                    onDoubleClick={() => void openProcessDetails(proc)}
                     onContextMenu={(event) => handleProcessContextMenu(event, proc)}
-                    className={`grid grid-cols-[minmax(0,1.6fr)_90px_150px_120px_120px] items-center gap-3 px-4 py-2.5 text-xs ${
-                      isSelected ? "bg-sky-500/10" : isSuspended ? "bg-cyan-500/5" : "hover:bg-[#151c27]"
+                    className={`grid grid-cols-[minmax(140px,1.7fr)_56px_78px_90px_118px] items-center gap-2.5 px-4 py-2 text-xs transition-colors lg:grid-cols-[minmax(0,1.7fr)_90px_150px_150px_122px] lg:gap-3 xl:grid-cols-[minmax(200px,2.2fr)_88px_72px_92px_136px_136px_122px] ${
+                      isSelected
+                        ? "bg-[#00D5E8]/12"
+                        : isSuspended
+                        ? "bg-amber-500/5"
+                        : row.matchedSelf
+                        ? "bg-[#00D5E8]/[0.04]"
+                        : "hover:bg-[#151C26]/65"
                     }`}
                   >
-                    <div className="flex min-w-0 items-center gap-2">
-                      <div className="flex h-4 w-4 shrink-0 items-center justify-center overflow-hidden text-slate-500">
+                    <div className="flex min-w-0 items-center">
+                      {visualDepth > 0 && (
+                        <div className="flex h-7 shrink-0 items-stretch" aria-hidden>
+                          {row.ancestorHasNext.slice(0, visualDepth - 1).map((hasLine, colIdx) => (
+                            <div
+                              key={colIdx}
+                              className="flex w-[16px] justify-center"
+                            >
+                              {hasLine && <span className="h-full w-px bg-[#202B38]" />}
+                            </div>
+                          ))}
+                          <div className="relative flex w-[16px] items-center justify-center">
+                            <span
+                              className={`absolute left-1/2 top-0 w-px -translate-x-1/2 bg-[#202B38] ${
+                                row.isLastChild ? "h-1/2" : "h-full"
+                              }`}
+                            />
+                            <span className="absolute left-1/2 top-1/2 h-px w-1/2 bg-[#202B38]" />
+                          </div>
+                        </div>
+                      )}
+
+                      {viewMode === "tree" && (
+                        row.hasChildren ? (
+                          <button
+                            type="button"
+                            aria-expanded={row.isExpanded}
+                            aria-label={row.isExpanded ? "Свернуть ветку" : "Развернуть ветку"}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              toggleExpand(proc.pid);
+                            }}
+                            className="mr-1.5 flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-[#202B38]/80 bg-[#0B0E14] text-[#8292A3] transition-colors hover:border-[#00D5E8]/45 hover:text-[#00D5E8]"
+                          >
+                            <ChevronRight
+                              size={12}
+                              className={`transition-transform duration-150 ${
+                                row.isExpanded ? "rotate-90 text-[#00D5E8]" : ""
+                              }`}
+                            />
+                          </button>
+                        ) : (
+                          <span className="mr-1.5 inline-block h-5 w-5 shrink-0" />
+                        )
+                      )}
+
+                      <div className="mr-2 flex h-6 w-6 shrink-0 items-center justify-center rounded border border-[#202B38] bg-[#0B0E14] text-[#8292A3]">
                         {isSuspended ? (
-                          <Pause size={11} className="text-cyan-300" />
+                          <Pause size={12} className="text-amber-300" />
                         ) : proc.icon_base64 ? (
                           <img
                             src={`data:image/png;base64,${proc.icon_base64}`}
@@ -235,35 +506,137 @@ export function ProcessModule({ c }: { c: NexusController }) {
                             className="h-4 w-4 object-contain"
                           />
                         ) : (
-                          <AppWindow size={12} />
+                          <AppWindow size={13} />
                         )}
                       </div>
-                      <div className="min-w-0">
-                        <div className="truncate font-semibold text-slate-100" title={proc.exe_path || proc.name}>
-                          {proc.name}
+
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span
+                            className={`truncate font-semibold ${
+                              row.matchedSelf ? "text-[#00D5E8]" : "text-[#E5EDF5]"
+                            }`}
+                            title={proc.exe_path || proc.name}
+                          >
+                            {proc.name}
+                          </span>
+                          {isShell && (
+                            <span
+                              className="shrink-0 rounded border border-[#202B38] bg-[#151C26] px-1.5 py-0.2 font-mono text-[9px] text-[#36AFC0]"
+                              title="Системная оболочка рабочего стола, панели задач и трея Windows"
+                            >
+                              Оболочка Windows
+                            </span>
+                          )}
+                          {row.hasChildren && (
+                            <span
+                              className="shrink-0 rounded border border-[#202B38] bg-[#0B0E14] px-1.5 py-0.2 font-mono text-[10px] text-[#8292A3]"
+                              title="Непосредственные дочерние процессы (Direct Children)"
+                            >
+                              {row.directChildCount} прям.
+                            </span>
+                          )}
+                          {row.totalDescendants > row.directChildCount && (
+                            <span
+                              className="shrink-0 rounded border border-[#202B38]/80 bg-[#0B0E14] px-1.5 py-0.2 font-mono text-[10px] text-[#526170]"
+                              title="Всего потомков на всех уровнях вложенности (Total Descendants)"
+                            >
+                              {row.totalDescendants} в ветке
+                            </span>
+                          )}
+                          {isSuspended && (
+                            <span className="shrink-0 rounded border border-amber-500/30 bg-amber-500/10 px-1 py-0.2 font-mono text-[9px] text-amber-300">
+                              ПАУЗА
+                            </span>
+                          )}
                         </div>
-                        <div className="font-mono text-[10px] text-slate-500">PID {proc.pid}</div>
+                        <div className="truncate font-mono text-[10px] text-[#526170]">
+                          {proc.exe_path ||
+                            (proc.parent_pid && proc.parent_pid !== 0
+                              ? `PPID ${proc.parent_pid}`
+                              : `PID ${proc.pid}`)}
+                          {proc.thread_count > 0 ? (
+                            <span className="xl:hidden">
+                              {` · Потоки: ${proc.thread_count}${
+                                proc.handle_count > 0 ? ` · Дескр.: ${proc.handle_count}` : ""
+                              }`}
+                            </span>
+                          ) : null}
+                          {diskBytesPerSec > 0 ? ` · Диск: ${formatRate(diskBytesPerSec)}` : ""}
+                        </div>
                       </div>
                     </div>
-                    <div className="font-mono text-slate-300">{proc.pid}</div>
-                    <div className="text-right">
-                      <div className={`font-mono font-medium ${tone.text}`}>{proc.cpu_usage.toFixed(1)}%</div>
-                      <div className="mt-1 ml-auto h-1 w-16 overflow-hidden rounded-full bg-[#151c27]">
+
+                    <div className="min-w-0 font-mono text-[#8292A3]">
+                      <div>{proc.pid}</div>
+                      {proc.parent_pid != null && proc.parent_pid !== 0 && (
+                        <div className="hidden truncate text-[10px] text-[#526170] xl:block">
+                          PPID {proc.parent_pid}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="hidden min-w-0 text-right font-mono text-[#8292A3] xl:block">
+                      {proc.thread_count > 0 ? proc.thread_count : "—"}
+                    </div>
+
+                    <div className="hidden min-w-0 text-right font-mono text-[#8292A3] xl:block">
+                      {proc.handle_count > 0
+                        ? proc.handle_count.toLocaleString("ru-RU")
+                        : "—"}
+                    </div>
+
+                    <div className="min-w-0 text-right">
+                      <div className={`font-mono ${tone.text}`}>{proc.cpu_usage.toFixed(1)}%</div>
+                      <div className="mt-1 ml-auto h-1.5 w-16 overflow-hidden rounded-full bg-[#0B0E14] lg:w-24">
                         <div
-                          className={`h-full rounded-full ${tone.bar}`}
+                          className={`h-full rounded-full transition-all duration-300 ${tone.bar}`}
                           style={{ width: `${Math.min(100, proc.cpu_usage)}%` }}
                         />
                       </div>
+                      {row.hasChildren && (
+                        <div className="mt-0.5 font-mono text-[10px] text-[#526170]">
+                          ветка: {row.subtreeCpu.toFixed(1)}%
+                        </div>
+                      )}
                     </div>
-                    <div className="text-right font-mono text-slate-200">{formatRam(proc.memory_mb)}</div>
-                    <div className="flex justify-end">
+
+                    <div className="min-w-0 text-right">
+                      <div className="font-mono font-medium text-[#E5EDF5]">
+                        {formatRam(proc.memory_mb)}
+                      </div>
+                      <div className="mt-1 ml-auto h-1.5 w-16 overflow-hidden rounded-full bg-[#0B0E14] lg:w-24">
+                        <div
+                          className="h-full rounded-full bg-gradient-to-r from-[#36AFC0] to-indigo-400 transition-all duration-300"
+                          style={{ width: `${ramPct}%` }}
+                        />
+                      </div>
+                      {row.hasChildren && (
+                        <div className="mt-0.5 font-mono text-[10px] text-[#526170]">
+                          ветка: {formatRam(row.subtreeMemoryMb)}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="flex justify-end gap-1">
+                      <button
+                        type="button"
+                        title="Свойства процесса"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void openProcessDetails(proc);
+                        }}
+                        className="hidden h-7 w-7 cursor-pointer items-center justify-center rounded-lg border border-transparent text-[#526170] transition-colors hover:border-[#202B38] hover:bg-[#151C26] hover:text-[#00D5E8] sm:inline-flex"
+                      >
+                        <Info size={13} />
+                      </button>
                       <button
                         type="button"
                         onClick={(event) => {
                           event.stopPropagation();
-                          requestKill(proc);
+                          requestKill(proc, false);
                         }}
-                        className="inline-flex items-center gap-1.5 rounded-lg border border-transparent px-2 py-1 text-[11px] text-slate-400 transition-colors hover:bg-rose-500/20 hover:text-rose-300"
+                        className="inline-flex cursor-pointer items-center gap-1 whitespace-nowrap rounded-lg border border-transparent px-2 py-1 text-[11px] font-medium text-[#8292A3] transition-colors hover:border-rose-500/35 hover:bg-rose-500/12 hover:text-rose-300 lg:px-2.5"
                       >
                         <XCircle size={13} />
                         Завершить
@@ -274,6 +647,7 @@ export function ProcessModule({ c }: { c: NexusController }) {
               })
             )}
           </div>
+          </div>
         </div>
       </motion.div>
 
@@ -281,63 +655,83 @@ export function ProcessModule({ c }: { c: NexusController }) {
         {processMenu && (
           <motion.div
             key={`menu-${processMenu.process.pid}-${processMenu.x}-${processMenu.y}`}
-            initial={{ opacity: 0, scale: 0.94, y: -4 }}
+            initial={{ opacity: 0, scale: 0.95, y: -4 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.96, y: -2 }}
             transition={{ type: "spring", stiffness: 520, damping: 34 }}
             style={{ left: processMenu.x, top: processMenu.y, transformOrigin: "top left" }}
             onMouseDown={(event) => event.stopPropagation()}
             onContextMenu={(event) => event.preventDefault()}
-            className="fixed z-[100] w-64 rounded-xl border border-[#222b38] bg-[#111722] p-1.5 text-xs shadow-[0_18px_44px_rgba(0,0,0,0.85)]"
+            className="fixed z-[100] w-64 rounded-xl border border-[#202B38] bg-[#10151D] p-1.5 text-xs shadow-[0_18px_44px_rgba(0,0,0,0.85)]"
           >
-            <div className="mb-1 rounded-lg border border-[#222b38] bg-[#151c27] px-2.5 py-2">
-              <div className="truncate font-semibold text-slate-100">{processMenu.process.name}</div>
-              <div className="font-mono text-[10px] text-slate-500">
+            <div className="mb-1 rounded-lg border border-[#202B38] bg-[#0B0E14] px-2.5 py-2">
+              <div className="truncate font-semibold text-[#E5EDF5]">{processMenu.process.name}</div>
+              <div className="font-mono text-[10px] text-[#8292A3]">
                 PID {processMenu.process.pid} · {formatRam(processMenu.process.memory_mb)}
               </div>
             </div>
             <button
               type="button"
+              onClick={() => {
+                const proc = processMenu.process;
+                setProcessMenu(null);
+                void openProcessDetails(proc);
+              }}
+              className="flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[#E5EDF5] hover:bg-[#151C26]"
+            >
+              <Info size={14} className="shrink-0 text-[#00D5E8]" />
+              Свойства процесса
+            </button>
+            <button
+              type="button"
               onClick={() => void handleProcessOpenLocation(processMenu.process)}
               disabled={!processMenu.process.exe_path}
-              className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-slate-200 hover:bg-[#151c27] disabled:cursor-not-allowed disabled:text-slate-600"
+              className="flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[#E5EDF5] hover:bg-[#151C26] disabled:cursor-not-allowed disabled:text-[#526170]"
             >
-              <FolderOpen size={14} className="shrink-0 text-sky-400" />
+              <FolderOpen size={14} className="shrink-0 text-[#00D5E8]" />
               Открыть расположение файла
             </button>
             <button
               type="button"
               onClick={() => void handleProcessCopyPath(processMenu.process)}
-              className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-slate-200 hover:bg-[#151c27]"
+              className="flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[#E5EDF5] hover:bg-[#151C26]"
             >
-              <Copy size={14} className="shrink-0 text-slate-400" />
+              <Copy size={14} className="shrink-0 text-[#8292A3]" />
               Копировать путь
             </button>
-            <div className="my-1 h-px bg-[#222b38]" />
+            <div className="my-1 h-px bg-[#202B38]" />
             <button
               type="button"
               onClick={() => void handleProcessSuspendToggle(processMenu.process)}
-              className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-cyan-200 hover:bg-cyan-500/10"
+              className="flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[#00D5E8] hover:bg-[#00D5E8]/10"
             >
-              {menuProcessSuspended ? <Play size={14} className="shrink-0 text-cyan-400" /> : <Pause size={14} className="shrink-0 text-cyan-400" />}
-              {menuProcessSuspended ? "Возобновить процесс" : "Приостановить"}
+              {menuProcessSuspended ? (
+                <Play size={14} className="shrink-0 text-[#00D5E8]" />
+              ) : (
+                <Pause size={14} className="shrink-0 text-[#00D5E8]" />
+              )}
+              {menuProcessSuspended ? "Возобновить процесс" : "Приостановить процесс"}
             </button>
             <button
               type="button"
               onClick={() => {
                 const proc = processMenu.process;
                 setProcessMenu(null);
-                requestKill(proc);
+                requestKill(proc, false);
               }}
-              className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-rose-300 hover:bg-rose-500/15"
+              className="flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-rose-300 hover:bg-rose-500/15"
             >
               <XCircle size={14} className="shrink-0 text-rose-400" />
               Завершить процесс
             </button>
             <button
               type="button"
-              onClick={() => void handleProcessKill(processMenu.process, true)}
-              className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-rose-300 hover:bg-rose-500/15"
+              onClick={() => {
+                const proc = processMenu.process;
+                setProcessMenu(null);
+                requestKill(proc, true);
+              }}
+              className="flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-rose-300 hover:bg-rose-500/15"
             >
               <Trash2 size={14} className="shrink-0 text-rose-400" />
               Завершить дерево процессов
@@ -347,33 +741,199 @@ export function ProcessModule({ c }: { c: NexusController }) {
       </AnimatePresence>
 
       {pendingKill && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4">
-          <div className="w-full max-w-md rounded-xl border border-[#222b38] bg-[#111722] p-4 shadow-2xl">
-            <h3 className="text-base font-semibold text-slate-100">Системный процесс</h3>
-            <p className="mt-2 text-sm text-slate-300">
-              {pendingKill.name} (PID <span className="font-mono">{pendingKill.pid}</span>) — критический системный процесс.
-              Завершение может нарушить работу Windows. Продолжить?
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-md rounded-xl border border-[#202B38] bg-[#10151D] p-5 shadow-2xl">
+            <h3 className="text-base font-semibold text-[#E5EDF5]">
+              {pendingKill.tree ? "Завершение дерева процессов" : "Системный процесс"}
+            </h3>
+            <p className="mt-2 text-sm text-[#8292A3]">
+              <span className="font-semibold text-[#E5EDF5]">{pendingKill.proc.name}</span> (PID{" "}
+              <span className="font-mono text-[#00D5E8]">{pendingKill.proc.pid}</span>)
+              {pendingKill.isCritical
+                ? " относится к критическим службам Windows. "
+                : " "}
+              {pendingKill.tree && pendingKill.totalDescendants > 0
+                ? `Будут принудительно завершены прямые дочерние процессы (${pendingKill.directCount}) и все вложенные потомки ветки (всего ${pendingKill.totalDescendants} шт.).`
+                : "Принудительное завершение может вызвать нестабильность системы."}
             </p>
             <div className="mt-4 flex justify-end gap-2">
               <button
                 type="button"
                 onClick={() => setPendingKill(null)}
-                className="rounded-lg border border-[#222b38] bg-[#151c27] px-3 py-2 text-xs font-medium text-slate-300 hover:bg-[#1a2332]"
+                className="cursor-pointer rounded-lg border border-[#202B38] bg-[#151C26] px-3.5 py-2 text-xs font-medium text-[#8292A3] hover:text-[#E5EDF5]"
               >
                 Отмена
               </button>
               <button
                 type="button"
                 onClick={() => {
-                  const proc = pendingKill;
+                  const item = pendingKill;
                   setPendingKill(null);
-                  void handleProcessKill(proc, false);
+                  void handleProcessKill(item.proc, item.tree);
                 }}
-                className="rounded-lg border border-rose-500/30 bg-rose-500/20 px-3 py-2 text-xs font-medium text-rose-300 hover:bg-rose-500/30"
+                className="cyber-btn-danger cursor-pointer px-3.5 py-2 text-xs font-semibold text-rose-300"
               >
-                Завершить
+                {pendingKill.tree ? "Завершить дерево" : "Принудительно завершить"}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {detailsModal && (
+        <div
+          onClick={() => setDetailsModal(null)}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-xs"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="tactical-card tactical-brackets w-full max-w-xl rounded-xl p-5 shadow-2xl"
+          >
+            <div className="flex items-start justify-between gap-3 border-b border-[#202B38] pb-3">
+              <div className="min-w-0">
+                <h3 className="truncate text-base font-semibold text-[#E5EDF5]">
+                  {detailsModal.data?.name ?? detailsModal.fallbackProc.name}
+                </h3>
+                <div className="mt-0.5 font-mono text-xs text-[#8292A3]">
+                  PID {detailsModal.fallbackProc.pid}
+                  {detailsModal.fallbackProc.parent_pid != null &&
+                  detailsModal.fallbackProc.parent_pid !== 0
+                    ? ` · PPID ${detailsModal.fallbackProc.parent_pid}`
+                    : ""}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDetailsModal(null)}
+                className="cursor-pointer rounded-lg border border-[#202B38] bg-[#0B0E14] p-1.5 text-[#8292A3] hover:text-[#E5EDF5]"
+              >
+                <X size={14} />
+              </button>
+            </div>
+
+            {detailsModal.loading ? (
+              <div className="flex items-center justify-center gap-2 py-10 text-xs text-[#8292A3]">
+                <Loader2 size={15} className="animate-spin text-[#00D5E8]" />
+                Загрузка параметров процесса…
+              </div>
+            ) : detailsModal.error ? (
+              <div className="mt-4 rounded-lg border border-rose-500/35 bg-rose-500/12 p-3 text-xs text-rose-300">
+                {detailsModal.error}
+              </div>
+            ) : detailsModal.data ? (
+              <div className="mt-3 space-y-3 text-xs">
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                  <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] px-3 py-2">
+                    <div className="text-[10px] text-[#526170]">Состояние</div>
+                    <div className="mt-0.5 font-mono font-semibold text-[#00D5E8]">
+                      {detailsModal.data.status}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] px-3 py-2">
+                    <div className="text-[10px] text-[#526170]">Память (RAM / Virt)</div>
+                    <div className="mt-0.5 font-mono font-semibold text-[#E5EDF5]">
+                      {formatRam(detailsModal.data.memory_mb)} /{" "}
+                      {formatRam(detailsModal.data.virtual_memory_mb)}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] px-3 py-2">
+                    <div className="text-[10px] text-[#526170]">Время работы</div>
+                    <div className="mt-0.5 font-mono font-semibold text-[#E5EDF5]">
+                      {formatUptime(detailsModal.data.run_time_sec)}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] px-3 py-2">
+                    <div className="text-[10px] text-[#526170]">Потоки (Threads)</div>
+                    <div className="mt-0.5 font-mono font-semibold text-[#E5EDF5]">
+                      {detailsModal.data.thread_count > 0 ? detailsModal.data.thread_count : "—"}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] px-3 py-2">
+                    <div className="text-[10px] text-[#526170]">Дескрипторы (Handles)</div>
+                    <div className="mt-0.5 font-mono font-semibold text-[#E5EDF5]">
+                      {detailsModal.data.handle_count > 0
+                        ? detailsModal.data.handle_count.toLocaleString("ru-RU")
+                        : "—"}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] px-3 py-2">
+                    <div className="text-[10px] text-[#526170]">Время запуска</div>
+                    <div className="mt-0.5 truncate font-mono font-semibold text-[#E5EDF5]">
+                      {formatStartTime(detailsModal.data.start_time)}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] p-3 space-y-2">
+                  <div className="flex justify-between gap-3">
+                    <span className="shrink-0 text-[#8292A3]">Родитель</span>
+                    <span className="truncate font-mono text-[#E5EDF5]">
+                      {detailsModal.data.parent_name
+                        ? `${detailsModal.data.parent_name} (PID ${detailsModal.data.parent_pid})`
+                        : detailsModal.data.parent_pid
+                        ? `PID ${detailsModal.data.parent_pid}`
+                        : "Корневой процесс"}
+                    </span>
+                  </div>
+                  <div className="flex justify-between gap-3">
+                    <span className="shrink-0 text-[#8292A3]">Прямых дочерних (Direct)</span>
+                    <span className="font-mono text-[#E5EDF5]">
+                      {detailsModal.data.child_count}
+                    </span>
+                  </div>
+                  <div className="flex justify-between gap-3">
+                    <span className="shrink-0 text-[#8292A3]">Всего потомков (Total)</span>
+                    <span className="font-mono text-[#E5EDF5]">
+                      {detailsModal.data.total_descendants ?? detailsModal.data.child_count}
+                    </span>
+                  </div>
+                  <div>
+                    <div className="text-[#8292A3]">Исполняемый файл</div>
+                    <div className="mt-1 break-all rounded border border-[#202B38]/70 bg-[#10151D] px-2.5 py-1.5 font-mono text-[11px] text-[#E5EDF5]">
+                      {detailsModal.data.exe_path || "Системный процесс / недоступен"}
+                    </div>
+                  </div>
+                  {detailsModal.data.working_dir && (
+                    <div>
+                      <div className="text-[#8292A3]">Рабочая директория</div>
+                      <div className="mt-1 break-all rounded border border-[#202B38]/70 bg-[#10151D] px-2.5 py-1.5 font-mono text-[11px] text-[#8292A3]">
+                        {detailsModal.data.working_dir}
+                      </div>
+                    </div>
+                  )}
+                  {detailsModal.data.command_line && (
+                    <div>
+                      <div className="text-[#8292A3]">Командная строка</div>
+                      <div className="mt-1 max-h-24 overflow-y-auto break-all rounded border border-[#202B38]/70 bg-[#10151D] px-2.5 py-1.5 font-mono text-[11px] text-[#8292A3]">
+                        {detailsModal.data.command_line}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex flex-wrap justify-end gap-2">
+                  {detailsModal.data.command_line && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void copyTextToClipboard(detailsModal.data!.command_line);
+                        showProcessNotice("Командная строка скопирована");
+                      }}
+                      className="cursor-pointer rounded-lg border border-[#202B38] bg-[#151C26] px-3 py-1.5 text-xs font-medium text-[#8292A3] hover:text-[#E5EDF5]"
+                    >
+                      Копировать команду
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setDetailsModal(null)}
+                    className="cyber-btn cursor-pointer px-3.5 py-1.5 text-xs font-medium text-[#00D5E8]"
+                  >
+                    Закрыть
+                  </button>
+                </div>
+              </div>
+            ) : null}
           </div>
         </div>
       )}

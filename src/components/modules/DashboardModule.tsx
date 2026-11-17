@@ -1,19 +1,19 @@
-import { useEffect, useState } from "react";
-import { HardDrive, Power, Trash2 } from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
+import { Cpu, Gauge, HardDrive, MemoryStick, Power, Terminal, Trash2 } from "lucide-react";
 import { motion } from "framer-motion";
 import { invoke } from "@tauri-apps/api/core";
-import { LoadHistoryChart, SegmentedHudBar } from "../../lib/studio";
+import { LoadHistoryChart, PageHeader, SegmentedHudBar } from "../../lib/studio";
 import type { NexusController } from "../../hooks/useNexusController";
 
 function pingTone(pingMs: number): { value: string; label: string; className: string } {
   if (!Number.isFinite(pingMs) || pingMs <= 0 || pingMs >= 999) {
-    return { value: "—", label: "Нет связи", className: "text-slate-400" };
+    return { value: "—", label: "Нет ответа", className: "text-[#8292A3]" };
   }
   if (pingMs <= 80) {
     return {
       value: `${pingMs}`,
       label: pingMs <= 40 ? "Отлично" : "Норма",
-      className: "text-emerald-400",
+      className: "text-[#00D5E8]",
     };
   }
   if (pingMs <= 120) {
@@ -24,13 +24,13 @@ function pingTone(pingMs: number): { value: string; label: string; className: st
 
 function PingSpark({ samples }: { samples: number[] }) {
   if (samples.length < 2) {
-    return <div className="mt-3 h-9 font-mono text-[11px] text-slate-500">TELEMETRY SYNC…</div>;
+    return <div className="mt-2 h-7 font-mono text-[11px] text-[#526170]">Ожидание замеров канала…</div>;
   }
   const min = Math.min(...samples);
   const max = Math.max(...samples);
   const span = Math.max(8, max - min);
   const width = 240;
-  const height = 36;
+  const height = 28;
   const coords = samples.map((value, index) => {
     const x = (index / (samples.length - 1)) * width;
     const y = height - ((value - min) / span) * (height - 8) - 4;
@@ -41,15 +41,15 @@ function PingSpark({ samples }: { samples: number[] }) {
     .join(" ");
   const area = `${line} L${width},${height} L0,${height} Z`;
   return (
-    <svg viewBox={`0 0 ${width} ${height}`} className="mt-3 h-9 w-full overflow-visible" aria-hidden>
+    <svg viewBox={`0 0 ${width} ${height}`} className="mt-2 h-7 w-full overflow-visible" aria-hidden>
       <defs>
         <linearGradient id="pingAreaGrad" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="#00F0FF" stopOpacity="0.28" />
-          <stop offset="100%" stopColor="#6366f1" stopOpacity="0" />
+          <stop offset="0%" stopColor="#00D5E8" stopOpacity="0.24" />
+          <stop offset="100%" stopColor="#36AFC0" stopOpacity="0" />
         </linearGradient>
         <linearGradient id="pingLineGrad" x1="0" y1="0" x2={width} y2="0" gradientUnits="userSpaceOnUse">
-          <stop offset="0%" stopColor="#00F0FF" />
-          <stop offset="100%" stopColor="#6366f1" />
+          <stop offset="0%" stopColor="#00D5E8" />
+          <stop offset="100%" stopColor="#36AFC0" />
         </linearGradient>
       </defs>
       <path d={area} fill="url(#pingAreaGrad)" />
@@ -57,18 +57,17 @@ function PingSpark({ samples }: { samples: number[] }) {
         d={line}
         fill="none"
         stroke="url(#pingLineGrad)"
-        strokeWidth="1.8"
+        strokeWidth="1.75"
         strokeLinejoin="round"
         strokeLinecap="round"
-        style={{ filter: "drop-shadow(0 0 6px rgba(0, 240, 255, 0.45))" }}
       />
     </svg>
   );
 }
 
 function MiniTrendSpark({ values, highLoad }: { values: number[]; highLoad: boolean }) {
-  const safe = values.length >= 2 ? values : [20, 26, 22, 30, 28, 34];
-  const w = 52;
+  const safe = values.length >= 2 ? values : [values[0] ?? 0, values[0] ?? 0];
+  const w = 48;
   const h = 16;
   const line = safe
     .map((val, idx) => {
@@ -83,15 +82,10 @@ function MiniTrendSpark({ values, highLoad }: { values: number[]; highLoad: bool
       <path
         d={line}
         fill="none"
-        stroke={highLoad ? "#f43f5e" : "#00F0FF"}
+        stroke={highLoad ? "#f43f5e" : "#00D5E8"}
         strokeWidth="1.5"
         strokeLinecap="round"
         strokeLinejoin="round"
-        style={{
-          filter: highLoad
-            ? "drop-shadow(0 0 5px rgba(244,63,94,0.6))"
-            : "drop-shadow(0 0 5px rgba(0,240,255,0.55))",
-        }}
       />
     </svg>
   );
@@ -99,46 +93,61 @@ function MiniTrendSpark({ values, highLoad }: { values: number[]; highLoad: bool
 
 function MetricCard({
   label,
+  icon,
   value,
+  subValue,
   detail,
   percent,
-  theme,
-  badgeLabel,
+  badgeText,
+  badgeTone = "normal",
   sparkValues,
 }: {
   label: string;
+  icon: ReactNode;
   value: string;
+  subValue?: string;
   detail: string;
   percent: number;
-  theme?: "emerald" | "cyan";
-  badgeLabel?: "REALTIME" | "STABLE" | "HIGH LOAD";
+  badgeText: string;
+  badgeTone?: "normal" | "warn" | "critical";
   sparkValues?: number[];
 }) {
-  const resolvedBadge = badgeLabel ?? (percent >= 80 ? "HIGH LOAD" : percent >= 45 ? "REALTIME" : "STABLE");
-  const isHigh = resolvedBadge === "HIGH LOAD";
+  const isHigh = badgeTone === "critical";
+  const badgeClasses =
+    badgeTone === "critical"
+      ? "border-rose-500/35 bg-rose-500/12 text-rose-300"
+      : badgeTone === "warn"
+      ? "border-amber-500/35 bg-amber-500/12 text-amber-300"
+      : "border-[#00D5E8]/30 bg-[#00D5E8]/10 text-[#00D5E8]";
 
   return (
-    <div className="tactical-card tactical-brackets flex min-w-0 flex-col justify-between gap-3 rounded-xl p-4">
-      <div className="flex items-start justify-between gap-2">
-        <div className="font-mono text-xs font-semibold uppercase tracking-wider text-slate-400">{label}</div>
+    <div className="tactical-card tactical-brackets flex min-w-0 flex-col justify-between gap-2.5 rounded-xl p-4">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-wider text-[#8292A3]">
+          <span className="text-[#00D5E8]">{icon}</span>
+          <span>{label}</span>
+        </div>
         <div className="flex items-center gap-2">
           {sparkValues && <MiniTrendSpark values={sparkValues} highLoad={isHigh} />}
-          <span
-            className={`rounded border px-1.5 py-0.5 font-mono text-[9px] font-bold tracking-widest ${
-              isHigh
-                ? "border-rose-500/40 bg-rose-500/15 text-rose-300 shadow-[0_0_10px_rgba(244,63,94,0.2)]"
-                : resolvedBadge === "REALTIME"
-                  ? "border-cyan-500/35 bg-cyan-500/12 text-cyan-300"
-                  : "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
-            }`}
-          >
-            {resolvedBadge}
+          <span className={`rounded border px-1.5 py-0.5 font-mono text-[10px] font-semibold tracking-wider ${badgeClasses}`}>
+            {badgeText}
           </span>
         </div>
       </div>
-      <div className="font-mono text-3xl font-bold tracking-tight text-white drop-shadow-sm">{value}</div>
-      <div className="truncate text-xs text-slate-400">{detail}</div>
-      <SegmentedHudBar percentage={percent} theme={theme} />
+
+      <div className="flex items-baseline justify-between gap-2">
+        <div className="font-mono text-2xl font-bold tracking-tight text-[#E5EDF5] xl:text-[26px]">
+          {value}
+        </div>
+        {subValue && (
+          <div className="font-mono text-xs font-medium text-[#8292A3]">{subValue}</div>
+        )}
+      </div>
+
+      <div className="truncate text-xs text-[#8292A3]" title={detail}>
+        {detail}
+      </div>
+      <SegmentedHudBar percentage={percent} theme="cyan" />
     </div>
   );
 }
@@ -185,142 +194,253 @@ export function DashboardModule({ c }: { c: NexusController }) {
   const ping = pingTone(gameRoute?.ping_ms ?? 0);
   const jitter = gameRoute ? gameRoute.jitter_ms : null;
   const stable = jitter !== null && jitter <= 7;
+
   const cpuName = hwData?.cpu.name?.trim();
+  const cpuTemp = hwData?.cpu.package_temp_c ?? hwData?.cpu.max_core_temp_c ?? null;
+  const cpuClockGhz =
+    hwData?.cpu.avg_clock_mhz != null ? (hwData.cpu.avg_clock_mhz / 1000).toFixed(2) : null;
+  const physCores = hwData?.cpu.physical_cores ?? 0;
+  const logCores = hwData?.cpu.logical_cores ?? 0;
   const coreCount = hwData?.cpu.core_temps.length ?? 0;
   const cpuDetail = cpuName
-    ? coreCount > 0
+    ? physCores > 0 && logCores > 0
+      ? `${cpuName} · ${physCores}Я/${logCores}П`
+      : coreCount > 0
       ? `${cpuName} · ${coreCount} ядер`
       : cpuName
-    : "Текущая загрузка процессора";
-  const linkLabel = isGatewayOnline ? "Шлюз доступен" : "Шлюз не отвечает";
+    : "Вычислительная нагрузка процессора";
+
+  const isHwPolled = hwData !== null;
+  const primaryGpu = hwData?.gpus[0] ?? null;
+  const gpuTemp = primaryGpu?.core_temp_c ?? primaryGpu?.hotspot_temp_c ?? null;
+  const gpuLoad = primaryGpu?.load_percent ?? null;
+  const gpuClock = primaryGpu?.core_clock_mhz ?? null;
+  const gpuPower = primaryGpu?.power_watts ?? null;
+  const gpuVramUsed = primaryGpu?.vram_used_mb ?? null;
+  const gpuVramTotal = primaryGpu?.vram_total_mb ?? null;
+  const gpuValue = !isHwPolled
+    ? "Опрос…"
+    : gpuTemp !== null
+    ? `${gpuTemp.toFixed(0)} °C`
+    : gpuLoad !== null
+    ? `${gpuLoad.toFixed(0)}%`
+    : gpuClock !== null
+    ? `${gpuClock.toFixed(0)} МГц`
+    : primaryGpu
+    ? "Обнаружен"
+    : "Не найден";
+  const gpuSubValue =
+    gpuTemp !== null && gpuLoad !== null
+      ? `${gpuLoad.toFixed(0)}%${gpuPower !== null ? ` · ${gpuPower.toFixed(0)} Вт` : ""}`
+      : gpuPower !== null
+      ? `${gpuPower.toFixed(0)} Вт`
+      : gpuClock !== null && gpuTemp !== null
+      ? `${gpuClock.toFixed(0)} МГц`
+      : gpuVramUsed !== null && gpuVramTotal !== null
+      ? `${(gpuVramUsed / 1024).toFixed(1)}/${(gpuVramTotal / 1024).toFixed(0)} ГБ`
+      : undefined;
+  const gpuDetail = !isHwPolled
+    ? "Подключение к датчикам GPU…"
+    : primaryGpu
+    ? [
+        primaryGpu.name?.trim() || "Графический ускоритель",
+        gpuVramUsed !== null && gpuVramTotal !== null
+          ? `VRAM ${(gpuVramUsed / 1024).toFixed(1)}/${(gpuVramTotal / 1024).toFixed(0)} ГБ`
+          : null,
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    : "Дискретный или DXGI-ускоритель не обнаружен";
+  const gpuPercent =
+    gpuLoad !== null
+      ? Math.min(100, Math.max(0, gpuLoad))
+      : gpuTemp !== null
+      ? Math.min(100, Math.max(12, ((gpuTemp - 25) / 70) * 100))
+      : primaryGpu?.fan_percent ?? 0;
+
+  const linkLabel = isGatewayOnline ? "Шлюз активен" : "Шлюз недоступен";
   const cpuSpark = history.slice(-12).map((h) => h.cpu);
   const ramSpark = history.slice(-12).map((h) => h.ram);
-  const netPercent = Math.min(100, (metrics.net_rx_kbps + metrics.net_tx_kbps) / 100);
 
   return (
     <motion.div
       key="dashboard"
-      initial={{ opacity: 0, y: 8 }}
+      initial={{ opacity: 0, y: 6 }}
       animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -6 }}
-      transition={{ duration: 0.18, ease: "easeOut" }}
-      className="w-full max-w-6xl"
+      exit={{ opacity: 0, y: -4 }}
+      transition={{ duration: 0.16, ease: "easeOut" }}
+      className="w-full space-y-4"
     >
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-        <div>
-          <div className="font-mono text-[10px] font-bold uppercase tracking-[0.2em] text-cyan-400/90">
-            SPECTRE // TACTICAL TELEMETRY
+      <PageHeader
+        title="Обзор системы"
+        description="Ключевые показатели вычислительных узлов, накопителей и сетевого канала в реальном времени"
+        actions={
+          <div
+            className={`inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 font-mono text-[11px] font-semibold ${
+              metricsReady
+                ? "border-[#00D5E8]/30 bg-[#00D5E8]/10 text-[#00D5E8]"
+                : "border-amber-500/35 bg-amber-500/12 text-amber-300"
+            }`}
+          >
+            <span
+              className={`h-1.5 w-1.5 rounded-full ${
+                metricsReady ? "bg-[#00D5E8] shadow-[0_0_6px_rgba(0,213,232,0.8)]" : "animate-pulse bg-amber-400"
+              }`}
+            />
+            {metricsReady ? "ТЕЛЕМЕТРИЯ АКТИВНА" : "ОПРОС ДАТЧИКОВ…"}
           </div>
-          <h2 className="mt-0.5 text-2xl font-bold tracking-tight text-slate-100">Обзор системы</h2>
-          <p className="mt-0.5 text-sm text-slate-400">Приборная панель контроля ресурсов в реальном времени</p>
-        </div>
-        <div
-          className={`inline-flex items-center gap-2 self-start rounded border px-3 py-1 font-mono text-[11px] font-bold tracking-wider ${
-            metricsReady
-              ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
-              : "border-amber-500/30 bg-amber-500/10 text-amber-300"
-          }`}
-        >
-          <span className={`h-1.5 w-1.5 rounded-full ${metricsReady ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]" : "animate-pulse bg-amber-400"}`} />
-          {metricsReady ? "CORE TELEMETRY: ACTIVE" : "INITIALIZING SENSORS..."}
-        </div>
-      </div>
+        }
+      />
 
       {!metricsReady ? (
-        <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-          {["cpu", "ram", "disk", "net"].map((key) => (
-            <div key={key} className="tactical-card h-36 animate-pulse rounded-xl" />
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          {["cpu", "gpu", "ram", "disk"].map((key) => (
+            <div key={key} className="tactical-card h-32 animate-pulse rounded-xl" />
           ))}
         </div>
       ) : (
-      <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <MetricCard
-          label="Процессор"
-          value={`${metrics.cpu_usage.toFixed(1)}%`}
-          detail={cpuDetail}
-          percent={metrics.cpu_usage}
-          badgeLabel={metrics.cpu_usage >= 80 ? "HIGH LOAD" : "REALTIME"}
-          sparkValues={cpuSpark}
-        />
-        <MetricCard
-          label="Память"
-          value={`${metrics.ram_used_gb.toFixed(1)} / ${metrics.ram_total_gb.toFixed(0)} GB`}
-          detail={`${metrics.ram_percentage.toFixed(0)}% занято`}
-          percent={metrics.ram_percentage}
-          theme="cyan"
-          badgeLabel={metrics.ram_percentage >= 85 ? "HIGH LOAD" : "STABLE"}
-          sparkValues={ramSpark}
-        />
-        <MetricCard
-          label="Системный накопитель"
-          value={`${metrics.disk_free_gb.toFixed(0)} GB`}
-          detail={`Свободно · ${diskUsedPercentage.toFixed(0)}% занято из ${metrics.disk_total_gb.toFixed(0)} GB`}
-          percent={diskUsedPercentage}
-          badgeLabel={diskUsedPercentage >= 90 ? "HIGH LOAD" : "STABLE"}
-        />
-        <MetricCard
-          label="Сетевая активность"
-          value={`↓ ${rxParts.value} ${rxParts.unit}`}
-          detail={`↑ ${txParts.value} ${txParts.unit} · ${linkLabel}`}
-          percent={netPercent}
-          theme="cyan"
-          badgeLabel="REALTIME"
-          sparkValues={gameSamples}
-        />
-      </div>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <MetricCard
+            label="Процессор (CPU)"
+            icon={<Cpu size={14} />}
+            value={`${metrics.cpu_usage.toFixed(1)}%`}
+            subValue={
+              cpuTemp !== null
+                ? `${cpuTemp.toFixed(0)} °C`
+                : cpuClockGhz !== null
+                ? `${cpuClockGhz} ГГц`
+                : undefined
+            }
+            detail={cpuDetail}
+            percent={metrics.cpu_usage}
+            badgeText={metrics.cpu_usage >= 85 ? "НАГРУЗКА" : "АКТИВЕН"}
+            badgeTone={metrics.cpu_usage >= 85 ? "critical" : metrics.cpu_usage >= 70 ? "warn" : "normal"}
+            sparkValues={cpuSpark}
+          />
+          <MetricCard
+            label="Видеокарта (GPU)"
+            icon={<Gauge size={14} />}
+            value={gpuValue}
+            subValue={gpuSubValue}
+            detail={gpuDetail}
+            percent={gpuPercent}
+            badgeText={
+              !isHwPolled
+                ? "ОЖИДАНИЕ"
+                : gpuTemp !== null && gpuTemp >= 82
+                ? "НАГРЕВ"
+                : primaryGpu
+                ? "НОРМА"
+                : "НЕТ ДАТЧИКА"
+            }
+            badgeTone={
+              gpuTemp !== null && gpuTemp >= 82
+                ? "critical"
+                : gpuTemp !== null && gpuTemp >= 72
+                ? "warn"
+                : "normal"
+            }
+          />
+          <MetricCard
+            label="Память (RAM)"
+            icon={<MemoryStick size={14} />}
+            value={`${metrics.ram_used_gb.toFixed(1)} ГБ`}
+            subValue={`из ${metrics.ram_total_gb.toFixed(0)} ГБ`}
+            detail={`Занято ${metrics.ram_percentage.toFixed(0)}% оперативной памяти`}
+            percent={metrics.ram_percentage}
+            badgeText={metrics.ram_percentage >= 88 ? "ДЕФИЦИТ" : "СТАБИЛЬНО"}
+            badgeTone={metrics.ram_percentage >= 88 ? "critical" : metrics.ram_percentage >= 75 ? "warn" : "normal"}
+            sparkValues={ramSpark}
+          />
+          <MetricCard
+            label="Накопитель (Диск)"
+            icon={<HardDrive size={14} />}
+            value={`${metrics.disk_free_gb.toFixed(0)} ГБ`}
+            subValue={`из ${metrics.disk_total_gb.toFixed(0)} ГБ`}
+            detail={`Свободно · Занято ${diskUsedPercentage.toFixed(0)}% системного тома`}
+            percent={diskUsedPercentage}
+            badgeText={diskUsedPercentage >= 90 ? "ЗАПОЛНЕН" : "НОРМА"}
+            badgeTone={diskUsedPercentage >= 90 ? "critical" : diskUsedPercentage >= 80 ? "warn" : "normal"}
+          />
+        </div>
       )}
 
-      <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-12">
+      <div className="grid grid-cols-1 gap-3 lg:grid-cols-12">
         <div className="min-w-0 lg:col-span-8">
           <LoadHistoryChart history={history} />
         </div>
 
-        <div className="flex min-w-0 flex-col gap-4 lg:col-span-4">
+        <div className="flex min-w-0 flex-col gap-3 lg:col-span-4">
           <div className="tactical-card tactical-brackets rounded-xl p-4">
             <div className="flex items-center justify-between">
-              <div className="font-mono text-xs font-semibold uppercase tracking-wider text-slate-400">
-                Сетевое подключение
+              <div className="text-xs font-semibold uppercase tracking-wider text-[#8292A3]">
+                Сетевой канал и маршруты
               </div>
-              <span className="rounded border border-cyan-500/30 bg-cyan-500/10 px-1.5 py-0.5 font-mono text-[9px] font-bold tracking-widest text-cyan-300">
-                NET PROBE
+              <span className="rounded border border-[#202B38] bg-[#151C26] px-2 py-0.5 font-mono text-[10px] font-medium text-[#00D5E8]">
+                {linkLabel}
               </span>
             </div>
-            <div className="mt-3 flex items-end justify-between gap-3">
+
+            <div className="mt-2.5 grid grid-cols-2 gap-2 rounded-lg border border-[#202B38] bg-[#0B0E14] px-3 py-2">
               <div>
-                <div className={`font-mono text-2xl font-bold tracking-tight ${ping.className}`}>
-                  {ping.value === "—" ? "—" : `${ping.value} ms`}
+                <div className="text-[11px] text-[#8292A3]">Приём (RX)</div>
+                <div className="font-mono text-sm font-semibold text-[#00D5E8]">
+                  ↓ {rxParts.value} {rxParts.unit}
                 </div>
-                <div className="mt-1 text-xs text-slate-500">Москва · {ping.label}</div>
               </div>
-              <div className="text-right">
-                <div className="font-mono text-sm font-bold text-slate-100">
-                  {jitter === null ? "—" : `±${jitter} ms`}
-                </div>
-                <div
-                  className={`mt-1 font-mono text-[11px] ${
-                    jitter === null ? "text-slate-500" : stable ? "text-emerald-300" : "text-amber-300"
-                  }`}
-                >
-                  {jitter === null ? "Сбор данных" : stable ? "STABLE LINK" : "JITTER DETECTED"}
+              <div className="border-l border-[#202B38] pl-3">
+                <div className="text-[11px] text-[#8292A3]">Отдача (TX)</div>
+                <div className="font-mono text-sm font-semibold text-[#E5EDF5]">
+                  ↑ {txParts.value} {txParts.unit}
                 </div>
               </div>
             </div>
+
+            <div className="mt-2.5 flex items-end justify-between gap-3">
+              <div>
+                <div className={`font-mono text-lg font-bold tracking-tight ${ping.className}`}>
+                  {ping.value === "—" ? "—" : `${ping.value} мс`}
+                </div>
+                <div className="text-xs text-[#8292A3]">Москва · {ping.label}</div>
+              </div>
+              <div className="text-right">
+                <div className="font-mono text-sm font-semibold text-[#E5EDF5]">
+                  {jitter === null ? "—" : `±${jitter} мс`}
+                </div>
+                <div
+                  className={`font-mono text-[11px] ${
+                    jitter === null ? "text-[#526170]" : stable ? "text-[#00D5E8]" : "text-amber-300"
+                  }`}
+                >
+                  {jitter === null ? "Замер канала" : stable ? "Канал стабилен" : "Есть джиттер"}
+                </div>
+              </div>
+            </div>
+
             <PingSpark samples={gameSamples} />
-            <div className="mt-3 space-y-2">
+
+            <div className="mt-2 space-y-2">
               <div className="space-y-1">
-                {(routes.length > 0 ? routes : [
-                  { label: "DNS / Магистраль", host: "1.1.1.1", ping_ms: 0, jitter_ms: 0 },
-                  { label: "СНГ / Москва", host: "162.159.135.234", ping_ms: 0, jitter_ms: 0 },
-                  { label: "Европа / Cloudflare", host: "1.0.0.1", ping_ms: 0, jitter_ms: 0 },
-                ]).map((route) => (
-                  <div key={route.host} className="flex items-center justify-between rounded border border-slate-800/80 bg-[#080b11] px-3 py-1.5 text-xs">
-                    <span className="text-slate-400">{route.label}</span>
-                    <span className="font-mono font-semibold text-slate-100">
+                {(routes.length > 0
+                  ? routes
+                  : [
+                      { label: "DNS / Магистраль", host: "1.1.1.1", ping_ms: 0, jitter_ms: 0 },
+                      { label: "СНГ / Москва", host: "162.159.135.234", ping_ms: 0, jitter_ms: 0 },
+                      { label: "Европа / Cloudflare", host: "1.0.0.1", ping_ms: 0, jitter_ms: 0 },
+                    ]
+                ).map((route) => (
+                  <div
+                    key={route.host}
+                    className="flex items-center justify-between rounded-md border border-[#202B38] bg-[#0B0E14] px-2.5 py-1 text-xs"
+                  >
+                    <span className="text-[#8292A3]">{route.label}</span>
+                    <span className="font-mono font-medium text-[#E5EDF5]">
                       {route.ping_ms > 0 ? `${route.ping_ms} мс ±${route.jitter_ms}` : "—"}
                     </span>
                   </div>
                 ))}
               </div>
+
               <div className="grid grid-cols-2 gap-2">
                 <button
                   type="button"
@@ -338,22 +458,16 @@ export function DashboardModule({ c }: { c: NexusController }) {
                         setDnsError(String(err));
                       });
                   }}
-                  className="cyber-btn px-2 py-2 font-mono text-[11px] font-semibold text-cyan-200 disabled:opacity-60"
+                  className="cyber-btn cursor-pointer px-2 py-1.5 font-mono text-[11px] font-semibold text-[#00D5E8] disabled:opacity-60"
                 >
-                  {dnsState === "done" ? (
-                    <span className="text-emerald-300">✓ DNS ОЧИЩЕН</span>
-                  ) : dnsState === "pending" ? (
-                    "ОЧИСТКА DNS…"
-                  ) : (
-                    "СБРОС DNS"
-                  )}
+                  {dnsState === "done" ? "✓ DNS ОЧИЩЕН" : dnsState === "pending" ? "ОЧИСТКА…" : "СБРОС DNS"}
                 </button>
                 <button
                   type="button"
                   disabled={netBusy}
                   onClick={() => {
                     if (!isElevatedAdmin) {
-                      setNetHint("Требуются права Администратора (кнопка в шапке)");
+                      setNetHint("Требуются права Администратора (кнопка в верхней панели)");
                       return;
                     }
                     setNetBusy(true);
@@ -363,50 +477,52 @@ export function DashboardModule({ c }: { c: NexusController }) {
                       .catch((err) => setNetHint(String(err)))
                       .finally(() => setNetBusy(false));
                   }}
-                  className="cyber-btn px-2 py-2 font-mono text-[11px] font-semibold text-cyan-200 disabled:opacity-60"
+                  className="cyber-btn cursor-pointer px-2 py-1.5 font-mono text-[11px] font-semibold text-[#00D5E8] disabled:opacity-60"
                 >
-                  {netHint === "Применено" ? (
-                    <span className="text-emerald-300">ПРИМЕНЕНО</span>
-                  ) : netBusy ? (
-                    "ПРИМЕНЕНИЕ…"
-                  ) : (
-                    "ОПТИМИЗАЦИЯ СТЕКА"
-                  )}
+                  {netHint === "Применено" ? "✓ ПРИМЕНЕНО" : netBusy ? "ПРИМЕНЕНИЕ…" : "ПРИОРИТЕТ ПАКЕТОВ"}
                 </button>
               </div>
-              {netHint && netHint !== "Применено" && <p className="text-xs text-slate-300">{netHint}</p>}
+              {netHint && netHint !== "Применено" && <p className="text-xs text-amber-300">{netHint}</p>}
               {dnsError && <p className="text-xs text-rose-300">{dnsError}</p>}
             </div>
           </div>
 
           <div className="tactical-card tactical-brackets rounded-xl p-4">
-            <div className="mb-3 font-mono text-xs font-semibold uppercase tracking-wider text-slate-400">
-              Быстрые действия
+            <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-[#8292A3]">
+              Быстрые переходы
             </div>
-            <div className="flex flex-col gap-2">
+            <div className="grid grid-cols-2 gap-1.5">
               <button
                 type="button"
                 onClick={() => setActiveTab("cleanup")}
-                className="group flex items-center justify-between rounded-lg border border-slate-800/90 bg-[#080b11] p-2.5 text-xs font-medium text-slate-200 transition-all hover:border-cyan-500/40 hover:bg-[#0e131d]"
+                className="group flex cursor-pointer items-center justify-between rounded-lg border border-[#202B38] bg-[#0B0E14] px-2.5 py-2 text-xs font-medium text-[#E5EDF5] transition-colors hover:border-[#00D5E8]/40 hover:bg-[#151C26]"
               >
-                <span>Очистка системы</span>
-                <Trash2 size={14} className="transition-transform group-hover:scale-110 group-hover:text-cyan-400" />
+                <span>Очистка</span>
+                <Trash2 size={13} className="text-[#8292A3] transition-colors group-hover:text-[#00D5E8]" />
               </button>
               <button
                 type="button"
                 onClick={() => setActiveTab("storage")}
-                className="group flex items-center justify-between rounded-lg border border-slate-800/90 bg-[#080b11] p-2.5 text-xs font-medium text-slate-200 transition-all hover:border-cyan-500/40 hover:bg-[#0e131d]"
+                className="group flex cursor-pointer items-center justify-between rounded-lg border border-[#202B38] bg-[#0B0E14] px-2.5 py-2 text-xs font-medium text-[#E5EDF5] transition-colors hover:border-[#00D5E8]/40 hover:bg-[#151C26]"
               >
-                <span>Анализ диска</span>
-                <HardDrive size={14} className="transition-transform group-hover:scale-110 group-hover:text-cyan-400" />
+                <span>Накопители</span>
+                <HardDrive size={13} className="text-[#8292A3] transition-colors group-hover:text-[#00D5E8]" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveTab("scripts")}
+                className="group flex cursor-pointer items-center justify-between rounded-lg border border-[#202B38] bg-[#0B0E14] px-2.5 py-2 text-xs font-medium text-[#E5EDF5] transition-colors hover:border-[#00D5E8]/40 hover:bg-[#151C26]"
+              >
+                <span>Скрипты</span>
+                <Terminal size={13} className="text-[#8292A3] transition-colors group-hover:text-[#00D5E8]" />
               </button>
               <button
                 type="button"
                 onClick={() => setActiveTab("power")}
-                className="group flex items-center justify-between rounded-lg border border-slate-800/90 bg-[#080b11] p-2.5 text-xs font-medium text-slate-200 transition-all hover:border-cyan-500/40 hover:bg-[#0e131d]"
+                className="group flex cursor-pointer items-center justify-between rounded-lg border border-[#202B38] bg-[#0B0E14] px-2.5 py-2 text-xs font-medium text-[#E5EDF5] transition-colors hover:border-[#00D5E8]/40 hover:bg-[#151C26]"
               >
-                <span>Таймер питания</span>
-                <Power size={14} className="transition-transform group-hover:scale-110 group-hover:text-cyan-400" />
+                <span>Питание</span>
+                <Power size={13} className="text-[#8292A3] transition-colors group-hover:text-[#00D5E8]" />
               </button>
             </div>
           </div>

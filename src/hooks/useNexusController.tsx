@@ -11,6 +11,7 @@ import {
   type HwmonStatusResponse,
   type HistoryPoint,
   type Metrics,
+  type NetworkTelemetrySnapshot,
   PROCESS_REFRESH_MS,
   type ProcessContextMenuState,
   type ProcessItem,
@@ -31,7 +32,7 @@ import { usePowerTimer } from "./usePowerTimer";
 
 export function useNexusController() {
   const [activeTab, setActiveTab] = useState<
-    "dashboard" | "startup" | "storage" | "hardware" | "cleanup" | "power" | "processes" | "network" | "drop" | "settings"
+    "dashboard" | "startup" | "storage" | "hardware" | "cleanup" | "power" | "processes" | "network" | "drop" | "scripts" | "settings"
   >("dashboard");
   const [metricsReady, setMetricsReady] = useState(false);
   const [metrics, setMetrics] = useState<Metrics>({
@@ -85,6 +86,13 @@ export function useNexusController() {
   const [processNotice, setProcessNotice] = useState<string | null>(null);
   const [processLoading, setProcessLoading] = useState<boolean>(false);
   const [selectedPid, setSelectedPid] = useState<number | null>(null);
+  const [netSnapshot, setNetSnapshot] = useState<NetworkTelemetrySnapshot | null>(null);
+  const [selectedAdapterId, setSelectedAdapterIdState] = useState<string | null>(null);
+  const [netSpeedHistory, setNetSpeedHistory] = useState<
+    Array<{ ts: string; rxBps: number; txBps: number }>
+  >([]);
+  const selectedAdapterRef = useRef<string | null>(null);
+  selectedAdapterRef.current = selectedAdapterId;
   const [suspendedPids, setSuspendedPids] = useState<number[]>([]);
   const [processMenu, setProcessMenu] = useState<ProcessContextMenuState | null>(null);
   const processMenuRef = useRef<ProcessContextMenuState | null>(null);
@@ -348,9 +356,9 @@ export function useNexusController() {
     return () => window.clearInterval(interval);
   }, []);
 
-  // Опрос датчиков LibreHardwareMonitor при активной вкладке «Железо»
+  // Опрос датчиков LibreHardwareMonitor на вкладках «Обзор» и «Железо»
   useEffect(() => {
-    if (activeTab !== "hardware") return;
+    if (activeTab !== "hardware" && activeTab !== "dashboard") return;
 
     const fetchHwTelemetry = async () => {
       try {
@@ -448,9 +456,9 @@ export function useNexusController() {
       ? 0
       : Math.min(100, Math.max(8, Math.log10(metrics.net_tx_kbps + 1) * 25));
 
-  const cpuLoadStyles = getLoadBarStyles(metrics.cpu_usage, "emerald");
+  const cpuLoadStyles = getLoadBarStyles(metrics.cpu_usage, "cyan");
   const ramLoadStyles = getLoadBarStyles(metrics.ram_percentage, "cyan");
-  const diskLoadStyles = getLoadBarStyles(diskUsedPercentage, "emerald");
+  const diskLoadStyles = getLoadBarStyles(diskUsedPercentage, "cyan");
 
   // Проверка перегрева для блока предупреждений Hardware Monitor по пользовательским порогам
   const thermalWarnings = useMemo<string[]>(() => {
@@ -516,6 +524,12 @@ export function useNexusController() {
           case "runtime":
             diff = a.run_time_sec - b.run_time_sec;
             break;
+          case "threads":
+            diff = (a.thread_count ?? 0) - (b.thread_count ?? 0);
+            break;
+          case "handles":
+            diff = (a.handle_count ?? 0) - (b.handle_count ?? 0);
+            break;
         }
         if (diff === 0) diff = a.pid - b.pid;
         return processSortDesc ? -diff : diff;
@@ -577,6 +591,58 @@ export function useNexusController() {
     setAlertThresholds({ cpu: cpuThreshold, gpu: gpuThreshold });
     return { history, report, cpuThreshold, gpuThreshold };
   }, []);
+
+  const refreshNetworkTelemetry = useCallback(async (resetSession = false) => {
+    try {
+      const snap = await invoke<NetworkTelemetrySnapshot>("get_network_telemetry", {
+        selectedAdapterId: selectedAdapterRef.current,
+        resetSession,
+      });
+      setNetSnapshot(snap);
+      if (!selectedAdapterRef.current && snap.active_adapter_id) {
+        selectedAdapterRef.current = snap.active_adapter_id;
+        setSelectedAdapterIdState(snap.active_adapter_id);
+      }
+      const ts = new Date().toLocaleTimeString("ru-RU", {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      });
+      setNetSpeedHistory((prev) => {
+        const next = [
+          ...prev,
+          {
+            ts,
+            rxBps: snap.total_rx_bytes_per_sec,
+            txBps: snap.total_tx_bytes_per_sec,
+          },
+        ];
+        return next.length > 60 ? next.slice(next.length - 60) : next;
+      });
+    } catch (err) {
+      console.error("Ошибка чтения сетевых интерфейсов:", err);
+    }
+  }, []);
+
+  const setSelectedAdapterId = useCallback(
+    (nextId: string | null) => {
+      selectedAdapterRef.current = nextId;
+      setSelectedAdapterIdState(nextId);
+      setNetSpeedHistory([]);
+      void refreshNetworkTelemetry(false);
+    },
+    [refreshNetworkTelemetry]
+  );
+
+  useEffect(() => {
+    if (activeTab !== "network" && activeTab !== "hardware" && activeTab !== "dashboard") return;
+    void refreshNetworkTelemetry(false);
+    const intervalMs = activeTab === "network" ? 1000 : 2000;
+    const timer = window.setInterval(() => {
+      void refreshNetworkTelemetry(false);
+    }, intervalMs);
+    return () => window.clearInterval(timer);
+  }, [activeTab, refreshNetworkTelemetry]);
 
   const exportTelemetryCsv = useCallback(() => invoke<string>("export_telemetry_csv"), []);
 
@@ -703,6 +769,13 @@ export function useNexusController() {
     diskLoadStyles,
     loadTelemetryBundle,
     exportTelemetryCsv,
+
+    // Network Monitor (Adapters & 60s Throughput)
+    netSnapshot,
+    selectedAdapterId,
+    setSelectedAdapterId,
+    netSpeedHistory,
+    refreshNetworkTelemetry,
   };
 }
 

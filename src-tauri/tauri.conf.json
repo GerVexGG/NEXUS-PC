@@ -18,11 +18,13 @@
         "height": 800,
         "minWidth": 900,
         "minHeight": 620,
+        "center": true,
+        "resizable": true,
         "decorations": false,
         "transparent": false,
-        "backgroundColor": "#080b11",
+        "backgroundColor": "#07080B",
         "shadow": true,
-        "visible": false
+        "visible": true
       },
       {
         "label": "tray_hud",
@@ -32,7 +34,7 @@
         "height": 180,
         "decorations": false,
         "transparent": false,
-        "backgroundColor": "#080b11",
+        "backgroundColor": "#07080B",
         "alwaysOnTop": true,
         "visible": false,
         "skipTaskbar": true,

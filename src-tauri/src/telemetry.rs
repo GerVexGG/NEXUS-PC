@@ -83,6 +83,14 @@ pub fn diagnose(buffer: &RwLock<VecDeque<TelemetrySnapshot>>, minutes: u32) -> D
         });
     }
 
+    let gpu_peak = points.iter().filter_map(|point| point.gpu_temp).fold(0.0_f32, f32::max);
+    if gpu_peak > 83.0 {
+        incidents.push(DiagnosticsIncident {
+            level: if gpu_peak >= 90.0 { "critical".to_string() } else { "warning".to_string() },
+            message: format!("Предупреждение: Высокая температура видеокарты GPU (пик {gpu_peak:.0}°C)"),
+        });
+    }
+
     let hot_samples = points.iter().filter(|point| point.cpu_usage > 95.0).count();
     if hot_samples * 2 >= 180 {
         let culprit = busiest_name(points.iter().filter(|point| point.cpu_usage > 95.0));
@@ -123,8 +131,10 @@ pub fn diagnose(buffer: &RwLock<VecDeque<TelemetrySnapshot>>, minutes: u32) -> D
 
     let verdict = if incidents.is_empty() {
         "Система работает стабильно, аппаратных ограничений не зафиксировано".to_string()
-    } else if cpu_peak > 0.0 {
+    } else if cpu_peak > 88.0 {
         format!("Пиковая температура CPU достигала {cpu_peak:.0} °C во время активности {process}. Средняя нагрузка GPU составила {gpu_avg:.0}%")
+    } else if gpu_peak > 83.0 {
+        format!("Пиковая температура видеокарты GPU достигала {gpu_peak:.0} °C. Средняя нагрузка GPU составила {gpu_avg:.0}%")
     } else {
         format!("Средняя нагрузка GPU составила {gpu_avg:.0}%. {}", incidents[0].message)
     };

@@ -97,6 +97,42 @@ public sealed class GpuTelemetryDto
 
     [JsonPropertyName("load_percent")]
     public float? LoadPercent { get; set; }
+
+    [JsonPropertyName("vendor")]
+    public string Vendor { get; set; } = "";
+
+    [JsonPropertyName("vram_used_mb")]
+    public float? VramUsedMb { get; set; }
+
+    [JsonPropertyName("vram_total_mb")]
+    public float? VramTotalMb { get; set; }
+
+    [JsonPropertyName("vram_used_percent")]
+    public float? VramUsedPercent { get; set; }
+
+    [JsonPropertyName("d3d_shared_mb")]
+    public float? D3dSharedMb { get; set; }
+
+    [JsonPropertyName("memory_controller_load_percent")]
+    public float? MemoryControllerLoadPercent { get; set; }
+
+    [JsonPropertyName("video_engine_load_percent")]
+    public float? VideoEngineLoadPercent { get; set; }
+
+    [JsonPropertyName("power_limit_percent")]
+    public float? PowerLimitPercent { get; set; }
+
+    [JsonPropertyName("pcie_rx_mb_s")]
+    public float? PcieRxMbS { get; set; }
+
+    [JsonPropertyName("pcie_tx_mb_s")]
+    public float? PcieTxMbS { get; set; }
+
+    [JsonPropertyName("fans")]
+    public List<FanSensorDto> Fans { get; set; } = new();
+
+    [JsonPropertyName("telemetry_source")]
+    public string TelemetrySource { get; set; } = "LibreHardwareMonitor";
 }
 
 public sealed class FanSensorDto
@@ -197,10 +233,225 @@ internal static class Program
     }
 
     private static bool IsValidTemp(float? val) =>
-        val.HasValue && !float.IsNaN(val.Value) && val.Value > 0f && val.Value < 130f;
+        val.HasValue && float.IsFinite(val.Value) && val.Value > 0f && val.Value < 130f;
 
     private static bool IsValidPositive(float? val) =>
-        val.HasValue && !float.IsNaN(val.Value) && val.Value >= 0f;
+        val.HasValue && float.IsFinite(val.Value) && val.Value >= 0f;
+
+    private static GpuTelemetryDto MapGpuHardware(IHardware hw)
+    {
+        string vendor = hw.HardwareType switch
+        {
+            HardwareType.GpuNvidia => "NVIDIA",
+            HardwareType.GpuAmd => "AMD",
+            HardwareType.GpuIntel => "Intel",
+            _ => ""
+        };
+
+        var gpu = new GpuTelemetryDto
+        {
+            Name = hw.Name,
+            Vendor = vendor,
+            TelemetrySource = vendor.Length > 0
+                ? $"LibreHardwareMonitor ({vendor})"
+                : "LibreHardwareMonitor"
+        };
+
+        float? coreLoad = null;
+        float? d3d3dLoad = null;
+        float? fallbackCoreLoad = null;
+        float? vramLoadPct = null;
+        float? videoDecodeLoad = null;
+        float? videoEncodeLoad = null;
+        float? videoEngineLoad = null;
+        float? dedicatedUsedMb = null;
+        float? d3dDedicatedUsedMb = null;
+        float? powerPreferred = null;
+        float? powerFallback = null;
+        float? coreClockPreferred = null;
+
+        var fanRpms = new Dictionary<string, (string DisplayName, float Rpm)>(StringComparer.OrdinalIgnoreCase);
+        var fanControls = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var s in GetAllSensorsRecursive(hw))
+        {
+            string sName = s.Name ?? "";
+            string sLower = sName.Trim().ToLowerInvariant();
+
+            if (s.SensorType == SensorType.Temperature && IsValidTemp(s.Value))
+            {
+                float t = s.Value!.Value;
+                // Check memory BEFORE junction/hotspot so "GPU Memory Junction" maps strictly to VRAM memory temp.
+                if (sLower.Contains("memory") || sLower.Contains("vram") || sLower.Contains("mem"))
+                {
+                    gpu.MemoryTempC = t;
+                }
+                else if (sLower.Contains("hot spot") || sLower.Contains("hotspot") || sLower.Contains("junction"))
+                {
+                    gpu.HotspotTempC = t;
+                }
+                else if (sLower.Contains("core") || sLower.Contains("edge") || !gpu.CoreTempC.HasValue)
+                {
+                    gpu.CoreTempC = t;
+                }
+            }
+            else if (s.SensorType == SensorType.Clock && IsValidPositive(s.Value))
+            {
+                float mhz = s.Value!.Value;
+                if (sLower.Contains("memory") || sLower.Contains("vram"))
+                {
+                    gpu.MemoryClockMhz = mhz;
+                }
+                else if (sLower == "gpu core" || sLower.Contains("graphics") || sLower.Contains("shader"))
+                {
+                    coreClockPreferred = mhz;
+                }
+                else if (sLower.Contains("core") && !coreClockPreferred.HasValue)
+                {
+                    coreClockPreferred = mhz;
+                }
+            }
+            else if (s.SensorType == SensorType.Fan && IsValidPositive(s.Value))
+            {
+                float rpm = s.Value!.Value;
+                fanRpms[sLower] = (sName.Trim(), rpm);
+                if (!gpu.FanRpm.HasValue || rpm > gpu.FanRpm.Value)
+                {
+                    gpu.FanRpm = rpm;
+                }
+            }
+            else if (s.SensorType == SensorType.Control && IsValidPositive(s.Value))
+            {
+                float pct = s.Value!.Value;
+                fanControls[sLower] = pct;
+                if (sLower.Contains("fan") && (!gpu.FanPercent.HasValue || pct > gpu.FanPercent.Value))
+                {
+                    gpu.FanPercent = pct;
+                }
+            }
+            else if (s.SensorType == SensorType.Power && IsValidPositive(s.Value))
+            {
+                float watts = s.Value!.Value;
+                if (sLower.Contains("package") || sLower.Contains("total board") || sLower == "gpu power" || sLower.Contains("ppt"))
+                {
+                    powerPreferred = watts;
+                }
+                else if (!powerFallback.HasValue)
+                {
+                    powerFallback = watts;
+                }
+            }
+            else if (s.SensorType == SensorType.Load && IsValidPositive(s.Value))
+            {
+                float val = s.Value!.Value;
+                if (sLower == "gpu core")
+                {
+                    coreLoad = val;
+                }
+                else if (sLower == "d3d 3d" || sLower == "3d")
+                {
+                    d3d3dLoad = val;
+                }
+                else if (sLower.Contains("memory controller"))
+                {
+                    gpu.MemoryControllerLoadPercent = val;
+                }
+                else if (sLower.Contains("video engine"))
+                {
+                    videoEngineLoad = val;
+                }
+                else if (sLower.Contains("d3d video decode"))
+                {
+                    videoDecodeLoad = val;
+                }
+                else if (sLower.Contains("d3d video encode"))
+                {
+                    videoEncodeLoad = val;
+                }
+                else if (sLower == "gpu board power" || sLower == "gpu power")
+                {
+                    gpu.PowerLimitPercent = val;
+                }
+                else if (sLower == "gpu memory" || sLower == "d3d dedicated memory usage")
+                {
+                    vramLoadPct = val;
+                }
+                else if ((sLower.Contains("core") || sLower == "gpu") && !fallbackCoreLoad.HasValue)
+                {
+                    fallbackCoreLoad = val;
+                }
+            }
+            else if ((s.SensorType == SensorType.SmallData || s.SensorType == SensorType.Data) && IsValidPositive(s.Value))
+            {
+                float mb = s.SensorType == SensorType.Data ? s.Value!.Value * 1024f : s.Value!.Value;
+                if (sLower == "gpu memory total")
+                {
+                    gpu.VramTotalMb = mb;
+                }
+                else if (sLower == "gpu memory used")
+                {
+                    dedicatedUsedMb = mb;
+                }
+                else if (sLower == "d3d dedicated memory used")
+                {
+                    d3dDedicatedUsedMb = mb;
+                }
+                else if (sLower == "d3d shared memory used")
+                {
+                    gpu.D3dSharedMb = mb;
+                }
+            }
+            else if (s.SensorType == SensorType.Voltage && IsValidPositive(s.Value))
+            {
+                if (s.Value!.Value > 0.05f && (!gpu.VoltageV.HasValue || sLower.Contains("core")))
+                {
+                    gpu.VoltageV = s.Value.Value;
+                }
+            }
+            else if (s.SensorType == SensorType.Throughput && IsValidPositive(s.Value))
+            {
+                float mbps = s.Value!.Value / (1024f * 1024f);
+                if (sLower.Contains("pcie rx"))
+                {
+                    gpu.PcieRxMbS = mbps;
+                }
+                else if (sLower.Contains("pcie tx"))
+                {
+                    gpu.PcieTxMbS = mbps;
+                }
+            }
+        }
+
+        gpu.CoreClockMhz = coreClockPreferred;
+        gpu.PowerWatts = powerPreferred ?? powerFallback;
+        gpu.LoadPercent = coreLoad ?? d3d3dLoad ?? fallbackCoreLoad;
+        gpu.VideoEngineLoadPercent = videoEngineLoad ?? (
+            videoDecodeLoad.HasValue || videoEncodeLoad.HasValue
+                ? MathF.Max(videoDecodeLoad ?? 0f, videoEncodeLoad ?? 0f)
+                : null
+        );
+        gpu.VramUsedMb = dedicatedUsedMb ?? d3dDedicatedUsedMb;
+        gpu.VramUsedPercent = vramLoadPct ?? (
+            gpu.VramTotalMb is > 0f && gpu.VramUsedMb is >= 0f
+                ? Math.Clamp((gpu.VramUsedMb.Value / gpu.VramTotalMb.Value) * 100f, 0f, 100f)
+                : null
+        );
+
+        foreach (var kv in fanRpms)
+        {
+            float? ctrlPct = fanControls.TryGetValue(kv.Key, out float matchedPct)
+                ? matchedPct
+                : gpu.FanPercent;
+            gpu.Fans.Add(new FanSensorDto
+            {
+                Name = kv.Value.DisplayName,
+                Rpm = kv.Value.Rpm,
+                Percent = ctrlPct
+            });
+        }
+
+        return gpu;
+    }
 
     public static void Main()
     {
@@ -374,81 +625,7 @@ internal static class Program
                 case HardwareType.GpuAmd:
                 case HardwareType.GpuIntel:
                 {
-                    var gpu = new GpuTelemetryDto
-                    {
-                        Name = hw.Name
-                    };
-
-                    foreach (var s in GetAllSensorsRecursive(hw))
-                    {
-                        string sName = s.Name ?? "";
-                        string sLower = sName.ToLowerInvariant();
-
-                        if (s.SensorType == SensorType.Temperature && IsValidTemp(s.Value))
-                        {
-                            float t = s.Value!.Value;
-                            if (sLower.Contains("hot spot") || sLower.Contains("hotspot") || sLower.Contains("junction"))
-                            {
-                                gpu.HotspotTempC = t;
-                            }
-                            else if (sLower.Contains("memory") || sLower.Contains("vram") || sLower.Contains("mem"))
-                            {
-                                gpu.MemoryTempC = t;
-                            }
-                            else if (sLower.Contains("core") || !gpu.CoreTempC.HasValue)
-                            {
-                                gpu.CoreTempC = t;
-                            }
-                        }
-                        else if (s.SensorType == SensorType.Clock && IsValidPositive(s.Value))
-                        {
-                            if (sLower.Contains("core"))
-                            {
-                                gpu.CoreClockMhz = s.Value!.Value;
-                            }
-                            else if (sLower.Contains("memory"))
-                            {
-                                gpu.MemoryClockMhz = s.Value!.Value;
-                            }
-                        }
-                        else if (s.SensorType == SensorType.Fan && IsValidPositive(s.Value))
-                        {
-                            if (!gpu.FanRpm.HasValue || s.Value!.Value > gpu.FanRpm.Value)
-                            {
-                                gpu.FanRpm = s.Value!.Value;
-                            }
-                        }
-                        else if (s.SensorType == SensorType.Control && IsValidPositive(s.Value))
-                        {
-                            if (sLower.Contains("fan") && (!gpu.FanPercent.HasValue || s.Value!.Value > gpu.FanPercent.Value))
-                            {
-                                gpu.FanPercent = s.Value!.Value;
-                            }
-                        }
-                        else if (s.SensorType == SensorType.Power && IsValidPositive(s.Value))
-                        {
-                            if (sLower.Contains("package") || sLower.Contains("total") || sLower.Contains("gpu") || !gpu.PowerWatts.HasValue)
-                            {
-                                gpu.PowerWatts = s.Value!.Value;
-                            }
-                        }
-                        else if (s.SensorType == SensorType.Load && IsValidPositive(s.Value))
-                        {
-                            if (sLower.Contains("core") || sLower.Contains("gpu") || sLower == "3d" || !gpu.LoadPercent.HasValue)
-                            {
-                                gpu.LoadPercent = s.Value!.Value;
-                            }
-                        }
-                        else if (s.SensorType == SensorType.Voltage && IsValidPositive(s.Value))
-                        {
-                            if (s.Value!.Value > 0.1f && (!gpu.VoltageV.HasValue || sLower.Contains("core")))
-                            {
-                                gpu.VoltageV = s.Value.Value;
-                            }
-                        }
-                    }
-
-                    dto.Gpus.Add(gpu);
+                    dto.Gpus.Add(MapGpuHardware(hw));
                     break;
                 }
 

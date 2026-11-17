@@ -51,43 +51,69 @@ export function TrayHud() {
   const stable = jitter !== null && jitter <= 7;
 
   return (
-    <div className="hud-bg flex h-screen w-screen flex-col justify-between border border-slate-800 bg-[#080b11] p-3 text-slate-100">
+    <div className="hud-bg flex h-screen w-screen flex-col justify-between border border-[#202B38] bg-[#07080B] p-3 text-[#E5EDF5]">
       <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs">
-        <span className="font-mono text-[11px] text-slate-400">PING</span>
-        <span className={`text-right font-mono font-bold ${ping === null ? "text-slate-400" : ping <= 80 ? "text-emerald-400" : ping <= 120 ? "text-amber-400" : "text-rose-400"}`}>
-          {ping === null ? "—" : `${ping} ms`}
+        <span className="font-mono text-[11px] text-[#8292A3]">PING</span>
+        <span
+          className={`text-right font-mono font-semibold ${
+            ping === null
+              ? "text-[#8292A3]"
+              : ping <= 80
+              ? "text-[#00D5E8]"
+              : ping <= 120
+              ? "text-amber-400"
+              : "text-rose-400"
+          }`}
+        >
+          {ping === null ? "—" : `${ping} мс`}
         </span>
-        <span className="font-mono text-[11px] text-slate-400">JITTER</span>
-        <span className="text-right font-mono font-bold text-slate-100">{jitter === null ? "—" : `±${jitter} ms`}</span>
-        <span className="font-mono text-[11px] text-slate-400">LINK</span>
-        <span className={`text-right font-mono text-[11px] ${jitter === null ? "text-slate-400" : stable ? "text-emerald-300" : "text-amber-300"}`}>
-          {jitter === null ? "SCANNING" : stable ? "STABLE" : "JITTER"}
+        <span className="font-mono text-[11px] text-[#8292A3]">JITTER</span>
+        <span className="text-right font-mono font-semibold text-[#E5EDF5]">
+          {jitter === null ? "—" : `±${jitter} мс`}
         </span>
-        <span className="font-mono text-[11px] text-slate-400">CPU</span>
-        <span className="text-right font-mono font-bold text-cyan-300">{metrics ? `${metrics.cpu_usage.toFixed(0)}%` : "—"}</span>
-        <span className="font-mono text-[11px] text-slate-400">RAM</span>
-        <span className="text-right font-mono font-bold text-cyan-300">{metrics ? `${metrics.ram_percentage.toFixed(0)}%` : "—"}</span>
+        <span className="font-mono text-[11px] text-[#8292A3]">КАНАЛ</span>
+        <span
+          className={`text-right font-mono text-[11px] ${
+            jitter === null ? "text-[#8292A3]" : stable ? "text-[#00D5E8]" : "text-amber-300"
+          }`}
+        >
+          {jitter === null ? "ОПРОС" : stable ? "СТАБИЛЬНО" : "ДЖИТТЕР"}
+        </span>
+        <span className="font-mono text-[11px] text-[#8292A3]">CPU</span>
+        <span className="text-right font-mono font-semibold text-[#00D5E8]">
+          {metrics ? `${metrics.cpu_usage.toFixed(0)}%` : "—"}
+        </span>
+        <span className="font-mono text-[11px] text-[#8292A3]">RAM</span>
+        <span className="text-right font-mono font-semibold text-[#36AFC0]">
+          {metrics ? `${metrics.ram_percentage.toFixed(0)}%` : "—"}
+        </span>
       </div>
       <div className="mt-2 flex gap-1.5">
         <button
           type="button"
           onClick={() => {
             void (async () => {
-              const main = await WebviewWindow.getByLabel("main");
-              await main?.show();
-              await main?.unminimize();
-              await main?.setFocus();
-              await getCurrentWindow().hide();
+              try {
+                await invoke("restore_from_tray");
+              } catch {
+                const main = await WebviewWindow.getByLabel("main");
+                await main?.show();
+                if (await main?.isMinimized()) {
+                  await main?.unminimize();
+                }
+                await main?.setFocus();
+                await getCurrentWindow().hide();
+              }
             })();
           }}
-          className="cyber-btn flex-1 px-2 py-1.5 font-mono text-[11px] font-semibold text-cyan-200"
+          className="cyber-btn flex-1 px-2 py-1.5 font-mono text-[11px] font-semibold text-[#00D5E8]"
         >
-          РАЗВЕРНУТЬ NEXUS
+          ОТКРЫТЬ NEXUS
         </button>
         <button
           type="button"
           onClick={() => void invoke("app_exit")}
-          className="cyber-btn-danger px-2.5 py-1.5 font-mono text-[11px] font-semibold text-rose-200"
+          className="cyber-btn-danger px-2.5 py-1.5 font-mono text-[11px] font-semibold text-rose-300"
         >
           ВЫХОД
         </button>

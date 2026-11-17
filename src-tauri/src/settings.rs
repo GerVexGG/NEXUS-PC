@@ -18,7 +18,7 @@ const EVENT_LIMIT: usize = 100;
 pub struct NexusSettings {
     #[serde(default)]
     pub autostart: bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub minimize_to_tray: bool,
     #[serde(default)]
     pub start_minimized: bool,
@@ -54,7 +54,7 @@ impl Default for NexusSettings {
     fn default() -> Self {
         Self {
             autostart: false,
-            minimize_to_tray: true,
+            minimize_to_tray: false,
             start_minimized: false,
             polling_rate_ms: 2000,
             alert_cpu_temp: 85,
@@ -186,7 +186,8 @@ fn sync_autostart(enabled: bool) -> Result<(), String> {
         .map_err(|err| format!("Не удалось открыть автозагрузку Windows: {err}"))?;
     if enabled {
         let exe = std::env::current_exe().map_err(|err| format!("Не удалось определить путь NEXUS: {err}"))?;
-        key.set_value(RUN_VALUE, &exe.display().to_string())
+        let command = format!("\"{}\" --autostart", exe.display());
+        key.set_value(RUN_VALUE, &command)
             .map_err(|err| format!("Не удалось записать автозапуск: {err}"))
     } else {
         match key.delete_value(RUN_VALUE) {

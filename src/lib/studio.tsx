@@ -1,8 +1,5 @@
 import { useEffect, useRef, memo, type ReactNode, type MouseEvent } from "react";
 import { motion, type Variants } from "framer-motion";
-import {
-  Sparkles,
-} from "lucide-react";
 
 export interface Metrics {
   cpu_usage: number;
@@ -81,6 +78,12 @@ export interface CpuTelemetry {
   power_watts: number | null;
   voltage_v: number | null;
   core_temps: CoreTemp[];
+  usage_percent?: number;
+  base_clock_mhz?: number | null;
+  physical_cores?: number;
+  logical_cores?: number;
+  core_loads?: number[];
+  hvci_enabled?: boolean;
 }
 
 export interface GpuTelemetry {
@@ -94,6 +97,119 @@ export interface GpuTelemetry {
   fan_percent: number | null;
   power_watts: number | null;
   voltage_v: number | null;
+  load_percent?: number | null;
+  vendor?: string;
+  vram_used_mb?: number | null;
+  vram_total_mb?: number | null;
+  vram_used_percent?: number | null;
+  d3d_shared_mb?: number | null;
+  memory_controller_load_percent?: number | null;
+  video_engine_load_percent?: number | null;
+  power_limit_percent?: number | null;
+  pcie_rx_mb_s?: number | null;
+  pcie_tx_mb_s?: number | null;
+  fans?: FanSensorItem[];
+  telemetry_source?: string;
+}
+
+export interface NetworkAdapterInfo {
+  id: string;
+  interface_index: number;
+  name: string;
+  description: string;
+  manufacturer: string;
+  adapter_kind: string;
+  adapter_type_label: string;
+  is_physical: boolean;
+  is_system_tunnel: boolean;
+  status: string;
+  status_label: string;
+  is_connected: boolean;
+  is_primary: boolean;
+  link_speed_bps: number;
+  mac_address: string;
+  ipv4_addresses: string[];
+  ipv6_addresses: string[];
+  gateways: string[];
+  dns_servers: string[];
+  rx_bytes_per_sec: number;
+  tx_bytes_per_sec: number;
+  total_rx_bytes: number;
+  total_tx_bytes: number;
+  session_rx_bytes: number;
+  session_tx_bytes: number;
+  rx_packets: number;
+  tx_packets: number;
+  rx_errors: number;
+  tx_errors: number;
+  rx_dropped: number;
+  tx_dropped: number;
+}
+
+export interface NetworkTelemetrySnapshot {
+  timestamp_ms: number;
+  adapters: NetworkAdapterInfo[];
+  active_adapter_id: string | null;
+  total_rx_bytes_per_sec: number;
+  total_tx_bytes_per_sec: number;
+}
+
+export interface NetworkHealthProbe {
+  timestamp_ms: number;
+  gateway_ip: string | null;
+  gateway_reachable: boolean;
+  gateway_ping_ms: number | null;
+  external_host: string;
+  external_reachable: boolean;
+  external_ping_ms: number | null;
+  external_method: string;
+}
+
+export function formatLinkSpeed(bps: number): string {
+  if (!Number.isFinite(bps) || bps <= 0) return "Не подключён";
+  if (bps >= 1_000_000_000) {
+    const gbps = bps / 1_000_000_000;
+    return `${Number.isInteger(gbps) ? gbps : gbps.toFixed(1)} Гбит/с`;
+  }
+  if (bps >= 1_000_000) {
+    const mbps = bps / 1_000_000;
+    return `${mbps >= 100 ? Math.round(mbps) : mbps.toFixed(1)} Мбит/с`;
+  }
+  if (bps >= 1_000) {
+    return `${Math.round(bps / 1_000)} Кбит/с`;
+  }
+  return `${Math.round(bps)} бит/с`;
+}
+
+export function formatThroughputRate(
+  bytesPerSec: number,
+  unitMode: "mbps" | "mbs"
+): { value: string; unit: string } {
+  const safe = Number.isFinite(bytesPerSec) && bytesPerSec > 0 ? bytesPerSec : 0;
+  if (unitMode === "mbps") {
+    const bitsPerSec = safe * 8;
+    if (bitsPerSec >= 1_000_000_000) {
+      return { value: (bitsPerSec / 1_000_000_000).toFixed(2), unit: "Гбит/с" };
+    }
+    if (bitsPerSec >= 1_000_000) {
+      return { value: (bitsPerSec / 1_000_000).toFixed(2), unit: "Мбит/с" };
+    }
+    if (bitsPerSec >= 1_000) {
+      return { value: (bitsPerSec / 1_000).toFixed(1), unit: "Кбит/с" };
+    }
+    return { value: Math.round(bitsPerSec).toString(), unit: "бит/с" };
+  }
+
+  if (safe >= 1024 * 1024 * 1024) {
+    return { value: (safe / (1024 * 1024 * 1024)).toFixed(2), unit: "ГБ/с" };
+  }
+  if (safe >= 1024 * 1024) {
+    return { value: (safe / (1024 * 1024)).toFixed(2), unit: "МБ/с" };
+  }
+  if (safe >= 1024) {
+    return { value: (safe / 1024).toFixed(1), unit: "КБ/с" };
+  }
+  return { value: Math.round(safe).toString(), unit: "Б/с" };
 }
 
 export interface FanSensorItem {
@@ -191,10 +307,42 @@ export interface ProcessItem {
   disk_read_bytes_sec: number;
   disk_write_bytes_sec: number;
   run_time_sec: number;
+  start_time: number;
+  thread_count: number;
+  handle_count: number;
+  status: string;
   icon_base64: string | null;
 }
 
-export type ProcessSortKey = "name" | "pid" | "cpu" | "memory" | "disk" | "runtime";
+export interface ProcessDetails {
+  pid: number;
+  parent_pid: number | null;
+  parent_name: string | null;
+  name: string;
+  exe_path: string;
+  command_line: string;
+  working_dir: string;
+  status: string;
+  cpu_usage: number;
+  memory_mb: number;
+  virtual_memory_mb: number;
+  run_time_sec: number;
+  start_time: number;
+  thread_count: number;
+  handle_count: number;
+  child_count: number;
+  total_descendants?: number;
+}
+
+export type ProcessSortKey =
+  | "name"
+  | "pid"
+  | "cpu"
+  | "memory"
+  | "disk"
+  | "runtime"
+  | "threads"
+  | "handles";
 
 export interface ProcessContextMenuState {
   x: number;
@@ -226,7 +374,6 @@ export async function copyTextToClipboard(text: string): Promise<void> {
   try {
     await navigator.clipboard.writeText(text);
   } catch {
-    // Фоллбэк для WebView без доступа к Clipboard API
     const area = document.createElement("textarea");
     area.value = text;
     area.style.position = "fixed";
@@ -256,40 +403,39 @@ export const PRESET_MINUTES = [15, 30, 45, 60];
 export const HISTORY_LENGTH = 60;
 
 export const TREEMAP_PALETTE = [
-  "from-sky-500/30 to-teal-600/20 border-sky-400/35 hover:border-sky-300/70 text-sky-200",
-  "from-cyan-500/30 to-sky-600/20 border-cyan-400/35 hover:border-cyan-300/70 text-cyan-200",
-  "from-indigo-500/30 to-blue-600/20 border-indigo-400/35 hover:border-indigo-300/70 text-indigo-200",
-  "from-amber-500/30 to-orange-600/20 border-amber-400/35 hover:border-amber-300/70 text-amber-200",
-  "from-violet-500/30 to-purple-600/20 border-violet-400/35 hover:border-violet-300/70 text-violet-200",
-  "from-teal-500/25 to-sky-700/20 border-teal-400/30 hover:border-teal-300/70 text-teal-200",
-  "from-sky-500/25 to-cyan-700/20 border-sky-400/30 hover:border-sky-300/70 text-sky-200",
-  "from-rose-500/25 to-pink-700/20 border-rose-400/30 hover:border-rose-300/70 text-rose-200",
-  "from-lime-500/25 to-sky-700/20 border-lime-400/30 hover:border-lime-300/70 text-lime-200",
-  "from-zinc-700/40 to-zinc-800/40 border-zinc-600/40 hover:border-zinc-400/60 text-[#d5dde8]",
+  "from-[#00D5E8]/28 to-[#0B0E14]/90 border-[#00D5E8]/40 hover:border-[#00D5E8]/80 text-[#E5EDF5]",
+  "from-[#36AFC0]/28 to-[#0B0E14]/90 border-[#36AFC0]/40 hover:border-[#36AFC0]/80 text-[#E5EDF5]",
+  "from-indigo-500/26 to-[#0B0E14]/90 border-indigo-400/35 hover:border-indigo-300/75 text-indigo-100",
+  "from-sky-500/26 to-[#0B0E14]/90 border-sky-400/35 hover:border-sky-300/75 text-sky-100",
+  "from-amber-500/24 to-[#0B0E14]/90 border-amber-400/35 hover:border-amber-300/75 text-amber-100",
+  "from-violet-500/24 to-[#0B0E14]/90 border-violet-400/35 hover:border-violet-300/75 text-violet-100",
+  "from-cyan-600/25 to-[#0B0E14]/90 border-cyan-500/35 hover:border-cyan-300/75 text-cyan-100",
+  "from-blue-500/24 to-[#0B0E14]/90 border-blue-400/35 hover:border-blue-300/75 text-blue-100",
+  "from-rose-500/22 to-[#0B0E14]/90 border-rose-400/35 hover:border-rose-300/75 text-rose-100",
+  "from-[#151C26]/90 to-[#10151D]/95 border-[#202B38] hover:border-[#36AFC0]/60 text-[#E5EDF5]",
 ];
 
-// Варианты упругой каскадной анимации приборных модулей Obsidian Cyber-HUD
 export const cardsContainerVariants: Variants = {
   hidden: { opacity: 0 },
   show: {
     opacity: 1,
     transition: {
-      staggerChildren: 0.045,
+      staggerChildren: 0.04,
       delayChildren: 0.01,
     },
   },
 };
 
 export const cardItemVariants: Variants = {
-  hidden: { opacity: 0, y: 10, scale: 0.985 },
+  hidden: { opacity: 0, y: 8, scale: 0.99 },
   show: {
     opacity: 1,
     y: 0,
     scale: 1,
     transition: {
       type: "spring",
-      stiffness: 440,
-      damping: 28,
+      stiffness: 460,
+      damping: 30,
     },
   },
 };
@@ -345,9 +491,9 @@ export function getPingHudStyle(pingMs: number): {
     return {
       valueText: "—",
       statusLabel: "НЕТ СВЯЗИ",
-      colorClass: "text-[#8793a5]",
-      badgeClass: "bg-zinc-800/90 text-[#8793a5] border-white/[0.08]",
-      dotClass: "bg-zinc-600",
+      colorClass: "text-[#8292A3]",
+      badgeClass: "bg-[#151C26] text-[#8292A3] border-[#202B38]",
+      dotClass: "bg-[#526170]",
       barPercent: 0,
     };
   }
@@ -355,9 +501,9 @@ export function getPingHudStyle(pingMs: number): {
     return {
       valueText: `${pingMs}`,
       statusLabel: pingMs <= 40 ? "ОТЛИЧНО" : "НОРМА",
-      colorClass: "text-emerald-400",
-      badgeClass: "bg-emerald-500/15 text-emerald-300 border-emerald-500/35",
-      dotClass: "bg-emerald-400",
+      colorClass: "text-[#00D5E8]",
+      badgeClass: "bg-[#00D5E8]/10 text-[#00D5E8] border-[#00D5E8]/30",
+      dotClass: "bg-[#00D5E8]",
       barPercent: Math.max(12, Math.min(100, (1 - pingMs / 150) * 100)),
     };
   }
@@ -365,20 +511,18 @@ export function getPingHudStyle(pingMs: number): {
     return {
       valueText: `${pingMs}`,
       statusLabel: "СРЕДНЕ",
-      colorClass: "text-amber-400 drop-shadow-[0_0_12px_rgba(251,191,36,0.35)]",
-      badgeClass:
-        "bg-amber-500/15 text-amber-300 border-amber-500/35 shadow-[0_0_12px_rgba(251,191,36,0.2)]",
-      dotClass: "bg-amber-400 shadow-[0_0_8px_#fbbf24]",
+      colorClass: "text-amber-400",
+      badgeClass: "bg-amber-500/12 text-amber-300 border-amber-500/35",
+      dotClass: "bg-amber-400",
       barPercent: Math.max(20, Math.min(100, (1 - pingMs / 160) * 100)),
     };
   }
   return {
     valueText: `${pingMs}`,
     statusLabel: "ВЫСОКИЙ ПИНГ",
-    colorClass: "text-rose-400 drop-shadow-[0_0_12px_rgba(244,63,94,0.4)]",
-    badgeClass:
-      "bg-rose-500/15 text-rose-300 border-rose-500/40 shadow-[0_0_14px_rgba(244,63,94,0.25)]",
-    dotClass: "bg-rose-500 shadow-[0_0_8px_#f43f5e]",
+    colorClass: "text-rose-400",
+    badgeClass: "bg-rose-500/12 text-rose-300 border-rose-500/35",
+    dotClass: "bg-rose-500",
     barPercent: 100,
   };
 }
@@ -394,7 +538,6 @@ export function formatBytes(bytes: number): string {
   return `${bytes} Б`;
 }
 
-// Цветовая индикация температуры (<65°C — зеленый, 65-80°C — янтарный, >80°C — рубиновый)
 export function getTempBadgeStyle(tempC: number | null | undefined): {
   badgeClass: string;
   textClass: string;
@@ -403,39 +546,33 @@ export function getTempBadgeStyle(tempC: number | null | undefined): {
 } {
   if (tempC === null || tempC === undefined || !Number.isFinite(tempC)) {
     return {
-      badgeClass: "bg-zinc-900/90 text-[#8793a5] border-white/[0.08]",
-      textClass: "text-[#8793a5]",
-      barClass: "bg-zinc-600",
-      label: "Н/Д",
+      badgeClass: "bg-[#151C26] text-[#8292A3] border-[#202B38]",
+      textClass: "text-[#8292A3]",
+      barClass: "bg-[#202B38]",
+      label: "Недоступно",
     };
   }
   if (tempC > 80) {
     return {
-      badgeClass:
-        "bg-rose-500/15 text-rose-300 border-rose-500/40 shadow-[0_0_14px_rgba(244,63,94,0.25)]",
+      badgeClass: "bg-rose-500/12 text-rose-300 border-rose-500/35",
       textClass: "text-rose-400",
-      barClass:
-        "bg-gradient-to-r from-rose-500 to-red-400 shadow-[0_0_12px_rgba(244,63,94,0.6)]",
-      label: "CRITICAL",
+      barClass: "bg-gradient-to-r from-rose-500 to-red-400",
+      label: "КРИТИЧНО",
     };
   }
   if (tempC >= 65) {
     return {
-      badgeClass:
-        "bg-amber-500/15 text-amber-300 border-amber-500/40 shadow-[0_0_14px_rgba(245,158,11,0.2)]",
+      badgeClass: "bg-amber-500/12 text-amber-300 border-amber-500/35",
       textClass: "text-amber-400",
-      barClass:
-        "bg-gradient-to-r from-amber-500 to-yellow-400 shadow-[0_0_12px_rgba(245,158,11,0.5)]",
-      label: "WARM",
+      barClass: "bg-gradient-to-r from-amber-500 to-yellow-400",
+      label: "НАГРЕВ",
     };
   }
   return {
-    badgeClass:
-      "bg-sky-500/15 text-sky-300 border-sky-500/35 shadow-[0_0_14px_rgba(56,189,248,0.18)]",
-    textClass: "text-sky-400",
-    barClass:
-      "bg-gradient-to-r from-sky-500 to-teal-400 shadow-[0_0_12px_rgba(56,189,248,0.45)]",
-    label: "OPTIMAL",
+    badgeClass: "bg-[#00D5E8]/10 text-[#00D5E8] border-[#00D5E8]/30",
+    textClass: "text-[#00D5E8]",
+    barClass: "bg-gradient-to-r from-[#00D5E8] to-[#36AFC0]",
+    label: "НОРМА",
   };
 }
 
@@ -447,44 +584,43 @@ export function getCategoryStyle(category: string): {
   switch (category) {
     case "Видео":
       return {
-        barClass: "bg-cyan-400 shadow-[0_0_10px_rgba(34,211,238,0.5)]",
-        dotClass: "bg-cyan-400",
-        textClass: "text-cyan-400",
+        barClass: "bg-[#00D5E8]",
+        dotClass: "bg-[#00D5E8]",
+        textClass: "text-[#00D5E8]",
       };
     case "Игры и софт":
       return {
-        barClass: "bg-indigo-400 shadow-[0_0_10px_rgba(129,140,248,0.5)]",
+        barClass: "bg-indigo-400",
         dotClass: "bg-indigo-400",
         textClass: "text-indigo-300",
       };
     case "Архивы и образы":
       return {
-        barClass: "bg-amber-400 shadow-[0_0_10px_rgba(251,191,36,0.5)]",
+        barClass: "bg-amber-400",
         dotClass: "bg-amber-400",
         textClass: "text-amber-400",
       };
     case "Аудио":
       return {
-        barClass: "bg-violet-400 shadow-[0_0_10px_rgba(167,139,250,0.5)]",
+        barClass: "bg-violet-400",
         dotClass: "bg-violet-400",
-        textClass: "text-violet-400",
+        textClass: "text-violet-300",
       };
     case "Документы":
       return {
-        barClass: "bg-sky-400 shadow-[0_0_10px_rgba(56,189,248,0.5)]",
-        dotClass: "bg-sky-400",
-        textClass: "text-sky-400",
+        barClass: "bg-[#36AFC0]",
+        dotClass: "bg-[#36AFC0]",
+        textClass: "text-[#36AFC0]",
       };
     default:
       return {
-        barClass: "bg-zinc-500",
-        dotClass: "bg-zinc-500",
-        textClass: "text-[#8793a5]",
+        barClass: "bg-[#526170]",
+        dotClass: "bg-[#526170]",
+        textClass: "text-[#8292A3]",
       };
   }
 }
 
-// Алгоритм пропорционального разбиения прямоугольника (Binary Split Treemap)
 export function computeTreemapRects(nodes: FolderNode[]): TreemapRect[] {
   const valid = nodes.filter((n) => n.size_bytes > 0);
   if (valid.length === 0) return [];
@@ -549,46 +685,45 @@ export function computeTreemapRects(nodes: FolderNode[]): TreemapRect[] {
   return results;
 }
 
-// Динамический цвет прогресс-бара и свечения в зависимости от нагрузки
 export function getLoadBarStyles(
   percentage: number,
-  defaultTheme: "emerald" | "cyan" = "emerald"
+  defaultTheme: "emerald" | "cyan" = "cyan"
 ): { barClass: string; badgeTextClass: string; activeSegmentClass: string } {
   if (percentage > 90) {
     return {
       barClass:
-        "bg-gradient-to-r from-rose-500 to-red-400 shadow-[0_0_12px_rgba(244,63,94,0.65)]",
+        "bg-gradient-to-r from-rose-500 to-red-400 shadow-[0_0_10px_rgba(244,63,94,0.45)]",
       badgeTextClass: "text-rose-400",
-      activeSegmentClass: "bg-rose-400 shadow-[0_0_8px_rgba(244,63,94,0.7)]",
+      activeSegmentClass: "bg-rose-400",
     };
   }
   if (percentage > 70) {
     return {
       barClass:
-        "bg-gradient-to-r from-amber-500 to-yellow-400 shadow-[0_0_12px_rgba(245,158,11,0.55)]",
+        "bg-gradient-to-r from-amber-500 to-yellow-400 shadow-[0_0_10px_rgba(245,158,11,0.4)]",
       badgeTextClass: "text-amber-400",
-      activeSegmentClass: "bg-amber-400 shadow-[0_0_8px_rgba(245,158,11,0.6)]",
+      activeSegmentClass: "bg-amber-400",
     };
   }
   if (defaultTheme === "cyan") {
     return {
       barClass:
-        "bg-gradient-to-r from-cyan-500 to-sky-400 shadow-[0_0_12px_rgba(34,211,238,0.45)]",
-      badgeTextClass: "text-cyan-400",
-      activeSegmentClass: "bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.55)]",
+        "bg-gradient-to-r from-[#00D5E8] to-[#36AFC0] shadow-[0_0_10px_rgba(0,213,232,0.35)]",
+      badgeTextClass: "text-[#00D5E8]",
+      activeSegmentClass: "bg-[#00D5E8]",
     };
   }
   return {
     barClass:
-      "bg-gradient-to-r from-sky-500 to-teal-400 shadow-[0_0_12px_rgba(56,189,248,0.45)]",
-    badgeTextClass: "text-sky-400",
-    activeSegmentClass: "bg-sky-400 shadow-[0_0_8px_rgba(56,189,248,0.55)]",
+      "bg-gradient-to-r from-[#36AFC0] to-[#00D5E8] shadow-[0_0_10px_rgba(54,175,192,0.35)]",
+    badgeTextClass: "text-[#36AFC0]",
+    activeSegmentClass: "bg-[#36AFC0]",
   };
 }
 
 export function SegmentedHudBar({
   percentage,
-  theme = "emerald",
+  theme = "cyan",
 }: {
   percentage: number;
   segments?: number;
@@ -598,7 +733,7 @@ export function SegmentedHudBar({
   const styles = getLoadBarStyles(clamped, theme);
 
   return (
-    <div className="relative h-2 w-full overflow-hidden rounded-sm border border-slate-800/90 bg-[#070a10] p-[1px]">
+    <div className="relative h-2 w-full overflow-hidden rounded-sm border border-[#202B38] bg-[#0B0E14] p-[1px]">
       <div
         className={`shimmer-bar relative h-full overflow-hidden rounded-[1px] ${styles.barClass}`}
         style={{
@@ -613,12 +748,42 @@ export function SegmentedHudBar({
 
 export function getLocationBadgeStyles(location: string): string {
   if (location.includes("HKCU")) {
-    return "bg-cyan-500/10 text-cyan-400 border-cyan-500/25";
+    return "bg-[#00D5E8]/10 text-[#00D5E8] border-[#00D5E8]/25";
   }
   if (location.includes("HKLM")) {
-    return "bg-indigo-500/10 text-indigo-400 border-indigo-500/25";
+    return "bg-indigo-500/10 text-indigo-300 border-indigo-500/25";
   }
-  return "bg-sky-500/10 text-sky-400 border-sky-500/25";
+  return "bg-[#36AFC0]/10 text-[#36AFC0] border-[#36AFC0]/25";
+}
+
+export interface PageHeaderProps {
+  title: string;
+  description: string;
+  badge?: ReactNode;
+  actions?: ReactNode;
+}
+
+export function PageHeader({ title, description, badge, actions }: PageHeaderProps) {
+  return (
+    <div className="flex flex-col gap-3 border-b border-[#202B38] pb-3.5 sm:flex-row sm:items-center sm:justify-between">
+      <div className="min-w-0">
+        <div className="flex flex-wrap items-center gap-2.5">
+          <h2 className="text-[22px] font-semibold tracking-tight text-[#E5EDF5]">
+            {title}
+          </h2>
+          {badge}
+        </div>
+        <p className="mt-0.5 text-[13px] leading-relaxed text-[#8292A3]">
+          {description}
+        </p>
+      </div>
+      {actions && (
+        <div className="flex shrink-0 flex-wrap items-center gap-2.5">
+          {actions}
+        </div>
+      )}
+    </div>
+  );
 }
 
 export interface SpotlightCardProps {
@@ -632,7 +797,7 @@ export interface SpotlightCardProps {
 export function SpotlightCard({
   children,
   className = "",
-  spotlightColor = "rgba(56, 189, 248, 0.12)",
+  spotlightColor = "rgba(0, 213, 232, 0.08)",
   variants,
 }: SpotlightCardProps) {
   const handleMouseMove = (e: MouseEvent<HTMLDivElement>) => {
@@ -656,7 +821,7 @@ export function SpotlightCard({
         className="pointer-events-none absolute inset-0 rounded-xl opacity-0 transition-opacity duration-300 group-hover:opacity-100"
         style={{
           background:
-            "radial-gradient(400px circle at var(--mouse-x, -200px) var(--mouse-y, -200px), var(--spotlight-color), transparent 80%)",
+            "radial-gradient(380px circle at var(--mouse-x, -200px) var(--mouse-y, -200px), var(--spotlight-color), transparent 80%)",
         }}
       />
       <div
@@ -664,7 +829,7 @@ export function SpotlightCard({
         style={{
           padding: "1px",
           background:
-            "radial-gradient(400px circle at var(--mouse-x, -200px) var(--mouse-y, -200px), rgba(56, 189, 248, 0.55), transparent 80%)",
+            "radial-gradient(380px circle at var(--mouse-x, -200px) var(--mouse-y, -200px), rgba(0, 213, 232, 0.45), transparent 80%)",
           mask: "linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0)",
           maskComposite: "exclude",
           WebkitMask: "linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0)",
@@ -743,7 +908,6 @@ function nearestSeries(
   return best;
 }
 
-// Изолированный компонент графика истории нагрузки за последние 60 секунд
 export const LoadHistoryChart = memo(function LoadHistoryChart({
   history,
 }: {
@@ -795,15 +959,15 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
     dotRef.current.style.opacity = "1";
     dotRef.current.style.left = `${xPct}%`;
     dotRef.current.style.top = `${yPct}%`;
-    dotRef.current.style.background = hit.series === "cpu" ? "#38bdf8" : "#2dd4bf";
+    dotRef.current.style.background = hit.series === "cpu" ? "#00D5E8" : "#6366F1";
     dotRef.current.style.boxShadow =
       hit.series === "cpu"
-        ? "0 0 8px rgba(56, 189, 248, 0.85)"
-        : "0 0 8px rgba(45, 212, 191, 0.8)";
+        ? "0 0 8px rgba(0, 213, 232, 0.85)"
+        : "0 0 8px rgba(99, 102, 241, 0.8)";
     badgeRef.current.style.opacity = "1";
     badgeRef.current.style.left = `${Math.min(84, Math.max(16, xPct))}%`;
     tipRef.current.textContent = `${point.timestamp}  ${hit.series === "cpu" ? "CPU" : "RAM"} ${value.toFixed(1)}%`;
-    tipRef.current.style.color = hit.series === "cpu" ? "#38bdf8" : "#5eead4";
+    tipRef.current.style.color = hit.series === "cpu" ? "#00D5E8" : "#A5B4FC";
   };
 
   const hideHover = () => {
@@ -829,38 +993,38 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
   return (
     <SpotlightCard
       variants={cardItemVariants}
-      spotlightColor="rgba(56, 189, 248, 0.12)"
-      className="p-5 sm:p-6"
+      spotlightColor="rgba(0, 213, 232, 0.08)"
+      className="p-4 sm:p-5"
     >
       <div className="space-y-4">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
           <div>
-            <div className="flex items-center gap-2">
-              <h3 className="text-base font-semibold tracking-tight text-slate-100">
-                Производительность (последние 60 сек)
+            <div className="flex items-center gap-2.5">
+              <h3 className="text-[15px] font-semibold tracking-tight text-[#E5EDF5]">
+                Динамика нагрузки системы
               </h3>
-              <span className="inline-flex items-center gap-1 rounded border border-cyan-500/30 bg-cyan-500/10 px-2 py-0.5 font-mono text-[10px] font-bold tracking-wider text-cyan-300">
-                <Sparkles size={10} /> LIVE TELEMETRY // 60S
+              <span className="rounded border border-[#202B38] bg-[#151C26] px-2 py-0.5 font-mono text-[11px] font-medium text-[#8292A3]">
+                60 сек
               </span>
             </div>
-            <p className="mt-0.5 text-sm text-slate-400">
-              Обновление каждую секунду · <span className="font-mono">{activePoint?.timestamp ?? "—"}</span>
+            <p className="mt-0.5 text-xs text-[#8292A3]">
+              Интервал опроса 1 сек · Срез: <span className="font-mono text-[#E5EDF5]">{activePoint?.timestamp ?? "—"}</span>
             </p>
           </div>
 
-          <div className="flex items-center gap-5 rounded-xl border border-white/5 bg-[#0e1118] px-3.5 py-2 text-xs">
+          <div className="flex items-center gap-4 rounded-lg border border-[#202B38] bg-[#0B0E14] px-3.5 py-2 text-xs">
             <div className="flex items-center gap-2">
-              <span className="h-2.5 w-2.5 rounded-full bg-sky-400 shadow-[0_0_10px_rgba(56,189,248,0.85)]"></span>
-              <span className="text-[#8793a5]">CPU:</span>
-              <span className="w-12 text-right font-mono font-semibold text-sky-400">
+              <span className="h-2 w-2 rounded-full bg-[#00D5E8] shadow-[0_0_8px_rgba(0,213,232,0.75)]"></span>
+              <span className="text-[#8292A3]">CPU</span>
+              <span className="w-12 text-right font-mono font-semibold text-[#00D5E8]">
                 {activePoint ? `${activePoint.cpu.toFixed(1)}%` : "0.0%"}
               </span>
             </div>
-            <div className="h-3.5 w-px bg-zinc-800" />
+            <div className="h-3.5 w-px bg-[#202B38]" />
             <div className="flex items-center gap-2">
-              <span className="h-2.5 w-2.5 rounded-full bg-teal-400 shadow-[0_0_10px_rgba(45,212,191,0.75)]"></span>
-              <span className="text-[#8793a5]">RAM:</span>
-              <span className="w-12 text-right font-mono font-semibold text-teal-300">
+              <span className="h-2 w-2 rounded-full bg-indigo-400 shadow-[0_0_8px_rgba(99,102,241,0.7)]"></span>
+              <span className="text-[#8292A3]">RAM</span>
+              <span className="w-12 text-right font-mono font-semibold text-indigo-300">
                 {activePoint ? `${activePoint.ram.toFixed(1)}%` : "0.0%"}
               </span>
             </div>
@@ -870,11 +1034,11 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
         <div>
           <div
             ref={plotRef}
-            className="relative h-[260px] w-full select-none"
+            className="relative h-[220px] w-full select-none xl:h-[260px] 2xl:h-[320px]"
             onMouseMove={(e) => moveHover(e.clientX, e.clientY, e.currentTarget.getBoundingClientRect())}
             onMouseLeave={hideHover}
           >
-            <div className="pointer-events-none absolute inset-y-0 left-2 z-10 flex flex-col justify-between py-2 font-mono text-xs text-slate-500">
+            <div className="pointer-events-none absolute inset-y-0 left-2.5 z-10 flex flex-col justify-between py-2 font-mono text-[11px] text-[#526170]">
               <span>100%</span>
               <span>75%</span>
               <span>50%</span>
@@ -888,7 +1052,7 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
             />
             <div
               ref={badgeRef}
-              className="pointer-events-none absolute top-2.5 z-20 -translate-x-1/2 whitespace-nowrap rounded-lg border border-[#222b38] bg-[#0e1118] px-2.5 py-1 font-mono text-xs opacity-0 shadow-lg"
+              className="pointer-events-none absolute top-2.5 z-20 -translate-x-1/2 whitespace-nowrap rounded-lg border border-[#202B38] bg-[#151C26] px-2.5 py-1 font-mono text-xs opacity-0 shadow-lg"
             >
               <span ref={tipRef} className="font-semibold" />
             </div>
@@ -896,25 +1060,25 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
             <svg
               viewBox={`0 0 ${width} ${height}`}
               preserveAspectRatio="none"
-              className="pointer-events-none h-full w-full transform-gpu overflow-visible rounded-xl border border-slate-800/90 bg-[#080b11]"
+              className="pointer-events-none h-full w-full transform-gpu overflow-visible rounded-xl border border-[#202B38] bg-[#0B0E14]"
             >
               <defs>
                 <linearGradient id="cpuStroke" x1="0" y1="0" x2={width} y2="0" gradientUnits="userSpaceOnUse">
-                  <stop offset="0%" stopColor="#00F0FF" />
-                  <stop offset="100%" stopColor="#6366f1" />
+                  <stop offset="0%" stopColor="#00D5E8" />
+                  <stop offset="100%" stopColor="#36AFC0" />
                 </linearGradient>
                 <linearGradient id="ramStroke" x1="0" y1="0" x2={width} y2="0" gradientUnits="userSpaceOnUse">
-                  <stop offset="0%" stopColor="#2dd4bf" />
-                  <stop offset="100%" stopColor="#10b981" />
+                  <stop offset="0%" stopColor="#818CF8" />
+                  <stop offset="100%" stopColor="#38BDF8" />
                 </linearGradient>
                 <linearGradient id="cpuGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#00F0FF" stopOpacity="0.34" />
-                  <stop offset="55%" stopColor="#6366f1" stopOpacity="0.14" />
-                  <stop offset="100%" stopColor="#6366f1" stopOpacity="0" />
+                  <stop offset="0%" stopColor="#00D5E8" stopOpacity="0.28" />
+                  <stop offset="60%" stopColor="#36AFC0" stopOpacity="0.1" />
+                  <stop offset="100%" stopColor="#36AFC0" stopOpacity="0" />
                 </linearGradient>
                 <linearGradient id="ramGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#2dd4bf" stopOpacity="0.25" />
-                  <stop offset="100%" stopColor="#10b981" stopOpacity="0" />
+                  <stop offset="0%" stopColor="#818CF8" stopOpacity="0.2" />
+                  <stop offset="100%" stopColor="#38BDF8" stopOpacity="0" />
                 </linearGradient>
               </defs>
 
@@ -925,7 +1089,7 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
                   y1={0}
                   x2={width * ratio}
                   y2={height}
-                  stroke="#1e293b"
+                  stroke="#202B38"
                   strokeOpacity="0.55"
                   strokeDasharray="2 4"
                   strokeWidth="1"
@@ -939,8 +1103,8 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
                   y1={height * ratio}
                   x2={width}
                   y2={height * ratio}
-                  stroke="#1e293b"
-                  strokeOpacity="0.8"
+                  stroke="#202B38"
+                  strokeOpacity="0.75"
                   strokeDasharray="4 4"
                   strokeWidth="1"
                 />
@@ -951,23 +1115,22 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
                 d={ramPaths.line}
                 fill="none"
                 stroke="url(#ramStroke)"
-                strokeWidth="5"
+                strokeWidth="4"
                 strokeLinecap="round"
                 strokeLinejoin="round"
-                opacity="0.28"
+                opacity="0.24"
                 vectorEffect="non-scaling-stroke"
               />
               <path
                 d={ramPaths.line}
                 fill="none"
                 stroke="url(#ramStroke)"
-                strokeWidth="2.2"
+                strokeWidth="2"
                 strokeLinecap="round"
                 strokeLinejoin="round"
                 vectorEffect="non-scaling-stroke"
                 style={{
-                  filter:
-                    "drop-shadow(0 0 2px rgba(45,212,191,0.7)) drop-shadow(0 0 8px rgba(16,185,129,0.35))",
+                  filter: "drop-shadow(0 0 6px rgba(129, 140, 248, 0.35))",
                 }}
               />
 
@@ -976,10 +1139,10 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
                 d={cpuPaths.line}
                 fill="none"
                 stroke="url(#cpuStroke)"
-                strokeWidth="5"
+                strokeWidth="4"
                 strokeLinecap="round"
                 strokeLinejoin="round"
-                opacity="0.32"
+                opacity="0.28"
                 vectorEffect="non-scaling-stroke"
               />
               <path
@@ -990,7 +1153,7 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
                 strokeLinecap="round"
                 strokeLinejoin="round"
                 vectorEffect="non-scaling-stroke"
-                style={{ filter: "drop-shadow(0 0 8px rgba(0, 240, 255, 0.55))" }}
+                style={{ filter: "drop-shadow(0 0 6px rgba(0, 213, 232, 0.45))" }}
               />
             </svg>
 
@@ -1002,9 +1165,9 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
                   top: `${(ramBeacon.y / height) * 100}%`,
                 }}
               >
-                <div className="relative h-3.5 w-3.5 -translate-x-1/2 -translate-y-1/2 transform-gpu">
-                  <span className="absolute inset-0 animate-ping rounded-full bg-teal-300/70" />
-                  <span className="absolute left-1/2 top-1/2 h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-teal-200 shadow-[0_0_8px_rgba(45,212,191,0.9)]" />
+                <div className="relative h-3 w-3 -translate-x-1/2 -translate-y-1/2 transform-gpu">
+                  <span className="absolute inset-0 animate-ping rounded-full bg-indigo-400/60" />
+                  <span className="absolute left-1/2 top-1/2 h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-indigo-300 shadow-[0_0_6px_rgba(129,140,248,0.85)]" />
                 </div>
               </div>
             )}
@@ -1016,15 +1179,15 @@ export const LoadHistoryChart = memo(function LoadHistoryChart({
                   top: `${(cpuBeacon.y / height) * 100}%`,
                 }}
               >
-                <div className="relative h-3.5 w-3.5 -translate-x-1/2 -translate-y-1/2 transform-gpu">
-                  <span className="absolute inset-0 animate-ping rounded-full bg-sky-400/75" />
-                  <span className="absolute left-1/2 top-1/2 h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-sky-200 shadow-[0_0_8px_rgba(56,189,248,0.95)]" />
+                <div className="relative h-3 w-3 -translate-x-1/2 -translate-y-1/2 transform-gpu">
+                  <span className="absolute inset-0 animate-ping rounded-full bg-[#00D5E8]/65" />
+                  <span className="absolute left-1/2 top-1/2 h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[#00D5E8] shadow-[0_0_6px_rgba(0,213,232,0.9)]" />
                 </div>
               </div>
             )}
           </div>
 
-          <div className="mt-1.5 flex justify-between px-1 text-xs text-slate-500">
+          <div className="mt-1.5 flex justify-between px-1 font-mono text-[11px] text-[#526170]">
             <span>-60 сек</span>
             <span>-30 сек</span>
             <span>Сейчас</span>

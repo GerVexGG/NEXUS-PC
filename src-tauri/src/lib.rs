@@ -11,8 +11,13 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use sysinfo::{Disks, Networks, System};
+mod archive;
 mod drop_server;
+mod gpu_fallback;
+mod net_monitor;
+mod scripts;
 mod settings;
+mod storage_smart;
 mod telemetry;
 
 use tauri::{Manager, State};
@@ -105,6 +110,18 @@ pub struct CpuTelemetry {
     pub power_watts: Option<f32>,
     pub voltage_v: Option<f32>,
     pub core_temps: Vec<CoreTemp>,
+    #[serde(default)]
+    pub usage_percent: f32,
+    #[serde(default)]
+    pub base_clock_mhz: Option<f32>,
+    #[serde(default)]
+    pub physical_cores: u32,
+    #[serde(default)]
+    pub logical_cores: u32,
+    #[serde(default)]
+    pub core_loads: Vec<f32>,
+    #[serde(default)]
+    pub hvci_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -121,6 +138,30 @@ pub struct GpuTelemetry {
     pub voltage_v: Option<f32>,
     #[serde(default)]
     pub load_percent: Option<f32>,
+    #[serde(default)]
+    pub vendor: String,
+    #[serde(default)]
+    pub vram_used_mb: Option<f32>,
+    #[serde(default)]
+    pub vram_total_mb: Option<f32>,
+    #[serde(default)]
+    pub vram_used_percent: Option<f32>,
+    #[serde(default)]
+    pub d3d_shared_mb: Option<f32>,
+    #[serde(default)]
+    pub memory_controller_load_percent: Option<f32>,
+    #[serde(default)]
+    pub video_engine_load_percent: Option<f32>,
+    #[serde(default)]
+    pub power_limit_percent: Option<f32>,
+    #[serde(default)]
+    pub pcie_rx_mb_s: Option<f32>,
+    #[serde(default)]
+    pub pcie_tx_mb_s: Option<f32>,
+    #[serde(default)]
+    pub fans: Vec<FanSensorItem>,
+    #[serde(default)]
+    pub telemetry_source: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -197,7 +238,32 @@ pub struct ProcessItem {
     pub disk_read_bytes_sec: u64,
     pub disk_write_bytes_sec: u64,
     pub run_time_sec: u64,
+    pub start_time: u64,
+    pub thread_count: u32,
+    pub handle_count: u32,
+    pub status: String,
     pub icon_base64: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ProcessDetails {
+    pub pid: u32,
+    pub parent_pid: Option<u32>,
+    pub parent_name: Option<String>,
+    pub name: String,
+    pub exe_path: String,
+    pub command_line: String,
+    pub working_dir: String,
+    pub status: String,
+    pub cpu_usage: f32,
+    pub memory_mb: f64,
+    pub virtual_memory_mb: f64,
+    pub run_time_sec: u64,
+    pub start_time: u64,
+    pub thread_count: u32,
+    pub handle_count: u32,
+    pub child_count: usize,
+    pub total_descendants: usize,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -260,16 +326,18 @@ pub struct AppState {
     pub networks: Arc<Mutex<Networks>>,
     pub disk_space: Arc<Mutex<(u64, u64)>>,
     pub ping_cache: Arc<Mutex<(u32, Option<Instant>, bool)>>,
-    pub process_last_refresh: Mutex<Option<Instant>>,
-    pub pid_cache: Mutex<HashMap<u32, (String, String)>>,
+    pub process_last_refresh: Arc<Mutex<Option<Instant>>>,
+    pub pid_cache: Arc<Mutex<HashMap<u32, (String, String)>>>,
     pub hw_telemetry: Arc<Mutex<Option<HardwareTelemetry>>>,
     pub hw_sidecar_child: Arc<Mutex<Option<Child>>>,
     pub hwmon_watchdog: Arc<Mutex<HwmonWatchdogState>>,
     pub scan_cancellation_token: Arc<AtomicBool>,
-    pub icon_cache: Mutex<HashMap<String, String>>,
+    pub icon_cache: Arc<Mutex<HashMap<String, String>>>,
     pub drop_hub: Arc<drop_server::DropHub>,
     pub tray_ping_item: Mutex<Option<tauri::menu::MenuItem<tauri::Wry>>>,
     pub history_buffer: Arc<RwLock<VecDeque<telemetry::TelemetrySnapshot>>>,
+    pub gpu_pdh: Arc<Mutex<gpu_fallback::GpuPdhSampler>>,
+    pub net_monitor: Arc<Mutex<net_monitor::NetworkMonitorState>>,
 }
 
 impl Drop for AppState {
@@ -282,55 +350,51 @@ impl Drop for AppState {
     }
 }
 
-// Поиск скомпилированного бинарника nexus-hwmon.exe
-fn find_hwmon_sidecar_exe() -> Option<PathBuf> {
-    let candidates = [
-        // Корень проекта Nexus/hwmon-sidecar (при запуске из src-tauri или из корня Nexus)
-        PathBuf::from("nexus-hwmon.exe"),
-        PathBuf::from("../src-tauri/nexus-hwmon.exe"),
-        PathBuf::from("src-tauri/nexus-hwmon.exe"),
-        PathBuf::from("../hwmon-sidecar/bin/Release/net9.0/win-x64/publish/nexus-hwmon.exe"),
-        PathBuf::from("hwmon-sidecar/bin/Release/net9.0/win-x64/publish/nexus-hwmon.exe"),
-        PathBuf::from("../hwmon-sidecar/bin/publish/nexus-hwmon.exe"),
-        PathBuf::from("hwmon-sidecar/bin/publish/nexus-hwmon.exe"),
-        PathBuf::from("../hwmon-sidecar/bin/Release/net9.0/win-x64/nexus-hwmon.exe"),
-        PathBuf::from("hwmon-sidecar/bin/Release/net9.0/win-x64/nexus-hwmon.exe"),
-        // Фоллбэки на случай размещения внутри src-tauri
-        PathBuf::from("src-tauri/hwmon-sidecar/bin/publish/nexus-hwmon.exe"),
-        PathBuf::from("src-tauri/hwmon-sidecar/bin/Release/net9.0/win-x64/nexus-hwmon.exe"),
-    ];
+fn normalize_sidecar_path(cand: &Path) -> Option<PathBuf> {
+    if !cand.is_file() {
+        return None;
+    }
+    let abs = std::fs::canonicalize(cand)
+        .or_else(|_| std::env::current_dir().map(|cwd| cwd.join(cand)))
+        .ok()?;
+    let raw = abs.to_string_lossy();
+    let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    Some(PathBuf::from(stripped))
+}
 
-    for cand in &candidates {
-        if cand.exists() {
-            return Some(cand.clone());
+// Поиск скомпилированного бинарника nexus-hwmon.exe (абсолютный путь без UNC-префикса)
+fn find_hwmon_sidecar_exe() -> Option<PathBuf> {
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let exe_candidates = [
+                exe_dir.join("nexus-hwmon.exe"),
+                exe_dir.join("../../nexus-hwmon.exe"),
+                exe_dir.join("../../../hwmon-sidecar/bin/publish/nexus-hwmon.exe"),
+                exe_dir.join("../../../hwmon-sidecar/bin/Release/net9.0/win-x64/publish/nexus-hwmon.exe"),
+                exe_dir.join("../../hwmon-sidecar/bin/publish/nexus-hwmon.exe"),
+            ];
+            for cand in &exe_candidates {
+                if let Some(resolved) = normalize_sidecar_path(cand) {
+                    return Some(resolved);
+                }
+            }
         }
     }
 
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            let near_exe = exe_dir.join("nexus-hwmon.exe");
-            if near_exe.exists() {
-                return Some(near_exe);
-            }
-            let beside_manifest = exe_dir.join("../../nexus-hwmon.exe");
-            if beside_manifest.exists() {
-                return Some(beside_manifest);
-            }
-            // При запуске из src-tauri/target/debug поднимаемся на 3 уровня к Nexus/hwmon-sidecar
-            let from_target_root = exe_dir.join("../../../hwmon-sidecar/bin/publish/nexus-hwmon.exe");
-            if from_target_root.exists() {
-                return Some(from_target_root);
-            }
-            let from_target_release =
-                exe_dir.join("../../../hwmon-sidecar/bin/Release/net9.0/win-x64/nexus-hwmon.exe");
-            if from_target_release.exists() {
-                return Some(from_target_release);
-            }
-            // Фоллбэк: 2 уровня вверх (если папка внутри src-tauri)
-            let from_target = exe_dir.join("../../hwmon-sidecar/bin/publish/nexus-hwmon.exe");
-            if from_target.exists() {
-                return Some(from_target);
-            }
+    let candidates = [
+        PathBuf::from("nexus-hwmon.exe"),
+        PathBuf::from("src-tauri/nexus-hwmon.exe"),
+        PathBuf::from("../src-tauri/nexus-hwmon.exe"),
+        PathBuf::from("hwmon-sidecar/bin/publish/nexus-hwmon.exe"),
+        PathBuf::from("../hwmon-sidecar/bin/publish/nexus-hwmon.exe"),
+        PathBuf::from("hwmon-sidecar/bin/Release/net9.0/win-x64/publish/nexus-hwmon.exe"),
+        PathBuf::from("../hwmon-sidecar/bin/Release/net9.0/win-x64/publish/nexus-hwmon.exe"),
+        PathBuf::from("src-tauri/hwmon-sidecar/bin/publish/nexus-hwmon.exe"),
+    ];
+
+    for cand in &candidates {
+        if let Some(resolved) = normalize_sidecar_path(cand) {
+            return Some(resolved);
         }
     }
 
@@ -376,7 +440,9 @@ fn spawn_hwmon_sidecar(
 
     let mut cmd = Command::new(&exe_path);
     if let Some(parent_dir) = exe_path.parent() {
-        cmd.current_dir(parent_dir);
+        if !parent_dir.as_os_str().is_empty() && parent_dir.is_dir() {
+            cmd.current_dir(parent_dir);
+        }
     }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -629,90 +695,222 @@ async fn restart_hwmon(state: State<'_, AppState>) -> Result<(), String> {
     .map_err(|e| format!("Ошибка потока перезапуска сайдкара: {e}"))?
 }
 
-#[tauri::command]
-fn get_hardware_telemetry(state: State<'_, AppState>) -> Result<HardwareTelemetry, String> {
+fn build_storage_temp_items(lhm_items: &[StorageTempItem]) -> Vec<StorageTempItem> {
+    static FALLBACK_CACHE: std::sync::OnceLock<Mutex<Option<(Instant, Vec<StorageTempItem>)>>> =
+        std::sync::OnceLock::new();
 
-    // Читаем базовые данные процессора из sysinfo для обогащения или fallback-ответа
-    let (fallback_cpu_name, fallback_clock_mhz) = if let Ok(mut sys) = state.sys.lock() {
-        sys.refresh_cpu_frequency();
-        let cpus = sys.cpus();
-        let name = cpus
-            .first()
-            .map(|c| c.brand().trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "Процессор x64".to_string());
-        let avg_freq = if !cpus.is_empty() {
-            let sum: u64 = cpus.iter().map(|c| c.frequency()).sum();
-            Some((sum as f32) / (cpus.len() as f32))
-        } else {
-            None
-        };
-        (name, avg_freq)
+    if lhm_items.is_empty() {
+        let cache_mutex = FALLBACK_CACHE.get_or_init(|| Mutex::new(None));
+        if let Ok(guard) = cache_mutex.lock() {
+            if let Some((at, ref cached)) = *guard {
+                if at.elapsed() < Duration::from_secs(5) {
+                    return cached.clone();
+                }
+            }
+        }
+    }
+
+    let smart_disks = storage_smart::query_physical_disks_smart_cached(false);
+    let disks = Disks::new_with_refreshed_list();
+
+    let mut total_vol_bytes: f64 = 0.0;
+    let mut used_vol_bytes: f64 = 0.0;
+    let mut volume_rows: Vec<StorageTempItem> = Vec::new();
+    for d in disks.iter() {
+        let total = d.total_space() as f64;
+        if total <= 0.0 {
+            continue;
+        }
+        let used = (total - (d.available_space() as f64)).max(0.0);
+        total_vol_bytes += total;
+        used_vol_bytes += used;
+        let used_pct = Some(((used / total) * 100.0) as f32);
+        let mount = d.mount_point().to_string_lossy().to_string();
+        let disk_name = d.name().to_string_lossy().to_string();
+        volume_rows.push(StorageTempItem {
+            name: if disk_name.is_empty() {
+                format!("Том ({mount})")
+            } else {
+                format!("{disk_name} ({mount})")
+            },
+            temp_c: None,
+            used_percent: used_pct,
+        });
+    }
+    let overall_used_pct = if total_vol_bytes > 0.0 {
+        Some(((used_vol_bytes / total_vol_bytes) * 100.0) as f32)
     } else {
-        ("Процессор x64".to_string(), None)
+        None
     };
 
-    if let Ok(guard) = state.hw_telemetry.lock() {
-        if let Some(mut data) = guard.clone() {
+    if !lhm_items.is_empty() {
+        return lhm_items
+            .iter()
+            .map(|item| {
+                let mut cloned = item.clone();
+                if cloned.temp_c.is_none() {
+                    let item_low = cloned.name.to_ascii_lowercase();
+                    if let Some(matched) = smart_disks
+                        .iter()
+                        .find(|s| {
+                            let m = s.model.to_ascii_lowercase();
+                            !m.is_empty() && (item_low.contains(&m) || m.contains(&item_low))
+                        })
+                        .or_else(|| if smart_disks.len() == 1 { smart_disks.first() } else { None })
+                    {
+                        cloned.temp_c = matched.temp_c.map(|t| t as f32);
+                    }
+                }
+                if cloned.used_percent.is_none() && smart_disks.len() <= 1 {
+                    cloned.used_percent = overall_used_pct;
+                }
+                cloned
+            })
+            .collect();
+    }
+
+    let result = if !smart_disks.is_empty() {
+        let single_drive = smart_disks.len() == 1;
+        let mut items: Vec<StorageTempItem> = smart_disks
+            .iter()
+            .map(|s| StorageTempItem {
+                name: format!("{} ({})", s.model, s.kind),
+                temp_c: s.temp_c.map(|t| t as f32),
+                used_percent: if single_drive { overall_used_pct } else { None },
+            })
+            .collect();
+        if !single_drive {
+            items.extend(volume_rows);
+        }
+        items
+    } else {
+        volume_rows
+    };
+
+    let cache_mutex = FALLBACK_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = cache_mutex.lock() {
+        *guard = Some((Instant::now(), result.clone()));
+    }
+    result
+}
+
+#[tauri::command]
+async fn get_hardware_telemetry(state: State<'_, AppState>) -> Result<HardwareTelemetry, String> {
+    let sys_arc = Arc::clone(&state.sys);
+    let hw_telemetry_arc = Arc::clone(&state.hw_telemetry);
+    let gpu_pdh_arc = Arc::clone(&state.gpu_pdh);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        // Читаем базовые данные и поточную загрузку процессора из sysinfo
+        let (
+            fallback_cpu_name,
+            base_clock_mhz,
+            usage_percent,
+            physical_cores,
+            logical_cores,
+            core_loads,
+        ) = if let Ok(mut sys) = sys_arc.lock() {
+            sys.refresh_cpu_frequency();
+            let cpus = sys.cpus();
+            let name = cpus
+                .first()
+                .map(|c| c.brand().trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "Процессор x64".to_string());
+            let avg_freq = if !cpus.is_empty() {
+                let sum: u64 = cpus.iter().map(|c| c.frequency()).sum();
+                Some((sum as f32) / (cpus.len() as f32))
+            } else {
+                None
+            };
+            let loads: Vec<f32> = cpus.iter().map(|c| c.cpu_usage()).collect();
+            let phys = sys.physical_core_count().unwrap_or(cpus.len()) as u32;
+            (
+                name,
+                avg_freq,
+                sys.global_cpu_usage(),
+                phys,
+                cpus.len() as u32,
+                loads,
+            )
+        } else {
+            ("Процессор x64".to_string(), None, 0.0, 0, 0, Vec::new())
+        };
+
+        let hvci_enabled = gpu_fallback::is_hvci_enabled();
+        let existing_telemetry = hw_telemetry_arc.lock().ok().and_then(|guard| guard.clone());
+
+        if let Some(mut data) = existing_telemetry {
+            let needs_gpu_pdh =
+                data.gpus.is_empty() || data.gpus.iter().any(|gpu| gpu.load_percent.is_none());
+            let (pdh_gpu_load, pdh_cpu_clock) = gpu_pdh_arc
+                .lock()
+                .ok()
+                .map(|mut s| s.sample_hardware_pdh(needs_gpu_pdh, base_clock_mhz))
+                .unwrap_or((None, None));
+
             if data.cpu.name.is_empty() || data.cpu.name == "Процессор" {
                 data.cpu.name = fallback_cpu_name;
             }
+            data.cpu.usage_percent = usage_percent;
+            data.cpu.base_clock_mhz = base_clock_mhz;
+            data.cpu.physical_cores = physical_cores;
+            data.cpu.logical_cores = logical_cores;
+            data.cpu.core_loads = core_loads;
+            data.cpu.hvci_enabled = hvci_enabled;
             if data.cpu.avg_clock_mhz.is_none() {
-                data.cpu.avg_clock_mhz = fallback_clock_mhz;
+                data.cpu.avg_clock_mhz = pdh_cpu_clock.or(base_clock_mhz);
             }
+
+            gpu_fallback::enrich_gpus(&mut data.gpus, pdh_gpu_load);
+            data.storage_temps = build_storage_temp_items(&data.storage_temps);
+
             settings::consider_hardware(
                 data.cpu.package_temp_c.or(data.cpu.max_core_temp_c),
                 data.gpus.iter().filter_map(|gpu| gpu.core_temp_c).reduce(f32::max),
             );
             return Ok(data);
         }
-    }
 
-    // Если sidecar еще инициализируется, возвращаем частичные метрики без падения
-    let disks = Disks::new_with_refreshed_list();
-    let storage_temps: Vec<StorageTempItem> = disks
-        .iter()
-        .map(|d| {
-            let total = d.total_space() as f32;
-            let used = total - (d.available_space() as f32);
-            let used_pct = if total > 0.0 {
-                Some((used / total) * 100.0)
-            } else {
-                None
-            };
-            let mount = d.mount_point().to_string_lossy().to_string();
-            let disk_name = d.name().to_string_lossy().to_string();
-            StorageTempItem {
-                name: if disk_name.is_empty() {
-                    format!("Накопитель ({})", mount)
-                } else {
-                    format!("{} ({})", disk_name, mount)
-                },
-                temp_c: None,
-                used_percent: used_pct,
-            }
+        // Если sidecar еще инициализируется, возвращаем доступные метрики ОС + DXGI + PDH + NVMe IOCTL
+        let mut fallback_gpus = Vec::new();
+        let (pdh_gpu_load, pdh_cpu_clock) = gpu_pdh_arc
+            .lock()
+            .ok()
+            .map(|mut s| s.sample_hardware_pdh(true, base_clock_mhz))
+            .unwrap_or((None, None));
+        gpu_fallback::enrich_gpus(&mut fallback_gpus, pdh_gpu_load);
+
+        let storage_temps = build_storage_temp_items(&[]);
+
+        Ok(HardwareTelemetry {
+            is_admin: check_is_elevated_admin(),
+            sidecar_online: false,
+            timestamp_ms: 0,
+            cpu: CpuTelemetry {
+                name: fallback_cpu_name,
+                package_temp_c: None,
+                max_core_temp_c: None,
+                avg_clock_mhz: pdh_cpu_clock.or(base_clock_mhz),
+                power_watts: None,
+                voltage_v: None,
+                core_temps: Vec::new(),
+                usage_percent,
+                base_clock_mhz,
+                physical_cores,
+                logical_cores,
+                core_loads,
+                hvci_enabled,
+            },
+            gpus: fallback_gpus,
+            motherboard_name: "Ожидание инициализации датчиков LibreHardwareMonitor...".to_string(),
+            motherboard_temps: Vec::new(),
+            system_fans: Vec::new(),
+            storage_temps,
         })
-        .collect();
-
-    Ok(HardwareTelemetry {
-        is_admin: false,
-        sidecar_online: false,
-        timestamp_ms: 0,
-        cpu: CpuTelemetry {
-            name: fallback_cpu_name,
-            package_temp_c: None,
-            max_core_temp_c: None,
-            avg_clock_mhz: fallback_clock_mhz,
-            power_watts: None,
-            voltage_v: None,
-            core_temps: Vec::new(),
-        },
-        gpus: Vec::new(),
-        motherboard_name: "Ожидание инициализации датчиков LibreHardwareMonitor...".to_string(),
-        motherboard_temps: Vec::new(),
-        system_fans: Vec::new(),
-        storage_temps,
     })
+    .await
+    .map_err(|e| format!("Ошибка потока аппаратной телеметрии: {e}"))?
 }
 
 // Раскрытие переменных окружения Windows (%APPDATA%, %LOCALAPPDATA%, %ProgramFiles% и остальных).
@@ -2532,7 +2730,7 @@ fn scan_worker_loop(
     let mut children = Vec::new();
     for (sub, bytes, kids) in nested {
         tree_bytes = tree_bytes.saturating_add(bytes);
-        if depth < 3 {
+        if depth < 5 {
             children.push(FolderNode {
                 name: sub
                     .file_name()
@@ -2540,13 +2738,21 @@ fn scan_worker_loop(
                     .unwrap_or_default(),
                 path: sub.to_string_lossy().into_owned(),
                 size_bytes: bytes,
-                children: if depth < 2 { kids } else { Vec::new() },
+                children: if depth < 4 { kids } else { Vec::new() },
             });
         }
     }
-    if depth < 3 {
+    if depth < 5 {
+        if depth > 0 && direct_bytes > 0 && !children.is_empty() {
+            children.push(FolderNode {
+                name: "[Файлы в папке]".to_string(),
+                path: path.to_string_lossy().into_owned(),
+                size_bytes: direct_bytes,
+                children: Vec::new(),
+            });
+        }
         children.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
-        children.truncate(10);
+        children.truncate(12);
     }
 
     (tree_bytes, direct_bytes, children)
@@ -2671,15 +2877,17 @@ async fn scan_drive_storage(state: State<'_, AppState>, path: String) -> Result<
 }
 
 fn probe_gateway_ping_ms() -> u32 {
-    let targets = [
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
-    ];
+    let hosts = [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)];
+    for ip in &hosts {
+        if let Some(ms) = net_monitor::icmp_ping_ipv4(*ip, 450) {
+            return ms.max(1);
+        }
+    }
     let timeout = Duration::from_millis(450);
-
-    for addr in &targets {
+    for ip in &hosts {
+        let addr = SocketAddr::new(IpAddr::V4(*ip), 53);
         let start = Instant::now();
-        if TcpStream::connect_timeout(addr, timeout).is_ok() {
+        if TcpStream::connect_timeout(&addr, timeout).is_ok() {
             let ms = start.elapsed().as_millis() as u32;
             return ms.max(1);
         }
@@ -2749,7 +2957,14 @@ async fn get_system_metrics(state: State<'_, AppState>) -> Result<SystemMetrics,
         )
     };
 
-    let (net_rx_kbps, net_tx_kbps) = if let Ok(mut networks) = state.networks.lock() {
+    let (net_rx_kbps, net_tx_kbps) = if let Some(rates) = state
+        .net_monitor
+        .lock()
+        .ok()
+        .and_then(|mut nm| nm.read_system_throughput_kbps().ok())
+    {
+        rates
+    } else if let Ok(mut networks) = state.networks.lock() {
         networks.refresh(true);
         let mut total_rx_bytes: u64 = 0;
         let mut total_tx_bytes: u64 = 0;
@@ -2897,7 +3112,7 @@ fn cancel_shutdown() -> Result<(), String> {
 }
 
 // Проверка запуска с правами Администратора (чтение защищённого куста реестра S-1-5-19)
-fn check_is_elevated_admin() -> bool {
+pub(crate) fn check_is_elevated_admin() -> bool {
     #[cfg(target_os = "windows")]
     {
         RegKey::predef(HKEY_USERS).open_subkey("S-1-5-19").is_ok()
@@ -2949,14 +3164,38 @@ fn restart_as_admin(app: tauri::AppHandle, state: State<'_, AppState>) -> Result
     Ok(())
 }
 
-#[tauri::command]
-fn app_exit(app: tauri::AppHandle, state: State<'_, AppState>) {
-    if let Ok(mut guard) = state.hw_sidecar_child.lock() {
-        if let Some(mut child) = guard.take() {
-            let _ = child.kill();
+fn cleanup_app_resources(app: &tauri::AppHandle) {
+    archive::cancel_active_archive();
+    if let Some(state) = app.try_state::<AppState>() {
+        state.scan_cancellation_token.store(true, Ordering::SeqCst);
+        let _ = state.drop_hub.stop();
+        if let Ok(mut guard) = state.hw_sidecar_child.lock() {
+            if let Some(mut child) = guard.take() {
+                let _ = child.kill();
+            }
         }
     }
+}
+
+#[tauri::command]
+fn app_exit(app: tauri::AppHandle) {
+    cleanup_app_resources(&app);
     app.exit(0);
+}
+
+#[tauri::command]
+fn hide_to_tray(app: tauri::AppHandle) {
+    if let Some(hud) = app.get_webview_window("tray_hud") {
+        let _ = hud.hide();
+    }
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+}
+
+#[tauri::command]
+fn restore_from_tray(app: tauri::AppHandle) {
+    reveal_main_window(&app);
 }
 
 #[tauri::command]
@@ -2991,6 +3230,18 @@ struct RouteProbe {
 }
 
 fn sample_tcp_route(ip: Ipv4Addr, port: u16) -> (u32, u32) {
+    if let Some(first) = net_monitor::icmp_ping_ipv4(ip, 500) {
+        let mut samples = vec![first.max(1)];
+        for _ in 0..2 {
+            if let Some(ms) = net_monitor::icmp_ping_ipv4(ip, 500) {
+                samples.push(ms.max(1));
+            }
+        }
+        let fastest = *samples.iter().min().unwrap_or(&0);
+        let slowest = *samples.iter().max().unwrap_or(&0);
+        return (fastest, slowest.saturating_sub(fastest));
+    }
+
     let addr = SocketAddr::new(IpAddr::V4(ip), port);
     let mut samples = Vec::new();
     for _ in 0..3 {
@@ -3049,11 +3300,15 @@ async fn probe_game_routes() -> Result<Vec<RouteProbe>, String> {
 struct DiskHealthInfo {
     model: String,
     kind: String,
+    firmware: String,
     health_percent: Option<u32>,
     health_label: String,
+    available_spare: Option<u32>,
     power_on_hours: Option<u64>,
+    power_cycles: Option<u64>,
     temp_c: Option<u32>,
     tbw_tb: Option<f64>,
+    read_tb: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -3108,6 +3363,27 @@ fn health_label(percent: Option<u32>, status: &str) -> String {
 #[tauri::command]
 async fn get_disk_health_info() -> Result<Vec<DiskHealthInfo>, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // Сначала пробуем прямой нативный Win32 IOCTL_STORAGE_QUERY_PROPERTY (работает без Администратора и без PowerShell).
+        let native_disks = storage_smart::query_physical_disks_smart();
+        if !native_disks.is_empty() {
+            return Ok(native_disks
+                .into_iter()
+                .map(|d| DiskHealthInfo {
+                    model: d.model,
+                    kind: d.kind,
+                    firmware: d.firmware,
+                    health_percent: d.health_percent,
+                    health_label: d.health_label,
+                    available_spare: d.available_spare,
+                    power_on_hours: d.power_on_hours,
+                    power_cycles: d.power_cycles,
+                    temp_c: d.temp_c,
+                    tbw_tb: d.tbw_tb,
+                    read_tb: d.read_tb,
+                })
+                .collect());
+        }
+
         let script = r#"
 $ErrorActionPreference='SilentlyContinue'
 $rows = New-Object System.Collections.Generic.List[object]
@@ -3178,17 +3454,21 @@ ConvertTo-Json -InputObject @($rows.ToArray()) -Compress
                 DiskHealthInfo {
                     model: row.model.unwrap_or_else(|| "Накопитель".to_string()),
                     kind: disk_kind(row.media.as_deref().unwrap_or(""), row.bus.as_deref().unwrap_or("")),
+                    firmware: String::new(),
                     health_label: health_label(health_percent, &status),
                     health_percent,
+                    available_spare: None,
                     power_on_hours: row
                         .power_on_hours
                         .filter(|value| *value >= 0.0)
                         .map(|value| value.round() as u64),
+                    power_cycles: None,
                     temp_c: temp,
                     tbw_tb: row
                         .bytes_written
                         .filter(|value| *value > 0.0)
                         .map(|value| value / 1_000_000_000_000.0),
+                    read_tb: None,
                 }
             })
             .collect())
@@ -3234,12 +3514,40 @@ fn read_leading_u32(bytes: &[u8]) -> Option<u32> {
 }
 
 fn ping_once(host: &str) -> Option<u32> {
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        return net_monitor::icmp_ping_ipv4(ip, 1000).map(|ms| ms.max(1));
+    }
     let mut cmd = Command::new("ping");
     cmd.args(["-4", "-n", "1", "-w", "1000", host]);
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
     let output = cmd.output().ok()?;
     parse_ping_ms(&output.stdout)
+}
+
+#[tauri::command]
+fn get_network_telemetry(
+    state: State<'_, AppState>,
+    selected_adapter_id: Option<String>,
+    reset_session: Option<bool>,
+) -> Result<net_monitor::NetworkTelemetrySnapshot, String> {
+    let mut monitor = state
+        .net_monitor
+        .lock()
+        .map_err(|_| "Монитор сетевых интерфейсов заблокирован".to_string())?;
+    monitor.snapshot(selected_adapter_id.as_deref(), reset_session.unwrap_or(false))
+}
+
+#[tauri::command]
+async fn probe_network_health(
+    gateway_ip: Option<String>,
+    external_host: Option<String>,
+) -> Result<net_monitor::NetworkHealthProbe, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        net_monitor::probe_network_health(gateway_ip, external_host)
+    })
+    .await
+    .map_err(|e| format!("Ошибка потока диагностики сети: {e}"))
 }
 
 #[tauri::command]
@@ -3538,7 +3846,9 @@ fn reveal_main_window(app: &tauri::AppHandle) {
     }
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
-        let _ = window.unminimize();
+        if window.is_minimized().unwrap_or(false) {
+            let _ = window.unminimize();
+        }
         let _ = window.set_focus();
     }
 }
@@ -4002,73 +4312,343 @@ async fn execute_cleanup(category_ids: Vec<String>) -> Result<CleanupReport, Str
 
 // ===================== Process Explorer =====================
 
-#[tauri::command]
-fn get_process_list(state: State<'_, AppState>) -> Result<Vec<ProcessItem>, String> {
-    // Интервал с прошлого опроса нужен для пересчёта дельты дискового I/O в байт/сек
-    let elapsed_secs = {
-        let mut guard = state
-            .process_last_refresh
-            .lock()
-            .map_err(|_| "Состояние процессов заблокировано".to_string())?;
-        let now = Instant::now();
-        let secs = guard
-            .map(|prev| now.duration_since(prev).as_secs_f64())
-            .unwrap_or(1.0)
-            .max(0.25);
-        *guard = Some(now);
-        secs
-    };
+#[cfg(target_os = "windows")]
+mod win_proc_counters {
+    use std::collections::HashMap;
+    use std::ffi::c_void;
 
-    let mut sys = state
-        .sys
-        .lock()
-        .map_err(|_| "Системный монитор заблокирован".to_string())?;
+    const TH32CS_SNAPPROCESS: u32 = 0x00000002;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const INVALID_HANDLE_VALUE: isize = -1;
 
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct PROCESSENTRY32W {
+        dwSize: u32,
+        cntUsage: u32,
+        th32ProcessID: u32,
+        th32DefaultHeapID: usize,
+        th32ModuleID: u32,
+        cntThreads: u32,
+        th32ParentProcessID: u32,
+        pcPriClassBase: i32,
+        dwFlags: u32,
+        szExeFile: [u16; 260],
+    }
 
-    let cpu_count = sys.cpus().len().max(1) as f32;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateToolhelp32Snapshot(dw_flags: u32, th32_process_id: u32) -> isize;
+        fn Process32FirstW(h_snapshot: isize, lppe: *mut PROCESSENTRY32W) -> i32;
+        fn Process32NextW(h_snapshot: isize, lppe: *mut PROCESSENTRY32W) -> i32;
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+        fn GetProcessHandleCount(h_process: *mut c_void, pdw_handle_count: *mut u32) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
 
-    let list = sys
-        .processes()
-        .values()
-        .filter(|p| p.pid().as_u32() != 0)
-        .map(|p| {
-            let disk = p.disk_usage();
-            ProcessItem {
-                pid: p.pid().as_u32(),
-                parent_pid: p.parent().map(|pp| pp.as_u32()),
-                name: p.name().to_string_lossy().to_string(),
-                exe_path: p
-                    .exe()
-                    .map(|e| e.to_string_lossy().to_string())
-                    .unwrap_or_default(),
-                cpu_usage: (p.cpu_usage() / cpu_count).clamp(0.0, 100.0),
-                memory_mb: p.memory() as f64 / 1024.0 / 1024.0,
-                disk_read_bytes_sec: (disk.read_bytes as f64 / elapsed_secs) as u64,
-                disk_write_bytes_sec: (disk.written_bytes as f64 / elapsed_secs) as u64,
-                run_time_sec: p.run_time(),
-                icon_base64: None,
+    pub fn collect(pids: &[u32]) -> HashMap<u32, (u32, u32)> {
+        let mut threads_by_pid: HashMap<u32, u32> = HashMap::with_capacity(pids.len());
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snap != 0 && snap != INVALID_HANDLE_VALUE {
+                let mut entry = std::mem::zeroed::<PROCESSENTRY32W>();
+                entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+                if Process32FirstW(snap, &mut entry) != 0 {
+                    loop {
+                        threads_by_pid.insert(entry.th32ProcessID, entry.cntThreads);
+                        if Process32NextW(snap, &mut entry) == 0 {
+                            break;
+                        }
+                    }
+                }
+                CloseHandle(snap as *mut c_void);
             }
-        })
-        .collect();
+        }
 
-    drop(sys);
+        let mut out: HashMap<u32, (u32, u32)> = HashMap::with_capacity(pids.len());
+        for &pid in pids {
+            let thread_cnt = threads_by_pid.get(&pid).copied().unwrap_or(0);
+            let mut handle_cnt = 0u32;
+            if pid > 4 {
+                unsafe {
+                    let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                    if !h.is_null() {
+                        let _ = GetProcessHandleCount(h, &mut handle_cnt);
+                        CloseHandle(h);
+                    }
+                }
+            }
+            out.insert(pid, (thread_cnt, handle_cnt));
+        }
+        out
+    }
+}
 
-    let mut list: Vec<ProcessItem> = list;
-    if let Ok(mut pid_guard) = state.pid_cache.lock() {
-        pid_guard.clear();
-        pid_guard.insert(0, ("System Idle Process".to_string(), String::new()));
-        pid_guard.insert(4, ("System".to_string(), String::new()));
-        for item in &list {
-            pid_guard.insert(item.pid, (item.name.clone(), item.exe_path.clone()));
+#[cfg(not(target_os = "windows"))]
+mod win_proc_counters {
+    use std::collections::HashMap;
+    pub fn collect(_pids: &[u32]) -> HashMap<u32, (u32, u32)> {
+        HashMap::new()
+    }
+}
+
+fn process_status_ru(status: sysinfo::ProcessStatus) -> String {
+    match status {
+        sysinfo::ProcessStatus::Run => "Активен".to_string(),
+        sysinfo::ProcessStatus::Sleep | sysinfo::ProcessStatus::Idle => "Ожидание".to_string(),
+        sysinfo::ProcessStatus::Stop => "Приостановлен".to_string(),
+        sysinfo::ProcessStatus::Zombie | sysinfo::ProcessStatus::Dead => "Завершается".to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+fn is_shell_launcher_parent(parent_name: &str, child_name: &str) -> bool {
+    parent_name.eq_ignore_ascii_case("explorer.exe")
+        && !child_name.eq_ignore_ascii_case("explorer.exe")
+}
+
+fn compute_process_tree_counts(
+    procs: &[(u32, Option<u32>, u64, String)],
+    target_pid: u32,
+) -> (Option<u32>, usize, usize) {
+    let mut by_pid: HashMap<u32, (Option<u32>, u64, &str)> = HashMap::with_capacity(procs.len());
+    for (pid, ppid, start_time, name) in procs {
+        if *pid == 0 {
+            continue;
+        }
+        let replace = by_pid
+            .get(pid)
+            .map(|&(_, prev_start, _)| *start_time >= prev_start)
+            .unwrap_or(true);
+        if replace {
+            by_pid.insert(*pid, (*ppid, *start_time, name.as_str()));
         }
     }
 
-    for item in &mut list {
-        item.icon_base64 = cached_process_icon(&state.icon_cache, &item.exe_path);
+    let mut pids: Vec<u32> = by_pid.keys().copied().collect();
+    pids.sort_unstable();
+
+    let mut real_parent_of: HashMap<u32, u32> = HashMap::with_capacity(by_pid.len());
+    let mut tree_parent_of: HashMap<u32, u32> = HashMap::with_capacity(by_pid.len());
+    let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
+
+    for &pid in &pids {
+        let Some(&(ppid_opt, child_start, child_name)) = by_pid.get(&pid) else {
+            continue;
+        };
+        let Some(ppid) = ppid_opt else {
+            continue;
+        };
+        if ppid == 0 || ppid == pid {
+            continue;
+        }
+        let Some(&(_, parent_start, parent_name)) = by_pid.get(&ppid) else {
+            continue;
+        };
+        // Защита от переиспользования PID: родитель не мог стартовать позже дочернего процесса
+        if parent_start != 0 && child_start != 0 && parent_start > child_start {
+            continue;
+        }
+        real_parent_of.insert(pid, ppid);
+        // Обычные приложения, запущенные пользователем из оболочки explorer.exe,
+        // отображаются как самостоятельные корни, как в System Informer
+        if is_shell_launcher_parent(parent_name, child_name) {
+            continue;
+        }
+        // Проверка на циклы по уже принятой цепи предков
+        let mut creates_cycle = false;
+        let mut cursor = Some(ppid);
+        let mut steps = 0usize;
+        while let Some(curr) = cursor {
+            if curr == pid || steps > pids.len() {
+                creates_cycle = true;
+                break;
+            }
+            cursor = tree_parent_of.get(&curr).copied();
+            steps += 1;
+        }
+        if creates_cycle {
+            continue;
+        }
+        tree_parent_of.insert(pid, ppid);
+        children_of.entry(ppid).or_default().push(pid);
     }
 
-    Ok(list)
+    let validated_real_parent = real_parent_of.get(&target_pid).copied();
+    let direct_children = children_of.get(&target_pid).map(|v| v.len()).unwrap_or(0);
+
+    let mut total_descendants = 0usize;
+    if let Some(direct_list) = children_of.get(&target_pid) {
+        let mut visited: HashSet<u32> = HashSet::new();
+        visited.insert(target_pid);
+        let mut stack: Vec<u32> = direct_list.clone();
+        while let Some(curr) = stack.pop() {
+            if !visited.insert(curr) {
+                continue;
+            }
+            total_descendants += 1;
+            if let Some(grandkids) = children_of.get(&curr) {
+                stack.extend_from_slice(grandkids);
+            }
+        }
+    }
+
+    (validated_real_parent, direct_children, total_descendants)
+}
+
+#[tauri::command]
+async fn get_process_list(state: State<'_, AppState>) -> Result<Vec<ProcessItem>, String> {
+    let last_refresh_arc = Arc::clone(&state.process_last_refresh);
+    let sys_arc = Arc::clone(&state.sys);
+    let pid_cache_arc = Arc::clone(&state.pid_cache);
+    let icon_cache_arc = Arc::clone(&state.icon_cache);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        // Интервал с прошлого опроса нужен для пересчёта дельты дискового I/O в байт/сек
+        let elapsed_secs = {
+            let mut guard = last_refresh_arc
+                .lock()
+                .map_err(|_| "Состояние процессов заблокировано".to_string())?;
+            let now = Instant::now();
+            let secs = guard
+                .map(|prev| now.duration_since(prev).as_secs_f64())
+                .unwrap_or(1.0)
+                .max(0.25);
+            *guard = Some(now);
+            secs
+        };
+
+        let mut list: Vec<ProcessItem> = {
+            let mut sys = sys_arc
+                .lock()
+                .map_err(|_| "Системный монитор заблокирован".to_string())?;
+
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            let cpu_count = sys.cpus().len().max(1) as f32;
+
+            sys.processes()
+                .values()
+                .filter(|p| p.pid().as_u32() != 0)
+                .map(|p| {
+                    let disk = p.disk_usage();
+                    ProcessItem {
+                        pid: p.pid().as_u32(),
+                        parent_pid: p.parent().map(|pp| pp.as_u32()),
+                        name: p.name().to_string_lossy().to_string(),
+                        exe_path: p
+                            .exe()
+                            .map(|e| e.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                        cpu_usage: (p.cpu_usage() / cpu_count).clamp(0.0, 100.0),
+                        memory_mb: p.memory() as f64 / 1024.0 / 1024.0,
+                        disk_read_bytes_sec: (disk.read_bytes as f64 / elapsed_secs) as u64,
+                        disk_write_bytes_sec: (disk.written_bytes as f64 / elapsed_secs) as u64,
+                        run_time_sec: p.run_time(),
+                        start_time: p.start_time(),
+                        thread_count: 0,
+                        handle_count: 0,
+                        status: process_status_ru(p.status()),
+                        icon_base64: None,
+                    }
+                })
+                .collect()
+        };
+
+        let all_pids: Vec<u32> = list.iter().map(|item| item.pid).collect();
+        let counters = win_proc_counters::collect(&all_pids);
+        for item in &mut list {
+            if let Some(&(threads, handles)) = counters.get(&item.pid) {
+                item.thread_count = threads;
+                item.handle_count = handles;
+            }
+        }
+
+        if let Ok(mut pid_guard) = pid_cache_arc.lock() {
+            pid_guard.clear();
+            pid_guard.insert(0, ("System Idle Process".to_string(), String::new()));
+            pid_guard.insert(4, ("System".to_string(), String::new()));
+            for item in &list {
+                pid_guard.insert(item.pid, (item.name.clone(), item.exe_path.clone()));
+            }
+        }
+
+        for item in &mut list {
+            item.icon_base64 = cached_process_icon(&icon_cache_arc, &item.exe_path);
+        }
+
+        Ok(list)
+    })
+    .await
+    .map_err(|e| format!("Ошибка потока чтения процессов: {e}"))?
+}
+
+#[tauri::command]
+fn get_process_details(state: State<'_, AppState>, pid: u32) -> Result<ProcessDetails, String> {
+    let sys = state
+        .sys
+        .lock()
+        .map_err(|_| "Системный монитор заблокирован".to_string())?;
+    let key = sysinfo::Pid::from_u32(pid);
+    let proc_ref = sys
+        .processes()
+        .get(&key)
+        .ok_or_else(|| format!("Процесс PID {pid} уже завершён или не найден"))?;
+    let cpu_count = sys.cpus().len().max(1) as f32;
+
+    let tree_snapshot: Vec<(u32, Option<u32>, u64, String)> = sys
+        .processes()
+        .values()
+        .map(|p| {
+            (
+                p.pid().as_u32(),
+                p.parent().map(|pp| pp.as_u32()),
+                p.start_time(),
+                p.name().to_string_lossy().to_string(),
+            )
+        })
+        .collect();
+    let (parent_pid, child_count, total_descendants) =
+        compute_process_tree_counts(&tree_snapshot, pid);
+    let parent_name = parent_pid.and_then(|ppid| {
+        sys.processes()
+            .get(&sysinfo::Pid::from_u32(ppid))
+            .map(|p| p.name().to_string_lossy().to_string())
+    });
+    let command_line = proc_ref
+        .cmd()
+        .iter()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let counters = win_proc_counters::collect(&[pid]);
+    let (thread_count, handle_count) = counters.get(&pid).copied().unwrap_or((0, 0));
+
+    Ok(ProcessDetails {
+        pid,
+        parent_pid,
+        parent_name,
+        name: proc_ref.name().to_string_lossy().to_string(),
+        exe_path: proc_ref
+            .exe()
+            .map(|e| e.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        command_line,
+        working_dir: proc_ref
+            .cwd()
+            .map(|c| c.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        status: process_status_ru(proc_ref.status()),
+        cpu_usage: (proc_ref.cpu_usage() / cpu_count).clamp(0.0, 100.0),
+        memory_mb: proc_ref.memory() as f64 / 1024.0 / 1024.0,
+        virtual_memory_mb: proc_ref.virtual_memory() as f64 / 1024.0 / 1024.0,
+        run_time_sec: proc_ref.run_time(),
+        start_time: proc_ref.start_time(),
+        thread_count,
+        handle_count,
+        child_count,
+        total_descendants,
+    })
 }
 
 fn cached_process_icon(cache: &Mutex<HashMap<String, String>>, path: &str) -> Option<String> {
@@ -4781,77 +5361,84 @@ fn query_pid_name_and_exe(_pid: u32) -> Option<(String, String)> {
 }
 
 #[tauri::command]
-fn get_network_connections(state: State<'_, AppState>) -> Result<Vec<NetworkConnection>, String> {
-    let sockets = collect_socket_rows()?;
+async fn get_network_connections(state: State<'_, AppState>) -> Result<Vec<NetworkConnection>, String> {
+    let pid_cache_arc = Arc::clone(&state.pid_cache);
+    let sys_arc = Arc::clone(&state.sys);
+    let icon_cache_arc = Arc::clone(&state.icon_cache);
 
-    // Читаем кэш PID -> (Name, ExePath) без вызова sys.refresh_processes(),
-    // чтобы не сбрасывать дельты CPU% и Disk I/O для диспетчера процессов.
-    let mut names: HashMap<u32, (String, String)> = state
-        .pid_cache
-        .lock()
-        .map(|guard| guard.clone())
-        .unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || {
+        let sockets = collect_socket_rows()?;
 
-    if let Ok(sys) = state.sys.lock() {
-        for process in sys.processes().values() {
-            let pid = process.pid().as_u32();
-            names.entry(pid).or_insert_with(|| {
-                (
-                    process.name().to_string_lossy().to_string(),
-                    process
-                        .exe()
-                        .map(|path| path.to_string_lossy().to_string())
-                        .unwrap_or_default(),
-                )
+        // Читаем кэш PID -> (Name, ExePath) без вызова sys.refresh_processes(),
+        // чтобы не сбрасывать дельты CPU% и Disk I/O для диспетчера процессов.
+        let mut names: HashMap<u32, (String, String)> = pid_cache_arc
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+
+        if let Ok(sys) = sys_arc.lock() {
+            for process in sys.processes().values() {
+                let pid = process.pid().as_u32();
+                names.entry(pid).or_insert_with(|| {
+                    (
+                        process.name().to_string_lossy().to_string(),
+                        process
+                            .exe()
+                            .map(|path| path.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                    )
+                });
+            }
+        }
+
+        let mut newly_resolved: Vec<(u32, (String, String))> = Vec::new();
+        for (_protocol, _local_addr, _remote_addr, _socket_state, pid) in &sockets {
+            if !names.contains_key(pid) {
+                if let Some(resolved) = query_pid_name_and_exe(*pid) {
+                    names.insert(*pid, resolved.clone());
+                    newly_resolved.push((*pid, resolved));
+                }
+            }
+        }
+
+        if !newly_resolved.is_empty() {
+            if let Ok(mut pid_guard) = pid_cache_arc.lock() {
+                for (pid, info) in newly_resolved {
+                    pid_guard.insert(pid, info);
+                }
+            }
+        }
+
+        let mut icon_memo: HashMap<String, Option<String>> = HashMap::new();
+        let mut connections = Vec::with_capacity(sockets.len());
+        for (protocol, local_addr, remote_addr, socket_state, pid) in sockets {
+            let (process_name, exe_path) = names
+                .get(&pid)
+                .cloned()
+                .unwrap_or_else(|| ("Неизвестно".to_string(), String::new()));
+            let icon_base64 = if exe_path.is_empty() {
+                None
+            } else {
+                icon_memo
+                    .entry(exe_path.clone())
+                    .or_insert_with(|| cached_process_icon(&icon_cache_arc, &exe_path))
+                    .clone()
+            };
+            connections.push(NetworkConnection {
+                protocol,
+                local_addr,
+                remote_addr,
+                state: socket_state,
+                pid,
+                process_name,
+                icon_base64,
             });
         }
-    }
 
-    let mut newly_resolved: Vec<(u32, (String, String))> = Vec::new();
-    for (_protocol, _local_addr, _remote_addr, _socket_state, pid) in &sockets {
-        if !names.contains_key(pid) {
-            if let Some(resolved) = query_pid_name_and_exe(*pid) {
-                names.insert(*pid, resolved.clone());
-                newly_resolved.push((*pid, resolved));
-            }
-        }
-    }
-
-    if !newly_resolved.is_empty() {
-        if let Ok(mut pid_guard) = state.pid_cache.lock() {
-            for (pid, info) in newly_resolved {
-                pid_guard.insert(pid, info);
-            }
-        }
-    }
-
-    let mut icon_memo: HashMap<String, Option<String>> = HashMap::new();
-    let mut connections = Vec::with_capacity(sockets.len());
-    for (protocol, local_addr, remote_addr, socket_state, pid) in sockets {
-        let (process_name, exe_path) = names
-            .get(&pid)
-            .cloned()
-            .unwrap_or_else(|| ("Неизвестно".to_string(), String::new()));
-        let icon_base64 = if exe_path.is_empty() {
-            None
-        } else {
-            icon_memo
-                .entry(exe_path.clone())
-                .or_insert_with(|| cached_process_icon(&state.icon_cache, &exe_path))
-                .clone()
-        };
-        connections.push(NetworkConnection {
-            protocol,
-            local_addr,
-            remote_addr,
-            state: socket_state,
-            pid,
-            process_name,
-            icon_base64,
-        });
-    }
-
-    Ok(connections)
+        Ok(connections)
+    })
+    .await
+    .map_err(|e| format!("Ошибка потока чтения сетевых подключений: {e}"))?
 }
 
 fn hwnd_to_isize<T: Copy>(hwnd: T) -> isize {
@@ -4957,28 +5544,43 @@ pub fn run() {
             networks,
             disk_space,
             ping_cache: Arc::new(Mutex::new((0, None, false))),
-            process_last_refresh: Mutex::new(None),
-            pid_cache: Mutex::new(HashMap::new()),
+            process_last_refresh: Arc::new(Mutex::new(None)),
+            pid_cache: Arc::new(Mutex::new(HashMap::new())),
             hw_telemetry,
             hw_sidecar_child,
             hwmon_watchdog,
             scan_cancellation_token,
-            icon_cache: Mutex::new(HashMap::new()),
+            icon_cache: Arc::new(Mutex::new(HashMap::new())),
             drop_hub: Arc::new(drop_server::DropHub::new()),
             tray_ping_item: Mutex::new(None),
             history_buffer,
+            gpu_pdh: Arc::new(Mutex::new(gpu_fallback::GpuPdhSampler::new())),
+            net_monitor: Arc::new(Mutex::new(net_monitor::NetworkMonitorState::new())),
         })
         .setup(|app| {
+            let launched_from_autostart = std::env::args()
+                .any(|arg| matches!(arg.as_str(), "--autostart" | "--minimized"));
+            let start_minimized =
+                launched_from_autostart && settings::load_settings().start_minimized;
+
             if let Some(window) = app.get_webview_window("main") {
                 #[cfg(target_os = "windows")]
                 if let Ok(hwnd) = window.hwnd() {
                     apply_dwm_rounded_corners(hwnd_to_isize(hwnd));
                 }
+                if start_minimized {
+                    let _ = window.hide();
+                } else {
+                    let _ = window.unminimize();
+                    let _ = window.center();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
             }
 
             let ping_item = tauri::menu::MenuItem::with_id(app, "ping", "Ping: —", false, None::<&str>)?;
             let title_item = tauri::menu::MenuItem::with_id(app, "title", "NEXUS PC", false, None::<&str>)?;
-            let show_item = tauri::menu::MenuItem::with_id(app, "show", "Показать окно", true, None::<&str>)?;
+            let show_item = tauri::menu::MenuItem::with_id(app, "show", "Открыть NEXUS", true, None::<&str>)?;
             let quit_item = tauri::menu::MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
             let menu = tauri::menu::Menu::with_items(app, &[&title_item, &ping_item, &show_item, &quit_item])?;
             if let Some(state) = app.try_state::<AppState>() {
@@ -4995,13 +5597,7 @@ pub fn run() {
                     .on_menu_event(|app, event| match event.id.as_ref() {
                         "show" => reveal_main_window(app),
                         "quit" => {
-                            if let Some(state) = app.try_state::<AppState>() {
-                                if let Ok(mut guard) = state.hw_sidecar_child.lock() {
-                                    if let Some(mut child) = guard.take() {
-                                        let _ = child.kill();
-                                    }
-                                }
-                            }
+                            cleanup_app_resources(app);
                             app.exit(0);
                         }
                         _ => {}
@@ -5025,11 +5621,13 @@ pub fn run() {
         })
         .on_window_event(move |window, event| match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {
-                let hide_main = window.label() == "main" && settings::load_settings().minimize_to_tray;
-                if window.label() != "main" || hide_main {
-                    api.prevent_close();
-                    let _ = window.hide();
+                api.prevent_close();
+                if window.label() == "main" {
+                    if let Some(hud) = window.app_handle().get_webview_window("tray_hud") {
+                        let _ = hud.hide();
+                    }
                 }
+                let _ = window.hide();
             }
             tauri::WindowEvent::Destroyed => {
                 if window.label() == "main" {
@@ -5038,6 +5636,7 @@ pub fn run() {
                             let _ = child.kill();
                         }
                     }
+                    window.app_handle().exit(0);
                 }
             }
             _ => {}
@@ -5061,6 +5660,8 @@ pub fn run() {
             is_elevated_admin,
             restart_as_admin,
             app_exit,
+            hide_to_tray,
+            restore_from_tray,
             flush_dns,
             probe_game_routes,
             get_packet_priority,
@@ -5071,8 +5672,11 @@ pub fn run() {
             scan_cleanup_targets,
             execute_cleanup,
             get_process_list,
+            get_process_details,
             kill_process,
             suspend_process,
+            get_network_telemetry,
+            probe_network_health,
             get_network_connections,
             start_drop_session,
             stop_drop_session,
@@ -5090,8 +5694,90 @@ pub fn run() {
             get_disk_health_info,
             get_stability_progress,
             run_stability_probe,
-            benchmark_dns
+            benchmark_dns,
+            scripts::get_user_scripts,
+            scripts::save_user_script,
+            scripts::delete_user_script,
+            scripts::run_user_script,
+            archive::archive_get_capabilities,
+            archive::archive_get_progress,
+            archive::archive_cancel,
+            archive::archive_inspect_paths,
+            archive::archive_pick_files,
+            archive::archive_pick_folder,
+            archive::archive_create
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sidecar_path_resolves_to_clean_absolute_file() {
+        let resolved = find_hwmon_sidecar_exe().expect("nexus-hwmon.exe should be found");
+        println!("Resolved sidecar path: {:?}", resolved);
+        assert!(resolved.is_absolute(), "Sidecar path must be absolute");
+        assert!(resolved.is_file(), "Resolved sidecar path must point to a file");
+        let text = resolved.to_string_lossy();
+        assert!(!text.starts_with(r"\\?\"), "Path should not have verbatim UNC prefix");
+        let parent = resolved.parent().expect("Sidecar must have parent directory");
+        assert!(parent.is_dir(), "Sidecar parent must be an existing directory");
+    }
+
+    #[test]
+    fn storage_temp_fallback_includes_nvme_smart_temperatures() {
+        let items = build_storage_temp_items(&[]);
+        println!("Storage temp items: {:#?}", items);
+        assert!(!items.is_empty(), "Expected at least one storage item");
+    }
+
+    #[test]
+    fn process_tree_counts_separate_direct_and_total_and_reject_reused_pids() {
+        let procs = vec![
+            // Оболочка Windows explorer.exe
+            (6704, Some(4000), 100, "explorer.exe".to_string()),
+            // Дочерний системный подпроцесс explorer.exe
+            (1000, Some(6704), 150, "explorer.exe".to_string()),
+            // Независимые приложения, запущенные пользователем через оболочку explorer.exe
+            (25936, Some(6704), 200, "chrome.exe".to_string()),
+            (25937, Some(25936), 210, "chrome.exe".to_string()),
+            (25938, Some(25936), 211, "chrome.exe".to_string()),
+            (22044, Some(6704), 220, "Antigravity.exe".to_string()),
+            (22045, Some(22044), 221, "Antigravity.exe".to_string()),
+            // Обычное дерево (не оболочка)
+            (1001, Some(500), 100, "steam.exe".to_string()),
+            (2001, Some(1001), 220, "steamwebhelper.exe".to_string()),
+            (2002, Some(2001), 230, "steamwebhelper.exe".to_string()),
+            // Повторное использование PID: процесс 3001 имеет parent_pid=1001,
+            // но 3001 стартовал (50) раньше 1001 (100) — не должен крепиться!
+            (3001, Some(1001), 50, "old.exe".to_string()),
+        ];
+
+        // explorer.exe считает прямыми потомками в дереве только собственные дочерние explorer.exe,
+        // а chrome.exe / Antigravity.exe не раздувают дерево explorer.exe
+        let (exp_parent, exp_direct, exp_total) = compute_process_tree_counts(&procs, 6704);
+        assert_eq!(exp_parent, None);
+        assert_eq!(exp_direct, 1);
+        assert_eq!(exp_total, 1);
+
+        // chrome.exe сохраняет свой настоящий parent_pid (6704) и своё поддерево (2)
+        let (chr_parent, chr_direct, chr_total) = compute_process_tree_counts(&procs, 25936);
+        assert_eq!(chr_parent, Some(6704));
+        assert_eq!(chr_direct, 2);
+        assert_eq!(chr_total, 2);
+
+        // steam.exe сохраняет полное поддерево 1 прямой + 1 внук = 2
+        let (_, stm_direct, stm_total) = compute_process_tree_counts(&procs, 1001);
+        assert_eq!(stm_direct, 1);
+        assert_eq!(stm_total, 2);
+
+        let (reused_parent, _, _) = compute_process_tree_counts(&procs, 3001);
+        assert_eq!(
+            reused_parent, None,
+            "Process older than its apparent PPID must not link to reused PID"
+        );
+    }
 }
