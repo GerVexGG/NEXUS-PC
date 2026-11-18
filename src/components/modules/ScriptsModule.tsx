@@ -527,34 +527,67 @@ export function ScriptsModule() {
             </div>
           </div>
 
-          {consoleOutput !== null && (
-            <div className="tactical-card tactical-brackets overflow-hidden rounded-xl">
-              <div className="flex items-center justify-between border-b border-[#202B38] bg-[#0B0E14] px-4 py-2.5">
-                <span className="font-mono text-xs font-semibold text-[#00D5E8]">
-                  ВЫВОД ТЕРМИНАЛА (STDOUT / STDERR)
-                </span>
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => void copyTextToClipboard(consoleOutput)}
-                    className="cursor-pointer rounded border border-[#202B38] bg-[#10151D] px-2 py-0.5 font-mono text-[10px] text-[#8292A3] hover:border-[#00D5E8]/40 hover:text-[#00D5E8]"
-                  >
-                    Копировать вывод
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setConsoleOutput(null)}
-                    className="cursor-pointer rounded p-1 text-[#8292A3] hover:text-[#E5EDF5]"
-                  >
-                    <X size={13} />
-                  </button>
+          {consoleOutput !== null && (() => {
+            const isTimeout = consoleOutput.includes("[TIMEOUT]");
+            const exitMatch = consoleOutput.match(/Код выхода:\s*(-?\d+)/) ?? consoleOutput.match(/\[EXIT CODE\s+(-?\d+)\]/);
+            const exitCode = exitMatch ? Number(exitMatch[1]) : null;
+            const isError =
+              isTimeout ||
+              consoleOutput.startsWith("[ОШИБКА]") ||
+              consoleOutput.includes("[ОШИБКА ·") ||
+              (exitCode !== null && exitCode !== 0);
+            const statusLabel = running
+              ? "ВЫПОЛНЕНИЕ…"
+              : isTimeout
+              ? "ТАЙМАУТ (60с)"
+              : isError
+              ? exitCode !== null
+                ? `ОШИБКА · КОД ${exitCode}`
+                : "ОШИБКА"
+              : exitCode === 0
+              ? "ЗАВЕРШЕНО · КОД 0"
+              : consoleOutput.includes("[INFO]")
+              ? "ИНФО"
+              : "ВЫПОЛНЕНО";
+            const statusBadgeClass = running
+              ? "border-[#00D5E8]/35 bg-[#00D5E8]/10 text-[#00D5E8]"
+              : isTimeout || isError
+              ? "border-rose-500/35 bg-rose-500/12 text-rose-300"
+              : "border-emerald-500/35 bg-emerald-500/12 text-emerald-300";
+            return (
+              <div className="tactical-card tactical-brackets overflow-hidden rounded-xl">
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#202B38] bg-[#0B0E14] px-4 py-2.5">
+                  <div className="flex items-center gap-2.5">
+                    <span className="font-mono text-xs font-semibold text-[#00D5E8]">
+                      ВЫВОД ТЕРМИНАЛА (STDOUT / STDERR)
+                    </span>
+                    <span className={`rounded border px-2 py-0.5 font-mono text-[10px] font-semibold ${statusBadgeClass}`}>
+                      {statusLabel}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void copyTextToClipboard(consoleOutput)}
+                      className="cursor-pointer rounded border border-[#202B38] bg-[#10151D] px-2 py-0.5 font-mono text-[10px] text-[#8292A3] hover:border-[#00D5E8]/40 hover:text-[#00D5E8]"
+                    >
+                      Копировать вывод
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConsoleOutput(null)}
+                      className="cursor-pointer rounded p-1 text-[#8292A3] hover:text-[#E5EDF5]"
+                    >
+                      <X size={13} />
+                    </button>
+                  </div>
                 </div>
+                <pre className="max-h-60 overflow-auto bg-[#07080B] p-4 font-mono text-xs leading-relaxed whitespace-pre-wrap text-[#E5EDF5]">
+                  {consoleOutput}
+                </pre>
               </div>
-              <pre className="max-h-60 overflow-auto bg-[#07080B] p-4 font-mono text-xs leading-relaxed whitespace-pre-wrap text-[#E5EDF5]">
-                {consoleOutput}
-              </pre>
-            </div>
-          )}
+            );
+          })()}
         </div>
       </div>
     </motion.div>

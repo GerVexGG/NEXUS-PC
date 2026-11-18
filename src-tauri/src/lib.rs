@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::{BufRead, BufReader};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -53,6 +53,7 @@ pub struct SystemMetrics {
     pub net_rx_kbps: f32,
     pub net_tx_kbps: f32,
     pub net_ping_ms: u32,
+    pub net_ping_method: String,
 }
 
 // Структура записи автозагрузки Windows
@@ -443,8 +444,9 @@ impl StorageScanCoordinator {
 pub struct AppState {
     pub sys: Arc<Mutex<System>>,
     pub networks: Arc<Mutex<Networks>>,
+    pub networks_last_refresh: Arc<Mutex<Option<Instant>>>,
     pub disk_space: Arc<Mutex<(u64, u64)>>,
-    pub ping_cache: Arc<Mutex<(u32, Option<Instant>, bool)>>,
+    pub ping_cache: Arc<Mutex<(u32, String, Option<Instant>, bool)>>,
     pub process_last_refresh: Arc<Mutex<Option<Instant>>>,
     pub pid_cache: Arc<Mutex<HashMap<u32, (String, String)>>>,
     pub hw_telemetry: Arc<Mutex<Option<HardwareTelemetry>>>,
@@ -3467,11 +3469,11 @@ async fn scan_drive_storage(state: State<'_, AppState>, path: String) -> Result<
     execute_drive_storage_scan(coordinator, path).await
 }
 
-fn probe_gateway_ping_ms() -> u32 {
+fn probe_gateway_ping_ms() -> (u32, &'static str) {
     let hosts = [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)];
     for ip in &hosts {
         if let Some(ms) = net_monitor::icmp_ping_ipv4(*ip, 450) {
-            return ms.max(1);
+            return (ms.max(1), "ICMP");
         }
     }
     let timeout = Duration::from_millis(450);
@@ -3480,25 +3482,42 @@ fn probe_gateway_ping_ms() -> u32 {
         let start = Instant::now();
         if TcpStream::connect_timeout(&addr, timeout).is_ok() {
             let ms = start.elapsed().as_millis() as u32;
-            return ms.max(1);
+            return (ms.max(1), "TCP");
         }
     }
-    0
+    (0, "")
 }
 
-// Неблокирующий замер TCP-пинга до DNS-шлюзов (1.1.1.1:53 / 8.8.8.8:53) с фоновым обновлением кэша раз в 2.5 сек
-fn measure_network_ping_ms(state: &AppState) -> u32 {
+pub(crate) fn compute_throughput_kbps(
+    delta_rx_bytes: u64,
+    delta_tx_bytes: u64,
+    elapsed: Duration,
+) -> (f32, f32) {
+    let dt_secs = elapsed.as_secs_f32();
+    if dt_secs <= 0.01 {
+        return (0.0, 0.0);
+    }
+    (
+        (delta_rx_bytes as f32 / 1024.0) / dt_secs,
+        (delta_tx_bytes as f32 / 1024.0) / dt_secs,
+    )
+}
+
+// Неблокирующий замер пинга до 1.1.1.1 / 8.8.8.8 (ICMP с явным TCP-фоллбэком) и фоновым обновлением кэша раз в 2.5 сек
+fn measure_network_ping_ms(state: &AppState) -> (u32, String) {
     let mut should_spawn = false;
     let mut cached_ms = 0u32;
+    let mut cached_method = String::new();
 
     if let Ok(mut guard) = state.ping_cache.lock() {
         cached_ms = guard.0;
+        cached_method = guard.1.clone();
         let expired = guard
-            .1
+            .2
             .map(|last| last.elapsed() >= Duration::from_millis(2500))
             .unwrap_or(true);
-        if expired && !guard.2 {
-            guard.2 = true;
+        if expired && !guard.3 {
+            guard.3 = true;
             should_spawn = true;
         }
     }
@@ -3506,14 +3525,14 @@ fn measure_network_ping_ms(state: &AppState) -> u32 {
     if should_spawn {
         let cache = Arc::clone(&state.ping_cache);
         tauri::async_runtime::spawn_blocking(move || {
-            let measured = probe_gateway_ping_ms();
+            let (measured, method) = probe_gateway_ping_ms();
             if let Ok(mut guard) = cache.lock() {
-                *guard = (measured, Some(Instant::now()), false);
+                *guard = (measured, method.to_string(), Some(Instant::now()), false);
             }
         });
     }
 
-    cached_ms
+    (cached_ms, cached_method)
 }
 
 #[tauri::command]
@@ -3556,6 +3575,12 @@ async fn get_system_metrics(state: State<'_, AppState>) -> Result<SystemMetrics,
     {
         rates
     } else if let Ok(mut networks) = state.networks.lock() {
+        let now = Instant::now();
+        let prev_at = state
+            .networks_last_refresh
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.replace(now));
         networks.refresh(true);
         let mut total_rx_bytes: u64 = 0;
         let mut total_tx_bytes: u64 = 0;
@@ -3565,16 +3590,21 @@ async fn get_system_metrics(state: State<'_, AppState>) -> Result<SystemMetrics,
             total_tx_bytes = total_tx_bytes.saturating_add(data.transmitted());
         }
 
-        (
-            total_rx_bytes as f32 / 1024.0,
-            total_tx_bytes as f32 / 1024.0,
-        )
+        if let Some(prev) = prev_at {
+            compute_throughput_kbps(
+                total_rx_bytes,
+                total_tx_bytes,
+                now.saturating_duration_since(prev),
+            )
+        } else {
+            (0.0, 0.0)
+        }
     } else {
         (0.0, 0.0)
     };
 
-    let net_ping_ms = measure_network_ping_ms(&state);
-    update_tray_ping(&state, net_ping_ms);
+    let (net_ping_ms, net_ping_method) = measure_network_ping_ms(&state);
+    update_tray_ping(&state, net_ping_ms, &net_ping_method);
 
     let (mut disk_free_gb, mut disk_total_gb) = state
         .disk_space
@@ -3604,6 +3634,7 @@ async fn get_system_metrics(state: State<'_, AppState>) -> Result<SystemMetrics,
         net_rx_kbps,
         net_tx_kbps,
         net_ping_ms,
+        net_ping_method,
     })
 }
 
@@ -3781,9 +3812,10 @@ struct RouteProbe {
     host: String,
     ping_ms: u32,
     jitter_ms: u32,
+    method: String,
 }
 
-fn sample_tcp_route(ip: Ipv4Addr, port: u16) -> (u32, u32) {
+fn sample_tcp_route(ip: Ipv4Addr, port: u16) -> (u32, u32, &'static str) {
     if let Some(first) = net_monitor::icmp_ping_ipv4(ip, 500) {
         let mut samples = vec![first.max(1)];
         for _ in 0..2 {
@@ -3793,7 +3825,7 @@ fn sample_tcp_route(ip: Ipv4Addr, port: u16) -> (u32, u32) {
         }
         let fastest = *samples.iter().min().unwrap_or(&0);
         let slowest = *samples.iter().max().unwrap_or(&0);
-        return (fastest, slowest.saturating_sub(fastest));
+        return (fastest, slowest.saturating_sub(fastest), "ICMP");
     }
 
     let addr = SocketAddr::new(IpAddr::V4(ip), port);
@@ -3805,11 +3837,11 @@ fn sample_tcp_route(ip: Ipv4Addr, port: u16) -> (u32, u32) {
         }
     }
     if samples.is_empty() {
-        return (0, 0);
+        return (0, 0, "");
     }
     let fastest = *samples.iter().min().unwrap_or(&0);
     let slowest = *samples.iter().max().unwrap_or(&0);
-    (fastest, slowest.saturating_sub(fastest))
+    (fastest, slowest.saturating_sub(fastest), "TCP")
 }
 
 #[tauri::command]
@@ -3824,12 +3856,13 @@ async fn probe_game_routes() -> Result<Vec<RouteProbe>, String> {
             let mut handles = Vec::new();
             for (label, ip, port) in targets {
                 handles.push(scope.spawn(move || {
-                    let (ping_ms, jitter_ms) = sample_tcp_route(ip, port);
+                    let (ping_ms, jitter_ms, method) = sample_tcp_route(ip, port);
                     RouteProbe {
                         label: label.to_string(),
                         host: ip.to_string(),
                         ping_ms,
                         jitter_ms,
+                        method: method.to_string(),
                     }
                 }));
             }
@@ -3841,6 +3874,7 @@ async fn probe_game_routes() -> Result<Vec<RouteProbe>, String> {
                         host: String::new(),
                         ping_ms: 0,
                         jitter_ms: 0,
+                        method: String::new(),
                     })
                 })
                 .collect()
@@ -3852,6 +3886,8 @@ async fn probe_game_routes() -> Result<Vec<RouteProbe>, String> {
 
 #[derive(Serialize, Clone)]
 struct DiskHealthInfo {
+    device_id: Option<u32>,
+    serial_number: String,
     model: String,
     kind: String,
     firmware: String,
@@ -3867,83 +3903,37 @@ struct DiskHealthInfo {
 
 #[derive(Deserialize)]
 struct RawDiskHealth {
+    device_id: Option<serde_json::Value>,
+    serial_number: Option<String>,
     model: Option<String>,
     media: Option<String>,
     bus: Option<String>,
     health: Option<String>,
     temp_c: Option<f64>,
     power_on_hours: Option<f64>,
+    power_cycles: Option<f64>,
     wear: Option<f64>,
     bytes_written: Option<f64>,
+    bytes_read: Option<f64>,
 }
 
-fn disk_kind(media: &str, bus: &str) -> String {
-    let media = media.to_ascii_lowercase();
-    let bus = bus.to_ascii_lowercase();
-    if bus.contains("nvme") {
-        "NVMe M.2".to_string()
-    } else if media.contains("hdd") || media == "3" {
-        "HDD".to_string()
-    } else if media.contains("ssd") || media == "4" || bus.contains("sata") {
-        "SATA SSD".to_string()
-    } else if media.is_empty() && bus.is_empty() {
-        "Накопитель".to_string()
-    } else {
-        format!("{media} {bus}").trim().to_string()
+fn parse_json_u32(val: Option<serde_json::Value>) -> Option<u32> {
+    match val? {
+        serde_json::Value::Number(n) => n.as_u64().and_then(|v| u32::try_from(v).ok()),
+        serde_json::Value::String(s) => s.trim().parse::<u32>().ok(),
+        _ => None,
     }
 }
 
-fn health_label(percent: Option<u32>, status: &str) -> String {
-    if let Some(value) = percent {
-        if value >= 90 {
-            return "Отличное".to_string();
-        }
-        if value >= 70 {
-            return "Хорошее".to_string();
-        }
-        if value >= 40 {
-            return "Износ".to_string();
-        }
-        return "Критично".to_string();
-    }
-    match status.to_ascii_lowercase().as_str() {
-        "healthy" => "Отличное".to_string(),
-        "warning" => "Внимание".to_string(),
-        "unhealthy" => "Критично".to_string(),
-        _ => "Нет данных".to_string(),
-    }
-}
-
-#[tauri::command]
-async fn get_disk_health_info() -> Result<Vec<DiskHealthInfo>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        // Сначала пробуем прямой нативный Win32 IOCTL_STORAGE_QUERY_PROPERTY (работает без Администратора и без PowerShell).
-        let native_disks = storage_smart::query_physical_disks_smart();
-        if !native_disks.is_empty() {
-            return Ok(native_disks
-                .into_iter()
-                .map(|d| DiskHealthInfo {
-                    model: d.model,
-                    kind: d.kind,
-                    firmware: d.firmware,
-                    health_percent: d.health_percent,
-                    health_label: d.health_label,
-                    available_spare: d.available_spare,
-                    power_on_hours: d.power_on_hours,
-                    power_cycles: d.power_cycles,
-                    temp_c: d.temp_c,
-                    tbw_tb: d.tbw_tb,
-                    read_tb: d.read_tb,
-                })
-                .collect());
-        }
-
-        let script = r#"
+fn query_powershell_disk_fallback() -> Result<Vec<storage_smart::FallbackDiskRecord>, String> {
+    let script = r#"
 $ErrorActionPreference='SilentlyContinue'
 $rows = New-Object System.Collections.Generic.List[object]
 Get-PhysicalDisk | ForEach-Object {
   $rel = $_ | Get-StorageReliabilityCounter
   $written = $null
+  $read = $null
+  $cycles = $null
   if ($null -ne $rel) {
     foreach ($name in @('WriteBytesTotal','HostBytesWritten','NandBytesWritten')) {
       $prop = $rel.PSObject.Properties[$name]
@@ -3952,80 +3942,139 @@ Get-PhysicalDisk | ForEach-Object {
         if ([double]::TryParse([string]$prop.Value, [ref]$number) -and $number -gt 0) { $written = $number; break }
       }
     }
+    foreach ($name in @('ReadBytesTotal','HostBytesRead')) {
+      $prop = $rel.PSObject.Properties[$name]
+      if ($null -ne $prop -and $null -ne $prop.Value) {
+        $number = 0.0
+        if ([double]::TryParse([string]$prop.Value, [ref]$number) -and $number -gt 0) { $read = $number; break }
+      }
+    }
+    $cyclesProp = $rel.PSObject.Properties['StartStopCycles']
+    if ($null -ne $cyclesProp -and $null -ne $cyclesProp.Value) {
+      $cnum = 0.0
+      if ([double]::TryParse([string]$cyclesProp.Value, [ref]$cnum) -and $cnum -ge 0) { $cycles = $cnum }
+    }
   }
   $rows.Add([pscustomobject]@{
+    device_id = [string]$_.DeviceId
+    serial_number = [string]$_.SerialNumber
     model = [string]$_.FriendlyName
     media = [string]$_.MediaType
     bus = [string]$_.BusType
     health = [string]$_.HealthStatus
     temp_c = if ($null -ne $rel) { $rel.Temperature } else { $null }
     power_on_hours = if ($null -ne $rel) { $rel.PowerOnHours } else { $null }
+    power_cycles = $cycles
     wear = if ($null -ne $rel) { $rel.Wear } else { $null }
     bytes_written = $written
+    bytes_read = $read
   }) | Out-Null
 }
 ConvertTo-Json -InputObject @($rows.ToArray()) -Compress
 "#;
-        let mut cmd = Command::new("powershell.exe");
-        cmd.args(["-NoProfile", "-NonInteractive", "-Command", script]);
-        #[cfg(target_os = "windows")]
-        cmd.creation_flags(CREATE_NO_WINDOW);
-        let output = cmd.output().map_err(|err| format!("Не удалось опросить накопители: {err}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(if stderr.trim().is_empty() {
-                "Windows не вернула сведения S.M.A.R.T.".to_string()
-            } else {
-                stderr.trim().to_string()
-            });
-        }
-        let raw = String::from_utf8_lossy(&output.stdout);
-        let trimmed = raw.trim();
-        if trimmed.is_empty() || trimmed == "null" {
-            return Ok(Vec::new());
-        }
-        let rows: Vec<RawDiskHealth> = serde_json::from_str(trimmed)
-            .or_else(|_| serde_json::from_str::<RawDiskHealth>(trimmed).map(|row| vec![row]))
-            .map_err(|err| format!("Не удалось разобрать ответ накопителей: {err}"))?;
-        Ok(rows
-            .into_iter()
-            .map(|row| {
-                let status = row.health.unwrap_or_default();
-                let health_percent = row
-                    .wear
-                    .filter(|value| *value >= 0.0)
-                    .map(|value| (100.0 - value.clamp(0.0, 100.0)).round() as u32)
-                    .or_else(|| match status.to_ascii_lowercase().as_str() {
-                        "healthy" => Some(100),
-                        "warning" => Some(60),
-                        "unhealthy" => Some(20),
-                        _ => None,
-                    });
-                let temp = row
-                    .temp_c
-                    .filter(|value| *value > 0.0 && *value < 120.0)
-                    .map(|value| value.round() as u32);
-                DiskHealthInfo {
-                    model: row.model.unwrap_or_else(|| "Накопитель".to_string()),
-                    kind: disk_kind(row.media.as_deref().unwrap_or(""), row.bus.as_deref().unwrap_or("")),
-                    firmware: String::new(),
-                    health_label: health_label(health_percent, &status),
-                    health_percent,
-                    available_spare: None,
-                    power_on_hours: row
-                        .power_on_hours
-                        .filter(|value| *value >= 0.0)
-                        .map(|value| value.round() as u64),
-                    power_cycles: None,
-                    temp_c: temp,
-                    tbw_tb: row
-                        .bytes_written
-                        .filter(|value| *value > 0.0)
-                        .map(|value| value / 1_000_000_000_000.0),
-                    read_tb: None,
+    let mut cmd = Command::new("powershell.exe");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let output = cmd
+        .output()
+        .map_err(|err| format!("Не удалось опросить накопители: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(if stderr.trim().is_empty() {
+            "Windows не вернула сведения S.M.A.R.T.".to_string()
+        } else {
+            stderr.trim().to_string()
+        });
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<RawDiskHealth> = serde_json::from_str(trimmed)
+        .or_else(|_| serde_json::from_str::<RawDiskHealth>(trimmed).map(|row| vec![row]))
+        .map_err(|err| format!("Не удалось разобрать ответ накопителей: {err}"))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| storage_smart::FallbackDiskRecord {
+            device_id: parse_json_u32(row.device_id),
+            serial_number: row.serial_number.unwrap_or_default().trim().to_string(),
+            model: row.model.unwrap_or_default().trim().to_string(),
+            media: row.media.unwrap_or_default(),
+            bus: row.bus.unwrap_or_default(),
+            health_status: row.health.unwrap_or_default(),
+            temp_c: row
+                .temp_c
+                .filter(|v| v.is_finite() && *v > 0.0 && *v < 120.0)
+                .map(|v| v.round() as u32),
+            power_on_hours: row
+                .power_on_hours
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .map(|v| v.round() as u64),
+            power_cycles: row
+                .power_cycles
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .map(|v| v.round() as u64),
+            wear: row.wear.filter(|v| v.is_finite() && *v >= 0.0 && *v <= 100.0),
+            bytes_written: row
+                .bytes_written
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .map(|v| v.round() as u64),
+            bytes_read: row
+                .bytes_read
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .map(|v| v.round() as u64),
+        })
+        .collect())
+}
+
+fn to_disk_health_info(d: storage_smart::SmartDiskMetrics) -> DiskHealthInfo {
+    DiskHealthInfo {
+        device_id: d.device_id,
+        serial_number: d.serial_number,
+        model: d.model,
+        kind: d.kind,
+        firmware: d.firmware,
+        health_percent: d.health_percent,
+        health_label: d.health_label,
+        available_spare: d.available_spare,
+        power_on_hours: d.power_on_hours,
+        power_cycles: d.power_cycles,
+        temp_c: d.temp_c,
+        tbw_tb: d.tbw_tb,
+        read_tb: d.read_tb,
+    }
+}
+
+#[tauri::command]
+async fn get_disk_health_info() -> Result<Vec<DiskHealthInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // Сначала пробуем прямой нативный Win32 IOCTL_STORAGE_QUERY_PROPERTY (работает без Администратора и без PowerShell).
+        let native_disks = storage_smart::query_physical_disks_smart();
+        let needs_fallback = native_disks.is_empty()
+            || native_disks
+                .iter()
+                .any(|d| !storage_smart::has_usable_native_smart(d));
+
+        let final_disks = if needs_fallback {
+            match query_powershell_disk_fallback() {
+                Ok(fallback_rows) => {
+                    storage_smart::merge_native_and_fallback_disks(native_disks, fallback_rows)
                 }
-            })
-            .collect())
+                Err(err) => {
+                    if native_disks.is_empty() {
+                        return Err(err);
+                    }
+                    native_disks
+                }
+            }
+        } else {
+            native_disks
+        };
+
+        Ok(final_disks.into_iter().map(to_disk_health_info).collect())
     })
     .await
     .map_err(|e| format!("Ошибка потока опроса SMART: {e}"))?
@@ -4167,9 +4216,61 @@ struct DnsBenchRow {
     name: String,
     server: String,
     ms: Option<u32>,
+    method: String,
 }
 
-fn time_dns(server: Option<&str>) -> Option<u32> {
+fn build_dns_query_packet(tx_id: u16, domain: &str) -> Vec<u8> {
+    let mut pkt = Vec::with_capacity(32);
+    pkt.extend_from_slice(&tx_id.to_be_bytes());
+    pkt.extend_from_slice(&0x0100u16.to_be_bytes()); // RD=1
+    pkt.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
+    pkt.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT=0
+    pkt.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT=0
+    pkt.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT=0
+    for label in domain.split('.').filter(|part| !part.is_empty()) {
+        let bytes = label.as_bytes();
+        let len = bytes.len().min(63);
+        pkt.push(len as u8);
+        pkt.extend_from_slice(&bytes[..len]);
+    }
+    pkt.push(0); // root label
+    pkt.extend_from_slice(&1u16.to_be_bytes()); // QTYPE = A
+    pkt.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
+    pkt
+}
+
+fn is_valid_dns_response(pkt: &[u8], expected_tx_id: u16) -> bool {
+    if pkt.len() < 12 {
+        return false;
+    }
+    let rx_id = u16::from_be_bytes([pkt[0], pkt[1]]);
+    let is_response = pkt[2] & 0x80 != 0;
+    let rcode = pkt[3] & 0x0F;
+    rx_id == expected_tx_id && is_response && rcode == 0
+}
+
+pub(crate) fn query_dns_udp_ms(addr: SocketAddr, domain: &str, timeout: Duration) -> Option<u32> {
+    static NEXT_TX_ID: AtomicU32 = AtomicU32::new(0x4E58);
+    let tx_id = (NEXT_TX_ID.fetch_add(1, Ordering::Relaxed) & 0xFFFF) as u16;
+    let packet = build_dns_query_packet(tx_id, domain);
+
+    let bind_addr = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let socket = UdpSocket::bind(bind_addr).ok()?;
+    let _ = socket.set_read_timeout(Some(timeout));
+    let _ = socket.set_write_timeout(Some(timeout));
+    socket.connect(addr).ok()?;
+
+    let started = Instant::now();
+    socket.send(&packet).ok()?;
+    let mut buf = [0u8; 512];
+    let n = socket.recv(&mut buf).ok()?;
+    if !is_valid_dns_response(&buf[..n], tx_id) {
+        return None;
+    }
+    Some(started.elapsed().as_millis().max(1) as u32)
+}
+
+fn time_dns_nslookup(server: Option<&str>) -> Option<u32> {
     let mut cmd = Command::new("nslookup");
     cmd.arg("-timeout=2").arg("google.com");
     if let Some(server) = server {
@@ -4189,22 +4290,59 @@ fn time_dns(server: Option<&str>) -> Option<u32> {
     Some(started.elapsed().as_millis().max(1) as u32)
 }
 
+fn detect_system_dns_socket() -> Option<SocketAddr> {
+    let mut mon = net_monitor::NetworkMonitorState::new();
+    let snap = mon.snapshot(None, false).ok()?;
+    let active = snap
+        .active_adapter_id
+        .as_deref()
+        .and_then(|id| snap.adapters.iter().find(|a| a.id == id))
+        .or_else(|| snap.adapters.iter().find(|a| a.is_connected));
+    let adapter = active?;
+    for dns in &adapter.dns_servers {
+        if let Ok(ip) = dns.trim().parse::<Ipv4Addr>() {
+            return Some(SocketAddr::new(IpAddr::V4(ip), 53));
+        }
+    }
+    None
+}
+
 #[tauri::command]
 async fn benchmark_dns() -> Result<Vec<DnsBenchRow>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        [
-            ("Cloudflare DNS", Some("1.1.1.1")),
-            ("Google Public DNS", Some("8.8.8.8")),
-            ("Quad9", Some("9.9.9.9")),
-            ("Текущий провайдер", None),
-        ]
-        .into_iter()
-        .map(|(name, server)| DnsBenchRow {
-            name: name.to_string(),
-            server: server.unwrap_or("Системный").to_string(),
-            ms: time_dns(server),
-        })
-        .collect()
+        let system_dns = detect_system_dns_socket();
+        let timeout = Duration::from_millis(1800);
+        let mut rows = Vec::with_capacity(4);
+        for (name, ip) in [
+            ("Cloudflare DNS", Ipv4Addr::new(1, 1, 1, 1)),
+            ("Google Public DNS", Ipv4Addr::new(8, 8, 8, 8)),
+            ("Quad9", Ipv4Addr::new(9, 9, 9, 9)),
+        ] {
+            let addr = SocketAddr::new(IpAddr::V4(ip), 53);
+            rows.push(DnsBenchRow {
+                name: name.to_string(),
+                server: ip.to_string(),
+                ms: query_dns_udp_ms(addr, "google.com", timeout),
+                method: "UDP DNS".to_string(),
+            });
+        }
+
+        if let Some(sys_addr) = system_dns {
+            rows.push(DnsBenchRow {
+                name: "Текущий провайдер".to_string(),
+                server: format!("{} (Системный)", sys_addr.ip()),
+                ms: query_dns_udp_ms(sys_addr, "google.com", timeout),
+                method: "UDP DNS".to_string(),
+            });
+        } else {
+            rows.push(DnsBenchRow {
+                name: "Текущий провайдер".to_string(),
+                server: "Системный".to_string(),
+                ms: time_dns_nslookup(None),
+                method: "nslookup CLI".to_string(),
+            });
+        }
+        rows
     })
     .await
     .map_err(|e| format!("Ошибка потока замера DNS: {e}"))
@@ -4251,7 +4389,7 @@ async fn set_ethernet_tuned(state: State<'_, AppState>, enabled: bool) -> Result
         .map_err(|e| format!("Ошибка потока переключения адаптера: {e}"))?
 }
 
-fn update_tray_ping(state: &AppState, ping_ms: u32) {
+fn update_tray_ping(state: &AppState, ping_ms: u32, method: &str) {
     let Ok(guard) = state.tray_ping_item.lock() else {
         return;
     };
@@ -4259,7 +4397,11 @@ fn update_tray_ping(state: &AppState, ping_ms: u32) {
         return;
     };
     let label = if ping_ms > 0 {
-        format!("Ping: {ping_ms} ms")
+        if method.is_empty() {
+            format!("Ping: {ping_ms} ms")
+        } else {
+            format!("Ping ({method}): {ping_ms} ms")
+        }
     } else {
         "Ping: нет сети".to_string()
     };
@@ -6391,6 +6533,7 @@ fn apply_dwm_rounded_corners(_hwnd: isize) {}
 fn start_background_services(
     sys: Arc<Mutex<System>>,
     networks: Arc<Mutex<Networks>>,
+    networks_last_refresh: Arc<Mutex<Option<Instant>>>,
     disk_space: Arc<Mutex<(u64, u64)>>,
     hw_telemetry: Arc<Mutex<Option<HardwareTelemetry>>>,
     hw_sidecar_child: Arc<Mutex<Option<Child>>>,
@@ -6418,6 +6561,9 @@ fn start_background_services(
         }
         if let Ok(mut guard) = networks.lock() {
             guard.refresh(true);
+            if let Ok(mut ts) = networks_last_refresh.lock() {
+                *ts = Some(Instant::now());
+            }
         }
         loop {
             if wd_for_bg
@@ -6451,6 +6597,7 @@ pub fn run() {
     settings::init_settings();
     let sys = Arc::new(Mutex::new(System::new()));
     let networks = Arc::new(Mutex::new(Networks::new()));
+    let networks_last_refresh = Arc::new(Mutex::new(None));
     let disk_space = Arc::new(Mutex::new((0u64, 0u64)));
     let hw_telemetry = Arc::new(Mutex::new(None));
     let hw_sidecar_child = Arc::new(Mutex::new(None));
@@ -6467,6 +6614,7 @@ pub fn run() {
     start_background_services(
         Arc::clone(&sys),
         Arc::clone(&networks),
+        Arc::clone(&networks_last_refresh),
         Arc::clone(&disk_space),
         Arc::clone(&hw_telemetry),
         Arc::clone(&hw_sidecar_child),
@@ -6477,8 +6625,9 @@ pub fn run() {
         .manage(AppState {
             sys,
             networks,
+            networks_last_refresh,
             disk_space,
-            ping_cache: Arc::new(Mutex::new((0, None, false))),
+            ping_cache: Arc::new(Mutex::new((0, String::new(), None, false))),
             process_last_refresh: Arc::new(Mutex::new(None)),
             pid_cache: Arc::new(Mutex::new(HashMap::new())),
             hw_telemetry,
@@ -7540,5 +7689,51 @@ mod tests {
             evaluate_hwmon_watchdog_step(&mut wd_cap, false, None, base),
             HwmonWatchdogAction::ExitThread
         );
+    }
+
+    #[test]
+    fn fallback_network_throughput_normalizes_by_elapsed_time() {
+        // 512 КБ за 2 секунды == 256 КБ/с
+        let (rx, tx) = compute_throughput_kbps(512 * 1024, 128 * 1024, Duration::from_secs(2));
+        assert!((rx - 256.0).abs() < 0.01, "Expected 256 KB/s, got {rx}");
+        assert!((tx - 64.0).abs() < 0.01, "Expected 64 KB/s, got {tx}");
+
+        // 1024 КБ за 500 мс == 2048 КБ/с
+        let (rx_half, tx_half) =
+            compute_throughput_kbps(1024 * 1024, 0, Duration::from_millis(500));
+        assert!(
+            (rx_half - 2048.0).abs() < 1.0,
+            "Expected 2048 KB/s, got {rx_half}"
+        );
+        assert_eq!(tx_half, 0.0);
+
+        // Нулевой / микроинтервал не приводит к делению на ноль и Infinity
+        let (rx_zero, tx_zero) = compute_throughput_kbps(4096, 4096, Duration::from_millis(2));
+        assert_eq!((rx_zero, tx_zero), (0.0, 0.0));
+    }
+
+    #[test]
+    fn udp_dns_benchmark_sends_valid_rfc1035_query_and_validates_response() {
+        let srv = UdpSocket::bind("127.0.0.1:0").expect("bind mock dns udp");
+        let srv_addr = srv.local_addr().unwrap();
+        let _ = srv.set_read_timeout(Some(Duration::from_secs(2)));
+
+        let handle = std::thread::spawn(move || {
+            let mut req = [0u8; 512];
+            let (len, peer) = srv.recv_from(&mut req).expect("recv dns query");
+            assert!(len > 12);
+            // Проверяем флаг RD=1 и QDCOUNT=1
+            assert_eq!(req[4..6], [0, 1]);
+            // Формируем минимальный валидный DNS-ответ с тем же TxID и QR=1, RCODE=0
+            let mut resp = req[..len].to_vec();
+            resp[2] = 0x81; // QR=1, RD=1
+            resp[3] = 0x80; // RA=1, RCODE=0
+            srv.send_to(&resp, peer).expect("send dns resp");
+        });
+
+        let latency = query_dns_udp_ms(srv_addr, "google.com", Duration::from_secs(2))
+            .expect("UDP DNS query against local mock server must succeed");
+        assert!(latency >= 1);
+        handle.join().unwrap();
     }
 }

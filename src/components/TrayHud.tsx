@@ -9,6 +9,7 @@ interface RouteProbe {
   host: string;
   ping_ms: number;
   jitter_ms: number;
+  method?: string;
 }
 
 export function TrayHud() {
@@ -53,7 +54,9 @@ export function TrayHud() {
   return (
     <div className="hud-bg flex h-screen w-screen flex-col justify-between border border-[#202B38] bg-[#07080B] p-3 text-[#E5EDF5]">
       <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs">
-        <span className="font-mono text-[11px] text-[#8292A3]">PING</span>
+        <span className="font-mono text-[11px] text-[#8292A3]">
+          PING{gameRoute?.method ? ` (${gameRoute.method})` : ""}
+        </span>
         <span
           className={`text-right font-mono font-semibold ${
             ping === null

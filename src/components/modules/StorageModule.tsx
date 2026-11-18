@@ -27,6 +27,8 @@ import { useStorageScanElapsed } from "../../hooks/useStorageScanner";
 import type { NexusController } from "../../hooks/useNexusController";
 
 interface DiskHealthInfo {
+  device_id?: number | null;
+  serial_number?: string;
   model: string;
   kind: string;
   firmware?: string;
@@ -720,7 +722,7 @@ export function StorageModule({ c }: { c: NexusController }) {
           <p className="mt-3 text-sm text-[#8292A3]">Чтение параметров S.M.A.R.T. контроллера…</p>
         ) : (
           <div className="mt-3 grid gap-3 lg:grid-cols-2">
-            {diskHealth.map((disk) => {
+            {diskHealth.map((disk, idx) => {
               const hasSmart = disk.health_percent !== null && disk.health_percent !== undefined;
               const percent = hasSmart ? disk.health_percent! : 0;
               const tone = !hasSmart
@@ -730,17 +732,26 @@ export function StorageModule({ c }: { c: NexusController }) {
                 : percent >= 50
                 ? "bg-amber-400"
                 : "bg-rose-400";
+              const diskKey =
+                disk.device_id != null
+                  ? `disk-${disk.device_id}`
+                  : disk.serial_number
+                  ? `sn-${disk.serial_number}`
+                  : `${disk.model}-${disk.kind}-${idx}`;
               return (
                 <div
-                  key={disk.model + disk.kind}
+                  key={diskKey}
                   className="rounded-lg border border-[#202B38] bg-[#0B0E14] p-3.5"
                 >
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0">
                       <div className="truncate text-sm font-medium text-[#E5EDF5]">{disk.model}</div>
-                      {disk.firmware && (
+                      {(disk.firmware || disk.device_id != null || disk.available_spare != null) && (
                         <div className="font-mono text-[10px] text-[#526170]">
-                          Прошивка: {disk.firmware}
+                          {disk.device_id != null ? `Диск #${disk.device_id}` : ""}
+                          {disk.firmware
+                            ? `${disk.device_id != null ? " · " : ""}Прошивка: ${disk.firmware}`
+                            : ""}
                           {disk.available_spare != null ? ` · Резерв: ${disk.available_spare}%` : ""}
                         </div>
                       )}
@@ -753,7 +764,7 @@ export function StorageModule({ c }: { c: NexusController }) {
                     <span>
                       Ресурс:{" "}
                       <span className="font-mono font-semibold text-[#E5EDF5]">
-                        {hasSmart ? `${percent}%` : "Недоступно"}
+                        {hasSmart ? `${percent}%` : disk.health_label || "Недоступно"}
                       </span>
                       {hasSmart ? ` (${disk.health_label})` : ""}
                     </span>

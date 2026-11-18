@@ -13,6 +13,7 @@ export interface Metrics {
   net_rx_kbps: number;
   net_tx_kbps: number;
   net_ping_ms: number;
+  net_ping_method?: string;
 }
 
 export interface DriveVolumeInfo {

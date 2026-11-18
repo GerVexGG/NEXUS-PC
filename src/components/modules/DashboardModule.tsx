@@ -168,14 +168,14 @@ export function DashboardModule({ c }: { c: NexusController }) {
 
   const [netBusy, setNetBusy] = useState(false);
   const [netHint, setNetHint] = useState<string | null>(null);
-  const [routes, setRoutes] = useState<Array<{ label: string; host: string; ping_ms: number; jitter_ms: number }>>([]);
+  const [routes, setRoutes] = useState<Array<{ label: string; host: string; ping_ms: number; jitter_ms: number; method?: string }>>([]);
   const [gameSamples, setGameSamples] = useState<number[]>([]);
   const [dnsState, setDnsState] = useState<"idle" | "pending" | "done">("idle");
   const [dnsError, setDnsError] = useState<string | null>(null);
 
   useEffect(() => {
     const loadRoutes = () => {
-      invoke<Array<{ label: string; host: string; ping_ms: number; jitter_ms: number }>>("probe_game_routes")
+      invoke<Array<{ label: string; host: string; ping_ms: number; jitter_ms: number; method?: string }>>("probe_game_routes")
         .then((next) => {
           setRoutes(next);
           const moscow = next.find((route) => route.label.includes("Москва") && route.ping_ms > 0);
@@ -398,10 +398,22 @@ export function DashboardModule({ c }: { c: NexusController }) {
 
             <div className="mt-2.5 flex items-end justify-between gap-3">
               <div>
-                <div className={`font-mono text-lg font-bold tracking-tight ${ping.className}`}>
-                  {ping.value === "—" ? "—" : `${ping.value} мс`}
+                <div className="flex items-baseline gap-2">
+                  <span className={`font-mono text-lg font-bold tracking-tight ${ping.className}`}>
+                    {ping.value === "—" ? "—" : `${ping.value} мс`}
+                  </span>
+                  {gameRoute?.method && (
+                    <span className="rounded border border-[#202B38] bg-[#0B0E14] px-1.5 py-0.5 font-mono text-[9px] text-[#8292A3]">
+                      {gameRoute.method}
+                    </span>
+                  )}
                 </div>
-                <div className="text-xs text-[#8292A3]">Москва · {ping.label}</div>
+                <div className="text-xs text-[#8292A3]">
+                  Москва · {ping.label}
+                  {metrics.net_ping_ms > 0 && metrics.net_ping_method
+                    ? ` · Шлюз ${metrics.net_ping_ms} мс (${metrics.net_ping_method})`
+                    : ""}
+                </div>
               </div>
               <div className="text-right">
                 <div className="font-mono text-sm font-semibold text-[#E5EDF5]">
@@ -434,8 +446,19 @@ export function DashboardModule({ c }: { c: NexusController }) {
                     className="flex items-center justify-between rounded-md border border-[#202B38] bg-[#0B0E14] px-2.5 py-1 text-xs"
                   >
                     <span className="text-[#8292A3]">{route.label}</span>
-                    <span className="font-mono font-medium text-[#E5EDF5]">
-                      {route.ping_ms > 0 ? `${route.ping_ms} мс ±${route.jitter_ms}` : "—"}
+                    <span className="flex items-center gap-1.5 font-mono font-medium text-[#E5EDF5]">
+                      {route.ping_ms > 0 ? (
+                        <>
+                          {route.method && (
+                            <span className="rounded border border-[#202B38] bg-[#151C26] px-1 py-0.2 text-[9px] text-[#8292A3]">
+                              {route.method}
+                            </span>
+                          )}
+                          <span>{`${route.ping_ms} мс ±${route.jitter_ms}`}</span>
+                        </>
+                      ) : (
+                        "—"
+                      )}
                     </span>
                   </div>
                 ))}

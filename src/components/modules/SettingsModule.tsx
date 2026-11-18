@@ -125,6 +125,7 @@ export function SettingsModule({ c }: { c?: NexusController }) {
         cpu: settingsRes.value.alert_cpu_temp,
         gpu: settingsRes.value.alert_gpu_temp,
       });
+      c?.setPollingRateMs(settingsRes.value.polling_rate_ms);
     } else {
       setSettingsLoaded(false);
       setError(`Ошибка чтения конфигурации: ${String(settingsRes.reason)}`);
@@ -165,6 +166,7 @@ export function SettingsModule({ c }: { c?: NexusController }) {
         cpu: draft.alert_cpu_temp,
         gpu: draft.alert_gpu_temp,
       });
+      c?.setPollingRateMs(draft.polling_rate_ms);
       setSaved(true);
       window.setTimeout(() => setSaved(false), 2200);
     } catch (err) {

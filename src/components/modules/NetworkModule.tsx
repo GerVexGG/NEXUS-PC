@@ -1214,6 +1214,7 @@ interface DnsBenchRow {
   name: string;
   server: string;
   ms: number | null;
+  method?: string;
 }
 
 function NetworkToolkit() {
@@ -1521,6 +1522,7 @@ function NetworkToolkit() {
             <tr>
               <th className="px-5 py-2.5 font-medium">Провайдер DNS</th>
               <th className="px-5 py-2.5 font-medium">Узел</th>
+              <th className="px-5 py-2.5 font-medium">Метод</th>
               <th className="px-5 py-2.5 font-medium">Время отклика</th>
             </tr>
           </thead>
@@ -1528,10 +1530,10 @@ function NetworkToolkit() {
             {(dnsRows.length > 0
               ? dnsRows
               : [
-                  { name: "Cloudflare DNS", server: "1.1.1.1", ms: null },
-                  { name: "Google Public DNS", server: "8.8.8.8", ms: null },
-                  { name: "Quad9 Security DNS", server: "9.9.9.9", ms: null },
-                  { name: "Текущий провайдер", server: "Системный", ms: null },
+                  { name: "Cloudflare DNS", server: "1.1.1.1", ms: null, method: "UDP DNS" },
+                  { name: "Google Public DNS", server: "8.8.8.8", ms: null, method: "UDP DNS" },
+                  { name: "Quad9 Security DNS", server: "9.9.9.9", ms: null, method: "UDP DNS" },
+                  { name: "Текущий провайдер", server: "Системный", ms: null, method: "UDP DNS" },
                 ]
             ).map((row) => (
               <tr key={row.name} className="border-b border-[#202B38]/60 last:border-0">
@@ -1544,6 +1546,11 @@ function NetworkToolkit() {
                   )}
                 </td>
                 <td className="px-5 py-3 font-mono text-[#8292A3]">{row.server}</td>
+                <td className="px-5 py-3">
+                  <span className="rounded border border-[#202B38] bg-[#0B0E14] px-2 py-0.5 font-mono text-[10px] text-[#8292A3]">
+                    {row.method || "UDP DNS"}
+                  </span>
+                </td>
                 <td className="px-5 py-3 font-mono font-semibold text-[#E5EDF5]">
                   {row.ms == null ? <span className="text-[#526170]">Не проверено</span> : `${row.ms} мс`}
                 </td>

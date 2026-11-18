@@ -124,12 +124,25 @@ export function ArchiveCreatorModal({
   const totalStats = useMemo(() => {
     let bytes = 0;
     let files = 0;
+    let oversizedSingle = false;
     for (const s of sources) {
       bytes += s.size_bytes;
       files += s.file_count;
+      if (!s.is_dir && s.size_bytes > 0xffffffff) {
+        oversizedSingle = true;
+      }
     }
-    return { bytes, files };
+    return { bytes, files, oversizedSingle };
   }, [sources]);
+
+  const zipLimitReason =
+    format === "zip"
+      ? totalStats.oversizedSingle || totalStats.bytes > 0xffffffff
+        ? "Суммарный объём или размер файла превышает лимит классического ZIP (4 ГБ). Выберите формат RAR или разделите файлы."
+        : totalStats.files + sources.length > 65535
+        ? "Число объектов превышает лимит классического ZIP (65 535 записей). Выберите формат RAR."
+        : null
+      : null;
 
   if (!open) return null;
 
@@ -211,6 +224,10 @@ export function ArchiveCreatorModal({
     }
     if (!destDir.trim()) {
       setError("Укажите папку для сохранения архива");
+      return;
+    }
+    if (zipLimitReason) {
+      setError(zipLimitReason);
       return;
     }
     if (format === "rar" && capabilities && !capabilities.rar_available) {
@@ -371,6 +388,13 @@ export function ArchiveCreatorModal({
                 Чтобы не создавать некорректный файл, создание <span className="font-mono">.rar</span> отключено
                 до установки WinRAR — выберите формат ZIP.
               </div>
+            </div>
+          )}
+
+          {zipLimitReason && (
+            <div className="flex items-start gap-2.5 rounded-xl border border-rose-500/35 bg-rose-500/10 px-3.5 py-2.5 text-xs text-rose-200">
+              <AlertTriangle size={15} className="mt-0.5 shrink-0 text-rose-400" />
+              <div>{zipLimitReason}</div>
             </div>
           )}
 
@@ -630,7 +654,7 @@ export function ArchiveCreatorModal({
               </button>
               <button
                 type="button"
-                disabled={sources.length === 0 || rarMissing}
+                disabled={sources.length === 0 || rarMissing || zipLimitReason !== null}
                 onClick={() => void handleCreateArchive()}
                 className="cyber-btn inline-flex cursor-pointer items-center gap-2 px-5 py-2 font-mono text-xs font-semibold uppercase tracking-wider text-[#00D5E8] disabled:cursor-not-allowed disabled:opacity-45"
               >

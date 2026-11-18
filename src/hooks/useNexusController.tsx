@@ -49,8 +49,13 @@ export function useNexusController() {
     net_rx_kbps: 0,
     net_tx_kbps: 0,
     net_ping_ms: 0,
+    net_ping_method: "",
   });
   const [history, setHistory] = useState<HistoryPoint[]>(createInitialHistory);
+  const [pollingRateMs, setPollingRateMsState] = useState<number>(2000);
+  const setPollingRateMs = useCallback((ms: number) => {
+    setPollingRateMsState(ms === 1000 || ms === 2000 || ms === 5000 ? ms : 2000);
+  }, []);
 
   // Состояние кастомного тайтлбара и привилегий процесса
   const [isElevatedAdmin, setIsElevatedAdmin] = useState<boolean>(false);
@@ -120,15 +125,22 @@ export function useNexusController() {
       .then((elevated) => setIsElevatedAdmin(Boolean(elevated)))
       .catch((err) => console.error("Ошибка проверки прав администратора:", err));
 
-    invoke<{ alert_cpu_temp: number; alert_gpu_temp: number }>("get_settings")
+    invoke<{ polling_rate_ms: number; alert_cpu_temp: number; alert_gpu_temp: number }>("get_settings")
       .then((s) => {
+        if (
+          s?.polling_rate_ms === 1000 ||
+          s?.polling_rate_ms === 2000 ||
+          s?.polling_rate_ms === 5000
+        ) {
+          setPollingRateMsState(s.polling_rate_ms);
+        }
         setAlertThresholds({
           cpu: Number.isFinite(s?.alert_cpu_temp) ? s.alert_cpu_temp : 85,
           gpu: Number.isFinite(s?.alert_gpu_temp) ? s.alert_gpu_temp : 83,
         });
       })
       .catch(() => {
-        /* используем фоллбэк 85 / 83 */
+        /* используем фоллбэк 85 / 83 и 2000 мс */
       });
   }, []);
 
@@ -356,7 +368,7 @@ export function useNexusController() {
   }, []);
 
   useEffect(() => {
-    // Опрашиваем Rust раз в секунду и пополняем кольцевой буфер на 60 точек
+    // Опрашиваем Rust с заданным интервалом pollingRateMs и пополняем кольцевой буфер на 60 точек
     const fetchMetrics = async () => {
       try {
         const data = await invoke<Metrics>("get_system_metrics");
@@ -383,10 +395,14 @@ export function useNexusController() {
       }
     };
 
+    const rate =
+      pollingRateMs === 1000 || pollingRateMs === 2000 || pollingRateMs === 5000
+        ? pollingRateMs
+        : 2000;
     void fetchMetrics();
-    const interval = window.setInterval(() => void fetchMetrics(), 1000);
+    const interval = window.setInterval(() => void fetchMetrics(), rate);
     return () => window.clearInterval(interval);
-  }, []);
+  }, [pollingRateMs]);
 
   // Опрос датчиков LibreHardwareMonitor на вкладках «Обзор» и «Железо»
   useEffect(() => {
@@ -412,39 +428,14 @@ export function useNexusController() {
       }
     };
 
-    const handle = { id: 0, cancelled: false };
-    void (async () => {
-      let rate = 2000;
-      try {
-        const settings = await invoke<{
-          polling_rate_ms: number;
-          alert_cpu_temp: number;
-          alert_gpu_temp: number;
-        }>("get_settings");
-        if (
-          settings.polling_rate_ms === 1000 ||
-          settings.polling_rate_ms === 2000 ||
-          settings.polling_rate_ms === 5000
-        ) {
-          rate = settings.polling_rate_ms;
-        }
-        setAlertThresholds({
-          cpu: Number.isFinite(settings?.alert_cpu_temp) ? settings.alert_cpu_temp : 85,
-          gpu: Number.isFinite(settings?.alert_gpu_temp) ? settings.alert_gpu_temp : 83,
-        });
-      } catch {
-        rate = 2000;
-      }
-      if (handle.cancelled) return;
-      await fetchHwTelemetry();
-      if (handle.cancelled) return;
-      handle.id = window.setInterval(() => void fetchHwTelemetry(), rate);
-    })();
-    return () => {
-      handle.cancelled = true;
-      window.clearInterval(handle.id);
-    };
-  }, [activeTab]);
+    const rate =
+      pollingRateMs === 1000 || pollingRateMs === 2000 || pollingRateMs === 5000
+        ? pollingRateMs
+        : 2000;
+    void fetchHwTelemetry();
+    const timer = window.setInterval(() => void fetchHwTelemetry(), rate);
+    return () => window.clearInterval(timer);
+  }, [activeTab, pollingRateMs]);
 
   // Автозагрузка данных при переходе между вкладками
   const { fetchStartupItems } = startup;
@@ -741,6 +732,8 @@ export function useNexusController() {
     handleRestartHwmon,
     alertThresholds,
     setAlertThresholds,
+    pollingRateMs,
+    setPollingRateMs,
     thermalWarnings,
     cpuTempStyle,
 
