@@ -54,6 +54,12 @@ export interface ScanResult {
   root_node: FolderNode;
   top_files: FileEntry[];
   category_sizes: [string, number][];
+  scan_id?: number;
+  skipped_dirs_count?: number;
+  access_denied_count?: number;
+  skipped_files_count?: number;
+  is_partial?: boolean;
+  skipped_samples?: string[];
 }
 
 export interface TreemapRect {
@@ -233,6 +239,8 @@ export interface HardwareTelemetry {
   is_admin: boolean;
   sidecar_online: boolean;
   timestamp_ms: number;
+  telemetry_stale?: boolean;
+  sample_age_ms?: number | null;
   cpu: CpuTelemetry;
   gpus: GpuTelemetry[];
   motherboard_name: string;
@@ -247,6 +255,8 @@ export interface HwmonStatusResponse {
   status: HwmonStatus;
   restart_count: number;
   last_error: string | null;
+  telemetry_stale?: boolean;
+  sample_age_ms?: number | null;
 }
 
 export interface TelemetrySnapshot {
@@ -415,7 +425,22 @@ export interface HistoryPoint {
   ram: number;
 }
 
+export type PowerTimerAction = "shutdown" | "restart" | "sleep";
+
+export interface BackendPowerTimerState {
+  timer_id: string;
+  action: PowerTimerAction;
+  start_time_ms: number;
+  end_time_ms: number;
+  total_seconds: number;
+  remaining_seconds: number;
+  restart: boolean;
+  sleep: boolean;
+}
+
 export interface StoredTimerState {
+  timerId?: string;
+  action?: PowerTimerAction;
   endTime: number;
   totalSeconds: number;
   restart: boolean;

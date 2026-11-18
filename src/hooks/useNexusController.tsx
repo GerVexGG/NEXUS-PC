@@ -71,6 +71,8 @@ export function useNexusController() {
     status: "offline",
     restart_count: 0,
     last_error: null,
+    telemetry_stale: false,
+    sample_age_ms: null,
   });
   const [isRestartingHwmon, setIsRestartingHwmon] = useState<boolean>(false);
   const [alertThresholds, setAlertThresholds] = useState<{ cpu: number; gpu: number }>({
@@ -448,6 +450,7 @@ export function useNexusController() {
   const { fetchStartupItems } = startup;
   const { fetchAvailableDrives } = storage;
   const { handleAnalyzeCleanup, cleanupCategories } = cleanup;
+  const { syncTimerFromBackend } = power;
 
   useEffect(() => {
     if (activeTab === "startup") {
@@ -456,8 +459,10 @@ export function useNexusController() {
       void fetchAvailableDrives();
     } else if (activeTab === "cleanup" && cleanupCategories.length === 0) {
       void handleAnalyzeCleanup();
+    } else if (activeTab === "power") {
+      void syncTimerFromBackend();
     }
-  }, [activeTab, fetchStartupItems, fetchAvailableDrives, handleAnalyzeCleanup, cleanupCategories.length]);
+  }, [activeTab, fetchStartupItems, fetchAvailableDrives, handleAnalyzeCleanup, cleanupCategories.length, syncTimerFromBackend]);
 
   const swapPercentage =
     metrics.swap_total_gb > 0

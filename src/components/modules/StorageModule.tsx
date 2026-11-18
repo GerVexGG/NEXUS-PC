@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { motion } from "framer-motion";
 import {
+  AlertTriangle,
   ChevronRight,
   FileText,
   Folder,
@@ -250,6 +251,9 @@ export function StorageModule({ c }: { c: NexusController }) {
                   type="button"
                   onClick={() => {
                     if (selected) return;
+                    if (isScanning) {
+                      void handleCancelStorageScan();
+                    }
                     setSelectedDriveOrPath(mount);
                     setScanResult(null);
                     setTreemapStack([]);
@@ -351,6 +355,42 @@ export function StorageModule({ c }: { c: NexusController }) {
 
       {scanResult && (
         <div className="space-y-4">
+          {scanResult.is_partial && (
+            <div className="flex flex-col gap-2 rounded-xl border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-xs text-amber-200">
+              <div className="flex items-start gap-2.5">
+                <AlertTriangle size={15} className="mt-0.5 shrink-0 text-amber-400" />
+                <div>
+                  <div className="font-semibold text-amber-100">
+                    Сканирование завершено с пропусками — результат неполный
+                  </div>
+                  <div className="mt-0.5 text-amber-200/85">
+                    Не удалось прочитать каталогов: {scanResult.skipped_dirs_count ?? 0}
+                    {(scanResult.access_denied_count ?? 0) > 0
+                      ? ` (отказ в доступе / Access Denied: ${scanResult.access_denied_count})`
+                      : ""}
+                    {(scanResult.skipped_files_count ?? 0) > 0
+                      ? `, пропущено/исчезнувших файлов: ${scanResult.skipped_files_count}`
+                      : ""}
+                    . Итоговый объём отражает только доступные для чтения объекты.
+                  </div>
+                  {scanResult.skipped_samples && scanResult.skipped_samples.length > 0 && (
+                    <div className="mt-1.5 flex flex-wrap gap-1.5 font-mono text-[10px] text-amber-300/90">
+                      {scanResult.skipped_samples.slice(0, 3).map((sample) => (
+                        <span
+                          key={sample}
+                          className="max-w-full truncate rounded border border-amber-500/25 bg-black/25 px-2 py-0.5"
+                          title={sample}
+                        >
+                          {sample}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Распределение типов файлов (category_sizes) */}
           {scanResult.category_sizes.length > 0 && scanResult.total_scanned_bytes > 0 && (
             <section className="tactical-card rounded-xl p-4">

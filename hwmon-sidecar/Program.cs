@@ -200,7 +200,7 @@ public sealed class HardwareTelemetryDto
 
 internal static class Program
 {
-    private static volatile bool _shouldExit;
+    private static readonly ManualResetEventSlim ExitEvent = new(false);
 
     private static bool CheckIsAdmin()
     {
@@ -462,14 +462,14 @@ internal static class Program
         Console.CancelKeyPress += (_, e) =>
         {
             e.Cancel = true;
-            _shouldExit = true;
+            ExitEvent.Set();
         };
 
         _ = Task.Run(async () =>
         {
             try
             {
-                while (await Console.In.ReadLineAsync() is not null)
+                while (!ExitEvent.IsSet && await Console.In.ReadLineAsync() is not null)
                 {
                     // Если родительский процесс жив и держит пайп открытым — ждём
                 }
@@ -478,7 +478,10 @@ internal static class Program
             {
                 // Поток ввода закрыт
             }
-            _shouldExit = true;
+            finally
+            {
+                ExitEvent.Set();
+            }
         });
 
         var computer = new Computer
@@ -495,9 +498,17 @@ internal static class Program
         {
             computer.Open();
         }
-        catch
+        catch (Exception ex)
         {
-            // Продолжаем работу с доступными датчиками даже при частичной ошибке драйвера
+            try
+            {
+                Console.Error.WriteLine($"[hwmon-open-error] {ex.Message}");
+                Console.Error.Flush();
+            }
+            catch
+            {
+                // Игнорируем сбой stderr при недоступном потоке
+            }
         }
 
         var visitor = new UpdateVisitor();
@@ -506,7 +517,7 @@ internal static class Program
             WriteIndented = false
         };
 
-        while (!_shouldExit)
+        while (!ExitEvent.IsSet)
         {
             try
             {
@@ -516,12 +527,33 @@ internal static class Program
                 Console.WriteLine(json);
                 Console.Out.Flush();
             }
-            catch
+            catch (IOException)
             {
-                // Не прерываем цикл при единичной ошибке чтения
+                ExitEvent.Set();
+                break;
+            }
+            catch (ObjectDisposedException)
+            {
+                ExitEvent.Set();
+                break;
+            }
+            catch (Exception ex)
+            {
+                try
+                {
+                    Console.Error.WriteLine($"[hwmon-loop-error] {ex.Message}");
+                    Console.Error.Flush();
+                }
+                catch
+                {
+                    // Игнорируем ошибку записи в stderr
+                }
             }
 
-            Thread.Sleep(1000);
+            if (ExitEvent.Wait(1000))
+            {
+                break;
+            }
         }
 
         try

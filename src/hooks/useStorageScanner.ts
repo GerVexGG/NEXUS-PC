@@ -100,10 +100,12 @@ export function useStorageScanner(options?: { isolateTimer?: boolean }) {
         if (scanRequestIdRef.current !== reqId) {
           return;
         }
-        const current = selectedDriveRef.current.trim().replace(/[\\/]+$/g, "").toUpperCase();
-        const scanned = res.target_path.trim().replace(/[\\/]+$/g, "").toUpperCase();
-        if (current.slice(0, 2) !== scanned.slice(0, 2)) {
-          return;
+        if (!targetPathOverride) {
+          const current = selectedDriveRef.current.trim().replace(/[\\/]+$/g, "").toUpperCase();
+          const scanned = res.target_path.trim().replace(/[\\/]+$/g, "").toUpperCase();
+          if (current.slice(0, 2) !== scanned.slice(0, 2)) {
+            return;
+          }
         }
         setStorageData(res);
         setTreemapStack([res.root_node]);
@@ -130,7 +132,7 @@ export function useStorageScanner(options?: { isolateTimer?: boolean }) {
     setIsScanning(false);
     setScanError(null);
     try {
-      await invoke("cancel_storage_scan");
+      await invoke("cancel_storage_scan", { scanId: null });
     } catch (err) {
       console.error("Ошибка отмены сканирования диска:", err);
     }

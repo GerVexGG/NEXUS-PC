@@ -252,6 +252,11 @@ export function HardwareModule({ c }: { c: NexusController }) {
     metricsReady,
     netSnapshot,
   } = c;
+  const telemetryStale = Boolean(hwData?.telemetry_stale || hwmonStatus.telemetry_stale);
+  const sampleAgeSec =
+    (hwData?.sample_age_ms ?? hwmonStatus.sample_age_ms) != null
+      ? Math.round(((hwData?.sample_age_ms ?? hwmonStatus.sample_age_ms) ?? 0) / 1000)
+      : null;
   const sidecarOnline = hwData?.sidecar_online === true || hwmonStatus.status === "ready";
   const sidecarStatus =
     hwmonStatus.status === "driver_blocked"
@@ -263,6 +268,15 @@ export function HardwareModule({ c }: { c: NexusController }) {
       : hwmonStatus.status === "restarting" || isRestartingHwmon
       ? {
           label: `NEXUS HWMON · ПЕРЕЗАПУСК (#${Math.max(1, hwmonStatus.restart_count)})`,
+          dot: "bg-amber-400 animate-pulse",
+          chip: "border-amber-500/35 bg-amber-500/12 text-amber-300",
+        }
+      : telemetryStale
+      ? {
+          label:
+            sampleAgeSec != null
+              ? `NEXUS HWMON · УСТАРЕЛО (${sampleAgeSec}с)`
+              : "NEXUS HWMON · ДАННЫЕ УСТАРЕЛИ",
           dot: "bg-amber-400 animate-pulse",
           chip: "border-amber-500/35 bg-amber-500/12 text-amber-300",
         }
@@ -351,19 +365,23 @@ export function HardwareModule({ c }: { c: NexusController }) {
     if (!hwData.is_admin) {
       return { label: "MSR · НУЖЕН АДМИН", tone: "border-amber-500/35 bg-amber-500/12 text-amber-300" };
     }
+    if (telemetryStale) {
+      return { label: "ДАННЫЕ УСТАРЕЛИ", tone: "border-amber-500/35 bg-amber-500/12 text-amber-300" };
+    }
     if (!hwData.sidecar_online) {
       return { label: "САЙДКАР ОТКЛЮЧЁН", tone: "border-[#202B38] bg-[#151C26] text-[#8292A3]" };
     }
     return { label: "ТЕЛЕМЕТРИЯ АКТИВНА", tone: "border-[#00D5E8]/30 bg-[#00D5E8]/10 text-[#00D5E8]" };
-  }, [hwData, hwmonStatus.status]);
+  }, [hwData, hwmonStatus.status, telemetryStale]);
 
   const cpuUnavailShort = useMemo(() => {
     if (!hwData) return "Опрос…";
     if (hwData.cpu.hvci_enabled || hwmonStatus.status === "driver_blocked") return "Блок HVCI";
     if (!hwData.is_admin) return "Нужен Админ";
+    if (telemetryStale) return "Устарело";
     if (!hwData.sidecar_online) return "Офлайн";
     return "Недоступно";
-  }, [hwData, hwmonStatus.status]);
+  }, [hwData, hwmonStatus.status, telemetryStale]);
 
   const cpuLoads = hwData?.cpu.core_loads ?? [];
   const maxCoreLoad = cpuLoads.length > 0 ? Math.max(...cpuLoads) : null;
@@ -447,7 +465,9 @@ export function HardwareModule({ c }: { c: NexusController }) {
               <span className={`h-1.5 w-1.5 rounded-full ${sidecarStatus.dot}`} />
               {sidecarStatus.label}
             </span>
-            {(hwmonStatus.status === "offline" || hwmonStatus.status === "restarting") && (
+            {(hwmonStatus.status === "offline" ||
+              hwmonStatus.status === "restarting" ||
+              telemetryStale) && (
               <button
                 type="button"
                 disabled={isRestartingHwmon}
@@ -461,6 +481,35 @@ export function HardwareModule({ c }: { c: NexusController }) {
           </div>
         }
       />
+
+      {telemetryStale && hwmonStatus.status !== "driver_blocked" && (
+        <div className="flex flex-col justify-between gap-3 rounded-xl border border-amber-500/35 bg-amber-500/10 p-4 sm:flex-row sm:items-center">
+          <div className="flex items-start gap-3">
+            <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-amber-500/30 bg-amber-500/12 text-amber-300">
+              <AlertTriangle size={16} />
+            </div>
+            <div>
+              <div className="text-sm font-medium text-amber-100">
+                Показания аппаратных датчиков устарели
+                {sampleAgeSec != null ? ` (${sampleAgeSec} сек без свежего обновления)` : ""}.
+              </div>
+              <div className="mt-0.5 text-xs text-amber-200/80">
+                {hwmonStatus.last_error ??
+                  "Watchdog контролирует поток телеметрии и при таймауте выполнит автоматический перезапуск nexus-hwmon."}
+              </div>
+            </div>
+          </div>
+          <button
+            type="button"
+            disabled={isRestartingHwmon}
+            onClick={() => void handleRestartHwmon()}
+            className="inline-flex shrink-0 cursor-pointer items-center gap-2 self-start rounded-lg border border-[#202B38] bg-[#151C26] px-3 py-2 text-xs font-medium text-[#E5EDF5] transition-colors hover:border-[#00D5E8]/40 disabled:opacity-60 sm:self-center"
+          >
+            <RefreshCw size={13} className={isRestartingHwmon ? "animate-spin" : ""} />
+            Перезапустить службу
+          </button>
+        </div>
+      )}
 
       {hwmonStatus.status === "driver_blocked" && (
         <div className="flex flex-col justify-between gap-3 rounded-xl border border-amber-500/35 bg-[#10151D] p-4 sm:flex-row sm:items-center">
