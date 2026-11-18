@@ -16,6 +16,7 @@ import {
   type ProcessContextMenuState,
   type ProcessItem,
   type ProcessSortKey,
+  type ProcessTargetIdentity,
   type DiagnosticsReport,
   type TelemetrySnapshot,
   copyTextToClipboard,
@@ -25,6 +26,7 @@ import {
   getPingHudStyle,
   getTempBadgeStyle,
 } from "../lib/studio";
+import { getProcessIdentityKey, toProcessTargetIdentity } from "../lib/processTree";
 import { useStorageScanner } from "./useStorageScanner";
 import { useStartupManager } from "./useStartupManager";
 import { useCleanupCenter } from "./useCleanupCenter";
@@ -93,7 +95,19 @@ export function useNexusController() {
   >([]);
   const selectedAdapterRef = useRef<string | null>(null);
   selectedAdapterRef.current = selectedAdapterId;
-  const [suspendedPids, setSuspendedPids] = useState<number[]>([]);
+  const [suspendedProcessKeys, setSuspendedProcessKeys] = useState<string[]>([]);
+  const suspendedPids = useMemo(
+    () =>
+      suspendedProcessKeys
+        .map((key) => Number(key.split(":", 1)[0]))
+        .filter((pid) => Number.isFinite(pid) && pid > 0),
+    [suspendedProcessKeys]
+  );
+  const isProcessSuspended = useCallback(
+    (proc: Pick<ProcessItem, "pid" | "start_time" | "name">) =>
+      suspendedProcessKeys.includes(getProcessIdentityKey(proc)),
+    [suspendedProcessKeys]
+  );
   const [processMenu, setProcessMenu] = useState<ProcessContextMenuState | null>(null);
   const processMenuRef = useRef<ProcessContextMenuState | null>(null);
   processMenuRef.current = processMenu;
@@ -145,8 +159,14 @@ export function useNexusController() {
       const list = await invoke<ProcessItem[]>("get_process_list");
       setProcesses(list);
       setProcessError(null);
-      // Убираем из списка замороженных PID, которых больше не существует
-      setSuspendedPids((prev) => prev.filter((pid) => list.some((p) => p.pid === pid)));
+      // Привязываем состояние заморозки к полной идентичности (PID + start_time + name),
+      // чтобы завершение процесса и повторное использование PID не наследовало заморозку.
+      const activeKeys = new Set(list.map(getProcessIdentityKey));
+      setSuspendedProcessKeys((prev) => {
+        if (prev.length === 0) return prev;
+        const next = prev.filter((k) => activeKeys.has(k));
+        return next.length === prev.length ? prev : next;
+      });
     } catch (err) {
       console.error("Ошибка получения списка процессов:", err);
       setProcessError(String(err));
@@ -246,11 +266,17 @@ export function useNexusController() {
   const handleProcessSuspendToggle = useCallback(
     async (proc: ProcessItem) => {
       setProcessMenu(null);
-      const isSuspended = suspendedPids.includes(proc.pid);
+      const identityKey = getProcessIdentityKey(proc);
+      const isSuspended = suspendedProcessKeys.includes(identityKey);
+      const target = toProcessTargetIdentity(proc);
       try {
-        await invoke("suspend_process", { pid: proc.pid, suspend: !isSuspended });
-        setSuspendedPids((prev) =>
-          isSuspended ? prev.filter((p) => p !== proc.pid) : [...prev, proc.pid]
+        if (isSuspended) {
+          await invoke("resume_process", { target });
+        } else {
+          await invoke("suspend_process", { target, suspend: true });
+        }
+        setSuspendedProcessKeys((prev) =>
+          isSuspended ? prev.filter((k) => k !== identityKey) : [...prev, identityKey]
         );
         showProcessNotice(
           isSuspended
@@ -261,18 +287,22 @@ export function useNexusController() {
         setProcessError(String(err));
       }
     },
-    [suspendedPids, showProcessNotice]
+    [suspendedProcessKeys, showProcessNotice]
   );
 
   const handleProcessKill = useCallback(
-    async (proc: ProcessItem, tree: boolean) => {
+    async (proc: ProcessItem, tree: boolean, explicitTargets?: ProcessTargetIdentity[]) => {
       setProcessMenu(null);
+      const target = toProcessTargetIdentity(proc);
+      const targets = tree ? explicitTargets ?? [target] : [target];
       try {
-        await invoke("kill_process", { pid: proc.pid, tree });
-        setProcesses((prev) => prev.filter((p) => p.pid !== proc.pid));
+        await invoke("kill_process", { target, tree, targets });
+        const removedKeys = new Set(targets.map(getProcessIdentityKey));
+        setProcesses((prev) => prev.filter((p) => !removedKeys.has(getProcessIdentityKey(p))));
+        setSuspendedProcessKeys((prev) => prev.filter((k) => !removedKeys.has(k)));
         showProcessNotice(
           tree
-            ? `Дерево процессов ${proc.name} (PID ${proc.pid}) завершено`
+            ? `Завершено процессов ветки ${proc.name} (PID ${proc.pid}): ${targets.length}`
             : `Процесс ${proc.name} (PID ${proc.pid}) завершён`
         );
         window.setTimeout(() => void fetchProcesses(), 400);
@@ -544,9 +574,7 @@ export function useNexusController() {
     () => processes.reduce((acc, p) => acc + p.memory_mb, 0) / 1024,
     [processes]
   );
-  const menuProcessSuspended = processMenu
-    ? suspendedPids.includes(processMenu.process.pid)
-    : false;
+  const menuProcessSuspended = processMenu ? isProcessSuspended(processMenu.process) : false;
 
   const renderSortHeader = (key: ProcessSortKey, label: string, alignRight = true) => {
     const isActive = processSortKey === key;
@@ -731,7 +759,7 @@ export function useNexusController() {
     selectedPid,
     setSelectedPid,
     suspendedPids,
-    setSuspendedPids,
+    isProcessSuspended,
     processMenu,
     setProcessMenu,
     processMenuRef,

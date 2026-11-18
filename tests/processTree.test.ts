@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildProcessTree } from "../src/lib/processTree.ts";
+import { buildProcessTree, getProcessIdentityKey } from "../src/lib/processTree.ts";
 import type { ProcessItem } from "../src/lib/studio.tsx";
 
 function makeProc(
@@ -145,4 +145,23 @@ test("breaks cycles cleanly without infinite recursion or double counting CPU/RA
   assert.equal(res.statsByPid.get(702)?.totalDescendants, 1);
   assert.equal(res.statsByPid.get(702)?.subtreeCpu, 20.0);
   assert.equal(res.statsByPid.get(702)?.subtreeMemoryMb, 200);
+});
+
+test("subtreeTargets matches displayed NEXUS branch in leaves-first order and excludes shell-promoted apps", () => {
+  const explorer = makeProc({ pid: 6704, name: "explorer.exe", parent_pid: 500, start_time: 100 });
+  const explorerSub = makeProc({ pid: 6705, name: "explorer.exe", parent_pid: 6704, start_time: 150 });
+  const chrome = makeProc({ pid: 25936, name: "chrome.exe", parent_pid: 6704, start_time: 300 });
+  const chromeTab = makeProc({ pid: 25937, name: "chrome.exe", parent_pid: 25936, start_time: 301 });
+  const crashpad = makeProc({ pid: 25938, name: "crashpad_handler.exe", parent_pid: 25937, start_time: 302 });
+
+  const tree = buildProcessTree([explorer, explorerSub, chrome, chromeTab, crashpad], "pid", false, "", new Set());
+  const explorerTargets = tree.statsByPid.get(6704)!.subtreeTargets.map((t) => t.pid);
+  assert.deepEqual(explorerTargets, [6705, 6704]);
+
+  const chromeTargets = tree.statsByPid.get(25936)!.subtreeTargets.map((t) => t.pid);
+  assert.deepEqual(chromeTargets, [25938, 25937, 25936]);
+
+  const keyOld = getProcessIdentityKey(chromeTab);
+  const keyReused = getProcessIdentityKey(makeProc({ pid: 25937, name: "notepad.exe", start_time: 9999 }));
+  assert.notEqual(keyOld, keyReused, "Identity key must distinguish reused PIDs");
 });

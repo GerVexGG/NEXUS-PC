@@ -1170,6 +1170,168 @@ fn read_registry_run_items(
     }
 }
 
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
+fn is_reparse_meta(meta: &std::fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        return (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+fn allowed_startup_folders() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        if !appdata.trim().is_empty() {
+            dirs.push(
+                Path::new(&appdata)
+                    .join("Microsoft")
+                    .join("Windows")
+                    .join("Start Menu")
+                    .join("Programs")
+                    .join("Startup"),
+            );
+        }
+    }
+    if let Ok(program_data) =
+        std::env::var("PROGRAMDATA").or_else(|_| std::env::var("ALLUSERSPROFILE"))
+    {
+        if !program_data.trim().is_empty() {
+            dirs.push(
+                Path::new(&program_data)
+                    .join("Microsoft")
+                    .join("Windows")
+                    .join("Start Menu")
+                    .join("Programs")
+                    .join("Startup"),
+            );
+        }
+    }
+    dirs
+}
+
+fn validate_startup_folder_item_paths(
+    raw_base_path: &str,
+    allowed_dirs: &[PathBuf],
+) -> Result<(PathBuf, PathBuf, String), String> {
+    let trimmed = raw_base_path.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return Err("Некорректный пустой путь элемента автозагрузки".to_string());
+    }
+    if trimmed.ends_with('\\') || trimmed.ends_with('/') {
+        return Err("Путь автозагрузки не должен указывать на каталог".to_string());
+    }
+
+    let raw_path = Path::new(trimmed);
+    for comp in raw_path.components() {
+        if matches!(
+            comp,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        ) {
+            return Err("Запрещён обход каталогов (.. / .) в пути автозагрузки".to_string());
+        }
+    }
+
+    let Some(parent) = raw_path.parent() else {
+        return Err("Не удалось определить родительский каталог автозагрузки".to_string());
+    };
+    let Some(file_name_os) = raw_path.file_name() else {
+        return Err("Не удалось определить имя файла автозагрузки".to_string());
+    };
+    let file_name = file_name_os.to_string_lossy().to_string();
+    if file_name.is_empty()
+        || file_name.contains('\\')
+        || file_name.contains('/')
+        || file_name.eq_ignore_ascii_case("desktop.ini")
+    {
+        return Err(format!("Недопустимое имя файла автозагрузки: {file_name}"));
+    }
+    if file_name.to_ascii_lowercase().ends_with(".disabled") {
+        return Err(
+            "Передайте базовый путь элемента автозагрузки без суффикса .disabled".to_string(),
+        );
+    }
+
+    let parent_meta = std::fs::symlink_metadata(parent).map_err(|e| {
+        format!("Разрешённая папка автозагрузки недоступна: {e}")
+    })?;
+    if !parent_meta.is_dir() || is_reparse_meta(&parent_meta) {
+        return Err(
+            "Каталог автозагрузки не является обычной директорией или является reparse point"
+                .to_string(),
+        );
+    }
+    let canon_parent = std::fs::canonicalize(parent)
+        .map_err(|e| format!("Не удалось канонизировать каталог автозагрузки: {e}"))?;
+
+    let mut allowed_match = false;
+    for allowed in allowed_dirs {
+        let Ok(allowed_meta) = std::fs::symlink_metadata(allowed) else {
+            continue;
+        };
+        if !allowed_meta.is_dir() || is_reparse_meta(&allowed_meta) {
+            continue;
+        }
+        if let Ok(canon_allowed) = std::fs::canonicalize(allowed) {
+            if canon_allowed == canon_parent {
+                allowed_match = true;
+                break;
+            }
+        }
+    }
+    if !allowed_match {
+        return Err(
+            "Путь находится за пределами разрешённых папок автозагрузки Windows".to_string(),
+        );
+    }
+
+    let candidate_base = canon_parent.join(&file_name);
+    let candidate_disabled = canon_parent.join(format!("{file_name}.disabled"));
+
+    let mut any_exists = false;
+    for candidate in [&candidate_base, &candidate_disabled] {
+        match std::fs::symlink_metadata(candidate) {
+            Ok(meta) => {
+                any_exists = true;
+                if meta.is_dir() {
+                    return Err("Операции с подкаталогами в автозагрузке запрещены".to_string());
+                }
+                if is_reparse_meta(&meta) {
+                    return Err(
+                        "Симлинки, junction и reparse points в папке автозагрузки запрещены"
+                            .to_string(),
+                    );
+                }
+                let canon_file = std::fs::canonicalize(candidate).map_err(|e| {
+                    format!("Не удалось проверить канонический путь файла автозагрузки: {e}")
+                })?;
+                if canon_file.parent() != Some(canon_parent.as_path()) {
+                    return Err(
+                        "Объект автозагрузки указывает за пределы разрешённой папки".to_string(),
+                    );
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!("Ошибка проверки файла автозагрузки: {err}"));
+            }
+        }
+    }
+    if !any_exists {
+        return Err("Элемент автозагрузки не найден в разрешённой папке".to_string());
+    }
+
+    Ok((candidate_base, candidate_disabled, file_name))
+}
+
 fn scan_startup_folder(
     dir_path: &Path,
     location_label: &str,
@@ -1177,6 +1339,12 @@ fn scan_startup_folder(
     items: &mut Vec<StartupItem>,
     seen_ids: &mut HashSet<String>,
 ) {
+    let Ok(dir_meta) = std::fs::symlink_metadata(dir_path) else {
+        return;
+    };
+    if !dir_meta.is_dir() || is_reparse_meta(&dir_meta) {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir_path) else {
         return;
     };
@@ -1186,10 +1354,10 @@ fn scan_startup_folder(
             continue;
         };
         let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
-        if file_type.is_dir() {
+        if meta.is_dir() || is_reparse_meta(&meta) {
             continue;
         }
 
@@ -1849,6 +2017,33 @@ fn append_logon_tasks(items: &mut Vec<StartupItem>, seen_ids: &mut HashSet<Strin
     }
 }
 
+fn toggle_startup_folder_entry_in_dirs(
+    raw_base_path: &str,
+    enable: bool,
+    allowed_dirs: &[PathBuf],
+) -> Result<String, String> {
+    let (base_path, disabled_path, file_name) =
+        validate_startup_folder_item_paths(raw_base_path, allowed_dirs)?;
+    if enable {
+        if disabled_path.exists() {
+            let _ = validate_startup_folder_item_paths(raw_base_path, allowed_dirs)?;
+            std::fs::rename(&disabled_path, &base_path).map_err(|e| {
+                format!(
+                    "Не удалось включить ярлык автозагрузки (проверьте права доступа): {e}"
+                )
+            })?;
+        }
+    } else if base_path.exists() {
+        let _ = validate_startup_folder_item_paths(raw_base_path, allowed_dirs)?;
+        std::fs::rename(&base_path, &disabled_path).map_err(|e| {
+            format!(
+                "Не удалось отключить ярлык автозагрузки (проверьте права доступа): {e}"
+            )
+        })?;
+    }
+    Ok(file_name)
+}
+
 #[tauri::command]
 fn toggle_startup_item(id: String, enable: bool) -> Result<(), String> {
     if id.starts_with("approved|") {
@@ -1856,32 +2051,24 @@ fn toggle_startup_item(id: String, enable: bool) -> Result<(), String> {
     }
 
     if let Some(base_path) = id.strip_prefix("dir|") {
-        let disabled_path = format!("{}.disabled", base_path);
+        let file_name =
+            toggle_startup_folder_entry_in_dirs(base_path, enable, &allowed_startup_folders())?;
         if enable {
-            if Path::new(&disabled_path).exists() {
-                std::fs::rename(&disabled_path, base_path).map_err(|e| {
-                    format!("Не удалось включить ярлык автозагрузки (проверьте права доступа): {}", e)
-                })?;
-            }
             #[cfg(target_os = "windows")]
-            if let Some(file_name) = Path::new(base_path).file_name().and_then(|n| n.to_str()) {
+            {
                 let folder_approved =
                     r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder";
                 let _ = restore_startup_approved_if_disabled(
                     HKEY_CURRENT_USER,
                     folder_approved,
-                    file_name,
+                    &file_name,
                 );
                 let _ = restore_startup_approved_if_disabled(
                     HKEY_LOCAL_MACHINE,
                     folder_approved,
-                    file_name,
+                    &file_name,
                 );
             }
-        } else if Path::new(base_path).exists() {
-            std::fs::rename(base_path, &disabled_path).map_err(|e| {
-                format!("Не удалось отключить ярлык автозагрузки (проверьте права доступа): {}", e)
-            })?;
         }
         return Ok(());
     }
@@ -2211,6 +2398,32 @@ fn delete_registry_value(root: winreg::HKEY, subkey: &str, name: &str) -> Result
         .map_err(|e| startup_delete_error(&e))
 }
 
+fn remove_startup_folder_entry_in_dirs(
+    raw_base_path: &str,
+    allowed_dirs: &[PathBuf],
+) -> Result<String, String> {
+    let (base_path, disabled_path, file_name) =
+        validate_startup_folder_item_paths(raw_base_path, allowed_dirs)?;
+    for path in [&base_path, &disabled_path] {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) => {
+                if meta.is_dir() || is_reparse_meta(&meta) {
+                    return Err(
+                        "Запрещено удаление подкаталогов, симлинков и reparse points".to_string(),
+                    );
+                }
+                std::fs::remove_file(path)
+                    .map_err(|e| format!("Не удалось удалить файл автозапуска: {e}"))?;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!("Ошибка доступа к файлу автозапуска: {err}"));
+            }
+        }
+    }
+    Ok(file_name)
+}
+
 #[tauri::command]
 fn remove_startup_entry(entry_id: String, source: String) -> Result<(), String> {
     let entry_id = entry_id.trim().to_string();
@@ -2219,21 +2432,14 @@ fn remove_startup_entry(entry_id: String, source: String) -> Result<(), String> 
     }
 
     if let Some(base_path) = entry_id.strip_prefix("dir|") {
-        for candidate in [base_path.to_string(), format!("{base_path}.disabled")] {
-            let path = Path::new(&candidate);
-            if path.exists() {
-                std::fs::remove_file(path)
-                    .map_err(|e| format!("Не удалось удалить файл автозапуска: {e}"))?;
-            }
-        }
+        let file_name =
+            remove_startup_folder_entry_in_dirs(base_path, &allowed_startup_folders())?;
         settings::record_startup_removal(&entry_id, &source);
-        if let Some(file_name) = Path::new(base_path).file_name().and_then(|name| name.to_str()) {
-            let _ = delete_registry_value(
-                HKEY_CURRENT_USER,
-                r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder",
-                file_name,
-            );
-        }
+        let _ = delete_registry_value(
+            HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder",
+            &file_name,
+        );
         return Ok(());
     }
 
@@ -4905,80 +5111,573 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-// Защита от завершения критичных узлов (System Idle, System) и самого NEXUS PC
-fn guard_process_pid(pid: u32) -> Result<(), String> {
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ProcessTargetIdentity {
+    pub pid: u32,
+    pub start_time: u64,
+    pub name: String,
+    #[serde(default)]
+    pub exe_path: Option<String>,
+}
+
+const PROTECTED_PROCESS_STEMS: &[&str] = &[
+    "system",
+    "system idle process",
+    "idle",
+    "registry",
+    "memory compression",
+    "secure system",
+    "smss",
+    "csrss",
+    "wininit",
+    "services",
+    "lsass",
+    "lsaiso",
+    "winlogon",
+    "dwm",
+    "fontdrvhost",
+    "sihost",
+    "svchost",
+    "explorer",
+    "nexus",
+    "nexus-hwmon",
+];
+
+fn normalize_process_stem(raw: &str) -> String {
+    let base = raw.trim().rsplit(['\\', '/']).next().unwrap_or("");
+    let lower = base.to_ascii_lowercase();
+    lower.strip_suffix(".exe").unwrap_or(&lower).to_string()
+}
+
+fn active_hwmon_sidecar_pid(state: &AppState) -> Option<u32> {
+    state
+        .hw_sidecar_child
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|c| c.id()))
+}
+
+fn check_process_not_protected(
+    pid: u32,
+    name: &str,
+    exe_path: Option<&str>,
+    sidecar_pid: Option<u32>,
+) -> Result<(), String> {
     if pid == 0 || pid == 4 {
-        return Err("Системный процесс Windows защищён от изменения".to_string());
+        return Err("Системный процесс ядра Windows защищён от изменения".to_string());
     }
     if pid == std::process::id() {
         return Err("Нельзя применить действие к самому NEXUS PC".to_string());
     }
+    if sidecar_pid == Some(pid) {
+        return Err("Системный сервис телеметрии NEXUS защищён от изменения".to_string());
+    }
+
+    let stem_from_name = normalize_process_stem(name);
+    if !stem_from_name.is_empty() && PROTECTED_PROCESS_STEMS.contains(&stem_from_name.as_str()) {
+        return Err(format!(
+            "Системный процесс Windows ({name}) защищён от завершения и приостановки"
+        ));
+    }
+
+    if let Some(path) = exe_path {
+        if !path.trim().is_empty() {
+            let stem_from_path = normalize_process_stem(path);
+            if !stem_from_path.is_empty()
+                && PROTECTED_PROCESS_STEMS.contains(&stem_from_path.as_str())
+            {
+                return Err(format!(
+                    "Исполняемый файл системы Windows ({path}) защищён от изменения"
+                ));
+            }
+        }
+    }
+
     Ok(())
 }
 
-#[tauri::command]
-fn kill_process(pid: u32, tree: bool) -> Result<(), String> {
-    guard_process_pid(pid)?;
-
-    let pid_str = pid.to_string();
-    let mut cmd = Command::new("taskkill");
-    if tree {
-        cmd.args(["/F", "/T", "/PID", &pid_str]);
-    } else {
-        cmd.args(["/F", "/PID", &pid_str]);
-    }
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-
-    let output = cmd
-        .output()
-        .map_err(|e| format!("Не удалось вызвать taskkill: {}", e))?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let details = if !stderr.is_empty() { stderr } else { stdout };
-        Err(if details.is_empty() {
-            format!(
-                "Не удалось завершить процесс PID {} (код {:?}). Возможно, требуются права Администратора",
-                pid,
-                output.status.code()
-            )
-        } else {
-            details
-        })
-    }
-}
-
-// Минимальный FFI к kernel32 для динамической загрузки NtSuspendProcess / NtResumeProcess из ntdll.dll
+// Минимальный FFI к kernel32 для проверки идентичности/критичности процесса и работы через verified HANDLE
 #[cfg(target_os = "windows")]
 mod win_process_ffi {
     use std::ffi::c_void;
 
     pub type Handle = *mut c_void;
+    pub const PROCESS_TERMINATE: u32 = 0x0001;
     pub const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
+    pub const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    pub const STILL_ACTIVE: u32 = 259;
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Default)]
+    #[allow(non_snake_case)]
+    pub struct FILETIME {
+        pub dwLowDateTime: u32,
+        pub dwHighDateTime: u32,
+    }
+
+    pub struct ScopedHandle(pub Handle);
+
+    impl Drop for ScopedHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+                self.0 = std::ptr::null_mut();
+            }
+        }
+    }
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
         pub fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> Handle;
         pub fn CloseHandle(handle: Handle) -> i32;
+        pub fn TerminateProcess(handle: Handle, exit_code: u32) -> i32;
+        pub fn GetProcessTimes(
+            handle: Handle,
+            creation_time: *mut FILETIME,
+            exit_time: *mut FILETIME,
+            kernel_time: *mut FILETIME,
+            user_time: *mut FILETIME,
+        ) -> i32;
+        pub fn QueryFullProcessImageNameW(
+            handle: Handle,
+            flags: u32,
+            exe_name: *mut u16,
+            size: *mut u32,
+        ) -> i32;
+        pub fn IsProcessCritical(handle: Handle, critical: *mut i32) -> i32;
+        pub fn GetExitCodeProcess(handle: Handle, exit_code: *mut u32) -> i32;
         pub fn GetModuleHandleW(module_name: *const u16) -> Handle;
         pub fn GetProcAddress(module: Handle, proc_name: *const u8) -> *mut c_void;
         pub fn GetLastError() -> u32;
     }
 
     pub type NtProcessFn = unsafe extern "system" fn(process_handle: Handle) -> i32;
+
+    pub fn filetime_to_unix_secs(ft: FILETIME) -> u64 {
+        const WINDOWS_TICK: u64 = 10_000_000;
+        const SEC_TO_UNIX_EPOCH: u64 = 11_644_473_600;
+        let ticks = ((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64);
+        (ticks / WINDOWS_TICK).saturating_sub(SEC_TO_UNIX_EPOCH)
+    }
+
+    pub fn query_handle_image_path(handle: Handle) -> Option<String> {
+        let mut buf = [0u16; 1024];
+        let mut size = buf.len() as u32;
+        let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size) };
+        if ok != 0 && size > 0 {
+            Some(String::from_utf16_lossy(&buf[..size as usize]))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_and_verify_process_target(
+    target: &ProcessTargetIdentity,
+    desired_access: u32,
+    sidecar_pid: Option<u32>,
+) -> Result<win_process_ffi::ScopedHandle, String> {
+    use win_process_ffi::*;
+
+    check_process_not_protected(
+        target.pid,
+        &target.name,
+        target.exe_path.as_deref(),
+        sidecar_pid,
+    )?;
+
+    if target.start_time == 0 {
+        return Err(format!(
+            "Невозможно безопасно подтвердить время запуска процесса {} (PID {})",
+            target.name, target.pid
+        ));
+    }
+
+    let handle_raw = unsafe {
+        OpenProcess(
+            desired_access | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            target.pid,
+        )
+    };
+    if handle_raw.is_null() {
+        let err = unsafe { GetLastError() };
+        if err == 87 {
+            return Err(format!("Процесс PID {} уже завершён", target.pid));
+        }
+        return Err(format!(
+            "Нет доступа к процессу {} (PID {}, Win32 код {}). Запустите NEXUS PC от имени Администратора",
+            target.name, target.pid, err
+        ));
+    }
+    let handle = ScopedHandle(handle_raw);
+
+    let mut exit_code: u32 = 0;
+    if unsafe { GetExitCodeProcess(handle.0, &mut exit_code) } != 0 && exit_code != STILL_ACTIVE {
+        return Err(format!("Процесс PID {} уже завершился", target.pid));
+    }
+
+    let mut critical_flag: i32 = 0;
+    if unsafe { IsProcessCritical(handle.0, &mut critical_flag) } != 0 && critical_flag != 0 {
+        return Err(format!(
+            "Процесс {} (PID {}) помечен Windows как критический (IsProcessCritical)",
+            target.name, target.pid
+        ));
+    }
+
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    if unsafe { GetProcessTimes(handle.0, &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
+        let err = unsafe { GetLastError() };
+        return Err(format!(
+            "Не удалось проверить время запуска процесса PID {} (Win32 код {})",
+            target.pid, err
+        ));
+    }
+    let actual_start_time = filetime_to_unix_secs(creation);
+    if actual_start_time != target.start_time {
+        return Err(format!(
+            "Идентичность PID {} изменилась (PID был переиспользован ОС): ожидалось время {}, фактически {}",
+            target.pid, target.start_time, actual_start_time
+        ));
+    }
+
+    let actual_image_path = query_handle_image_path(handle.0);
+    if let Some(ref actual_path) = actual_image_path {
+        check_process_not_protected(target.pid, &target.name, Some(actual_path), sidecar_pid)?;
+
+        let expected_stem = normalize_process_stem(&target.name);
+        let actual_stem = normalize_process_stem(actual_path);
+        if !expected_stem.is_empty() && expected_stem != actual_stem {
+            return Err(format!(
+                "Идентичность процесса PID {} не совпадает: ожидался '{}', фактически '{}'",
+                target.pid, target.name, actual_path
+            ));
+        }
+
+        if let Some(ref expected_path) = target.exe_path {
+            let trimmed = expected_path.trim();
+            if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case(actual_path) {
+                return Err(format!(
+                    "Путь исполняемого файла PID {} изменился (ожидался '{}', фактически '{}')",
+                    target.pid, trimmed, actual_path
+                ));
+            }
+        }
+    }
+
+    Ok(handle)
+}
+
+#[derive(Clone, Debug)]
+struct LiveProcSnap {
+    pid: u32,
+    ppid: Option<u32>,
+    start_time: u64,
+    name: String,
+    exe_path: String,
+}
+
+fn validate_tree_kill_batch(
+    root_target: &ProcessTargetIdentity,
+    batch: &[ProcessTargetIdentity],
+    snapshot: &[LiveProcSnap],
+    self_pid: u32,
+    sidecar_pid: Option<u32>,
+) -> Result<Vec<ProcessTargetIdentity>, String> {
+    if batch.is_empty() {
+        return Err("Список процессов для завершения дерева пуст".to_string());
+    }
+    if root_target.pid == 0 || root_target.pid == 4 || root_target.pid == self_pid {
+        return Err("Системный или собственный процесс защищён от завершения дерева".to_string());
+    }
+    check_process_not_protected(
+        root_target.pid,
+        &root_target.name,
+        root_target.exe_path.as_deref(),
+        sidecar_pid,
+    )?;
+
+    let mut by_pid: HashMap<u32, &LiveProcSnap> = HashMap::with_capacity(snapshot.len());
+    for item in snapshot {
+        if item.pid == 0 {
+            continue;
+        }
+        let replace = by_pid
+            .get(&item.pid)
+            .map(|prev| item.start_time >= prev.start_time)
+            .unwrap_or(true);
+        if replace {
+            by_pid.insert(item.pid, item);
+        }
+    }
+
+    let Some(live_root) = by_pid.get(&root_target.pid).copied() else {
+        return Err(format!(
+            "Корневой процесс {} (PID {}) уже завершён",
+            root_target.name, root_target.pid
+        ));
+    };
+    if live_root.start_time != root_target.start_time
+        || normalize_process_stem(&live_root.name) != normalize_process_stem(&root_target.name)
+    {
+        return Err(format!(
+            "Идентичность корневого процесса PID {} изменилась — завершение дерева заблокировано",
+            root_target.pid
+        ));
+    }
+
+    // Восстанавливаем отображаемое дерево NEXUS (исключая независимые приложения, запущенные через explorer.exe)
+    let mut pids: Vec<u32> = by_pid.keys().copied().collect();
+    pids.sort_unstable();
+    let mut tree_parent_of: HashMap<u32, u32> = HashMap::with_capacity(by_pid.len());
+    let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
+
+    for &pid in &pids {
+        let Some(proc_snap) = by_pid.get(&pid) else {
+            continue;
+        };
+        let Some(ppid) = proc_snap.ppid else {
+            continue;
+        };
+        if ppid == 0 || ppid == pid {
+            continue;
+        }
+        let Some(parent_snap) = by_pid.get(&ppid) else {
+            continue;
+        };
+        if parent_snap.start_time != 0
+            && proc_snap.start_time != 0
+            && parent_snap.start_time > proc_snap.start_time
+        {
+            continue;
+        }
+        if is_shell_launcher_parent(&parent_snap.name, &proc_snap.name) {
+            continue;
+        }
+        let mut creates_cycle = false;
+        let mut cursor = Some(ppid);
+        let mut steps = 0usize;
+        while let Some(curr) = cursor {
+            if curr == pid || steps > pids.len() {
+                creates_cycle = true;
+                break;
+            }
+            cursor = tree_parent_of.get(&curr).copied();
+            steps += 1;
+        }
+        if creates_cycle {
+            continue;
+        }
+        tree_parent_of.insert(pid, ppid);
+        children_of.entry(ppid).or_default().push(pid);
+    }
+
+    let mut allowed_subtree_pids: HashSet<u32> = HashSet::new();
+    let mut stack = vec![root_target.pid];
+    while let Some(curr) = stack.pop() {
+        if !allowed_subtree_pids.insert(curr) {
+            continue;
+        }
+        if let Some(live_node) = by_pid.get(&curr) {
+            if curr == self_pid {
+                return Err("Ветка содержит процесс NEXUS PC — завершение заблокировано".to_string());
+            }
+            check_process_not_protected(
+                live_node.pid,
+                &live_node.name,
+                Some(live_node.exe_path.as_str()),
+                sidecar_pid,
+            )?;
+        }
+        if let Some(kids) = children_of.get(&curr) {
+            stack.extend_from_slice(kids);
+        }
+    }
+
+    let mut seen_pids: HashSet<u32> = HashSet::new();
+    let mut verified_targets: Vec<ProcessTargetIdentity> = Vec::with_capacity(batch.len());
+    let mut root_included = false;
+
+    for item in batch {
+        if !seen_pids.insert(item.pid) {
+            continue;
+        }
+        if item.pid == self_pid {
+            return Err("Нельзя завершить сам NEXUS PC через дерево процессов".to_string());
+        }
+        check_process_not_protected(
+            item.pid,
+            &item.name,
+            item.exe_path.as_deref(),
+            sidecar_pid,
+        )?;
+        if item.pid == root_target.pid {
+            root_included = true;
+        }
+
+        if let Some(live_item) = by_pid.get(&item.pid) {
+            if !allowed_subtree_pids.contains(&item.pid) {
+                return Err(format!(
+                    "Процесс {} (PID {}) не относится к подтверждённой ветке {} — операция заблокирована",
+                    item.name, item.pid, root_target.name
+                ));
+            }
+            if live_item.start_time != item.start_time
+                || normalize_process_stem(&live_item.name) != normalize_process_stem(&item.name)
+            {
+                return Err(format!(
+                    "Идентичность процесса PID {} изменилась (PID reuse) — завершение дерева заблокировано",
+                    item.pid
+                ));
+            }
+            verified_targets.push(item.clone());
+        }
+    }
+
+    if !root_included {
+        return Err("Подтверждённый список не содержит корневой процесс ветки".to_string());
+    }
+
+    Ok(verified_targets)
 }
 
 #[tauri::command]
-fn suspend_process(pid: u32, suspend: bool) -> Result<(), String> {
-    guard_process_pid(pid)?;
+fn kill_process(
+    state: State<'_, AppState>,
+    target: ProcessTargetIdentity,
+    tree: bool,
+    targets: Option<Vec<ProcessTargetIdentity>>,
+) -> Result<(), String> {
+    let sidecar_pid = active_hwmon_sidecar_pid(&state);
+    check_process_not_protected(
+        target.pid,
+        &target.name,
+        target.exe_path.as_deref(),
+        sidecar_pid,
+    )?;
 
     #[cfg(target_os = "windows")]
     {
         use win_process_ffi::*;
+
+        if !tree {
+            let handle =
+                open_and_verify_process_target(&target, PROCESS_TERMINATE, sidecar_pid)?;
+            let ok = unsafe { TerminateProcess(handle.0, 1) };
+            if ok != 0 {
+                return Ok(());
+            }
+            let err = unsafe { GetLastError() };
+            return Err(format!(
+                "Не удалось завершить процесс {} (PID {}, Win32 код {}). Возможно, требуются права Администратора",
+                target.name, target.pid, err
+            ));
+        }
+
+        let batch = targets.ok_or_else(|| {
+            "Для завершения ветки процессов необходим явно подтверждённый список целей"
+                .to_string()
+        })?;
+
+        let snapshot: Vec<LiveProcSnap> = {
+            let mut sys = state
+                .sys
+                .lock()
+                .map_err(|_| "Системный монитор заблокирован".to_string())?;
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            sys.processes()
+                .values()
+                .filter(|p| p.pid().as_u32() != 0)
+                .map(|p| LiveProcSnap {
+                    pid: p.pid().as_u32(),
+                    ppid: p.parent().map(|pp| pp.as_u32()),
+                    start_time: p.start_time(),
+                    name: p.name().to_string_lossy().to_string(),
+                    exe_path: p
+                        .exe()
+                        .map(|e| e.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                })
+                .collect()
+        };
+
+        let validated_targets = validate_tree_kill_batch(
+            &target,
+            &batch,
+            &snapshot,
+            std::process::id(),
+            sidecar_pid,
+        )?;
+
+        let mut handles: Vec<(ProcessTargetIdentity, ScopedHandle)> =
+            Vec::with_capacity(validated_targets.len());
+        for item in validated_targets {
+            match open_and_verify_process_target(&item, PROCESS_TERMINATE, sidecar_pid) {
+                Ok(h) => handles.push((item, h)),
+                Err(err) => {
+                    if err.contains("уже заверш") {
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        let mut terminated = 0usize;
+        let mut last_err: Option<String> = None;
+        for (item, handle) in handles {
+            let ok = unsafe { TerminateProcess(handle.0, 1) };
+            if ok != 0 {
+                terminated += 1;
+            } else {
+                let code = unsafe { GetLastError() };
+                last_err = Some(format!(
+                    "Не удалось завершить {} (PID {}, Win32 код {})",
+                    item.name, item.pid, code
+                ));
+            }
+        }
+
+        if let Some(err) = last_err {
+            if terminated == 0 {
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = targets;
+        Err("Управление процессами поддерживается только в Windows".to_string())
+    }
+}
+
+#[tauri::command]
+fn suspend_process(
+    state: State<'_, AppState>,
+    target: ProcessTargetIdentity,
+    suspend: bool,
+) -> Result<(), String> {
+    let sidecar_pid = active_hwmon_sidecar_pid(&state);
+    check_process_not_protected(
+        target.pid,
+        &target.name,
+        target.exe_path.as_deref(),
+        sidecar_pid,
+    )?;
+
+    #[cfg(target_os = "windows")]
+    {
+        use win_process_ffi::*;
+
+        let handle = open_and_verify_process_target(&target, PROCESS_SUSPEND_RESUME, sidecar_pid)?;
 
         let ntdll_name: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
         let fn_name: &[u8] = if suspend {
@@ -4987,7 +5686,7 @@ fn suspend_process(pid: u32, suspend: bool) -> Result<(), String> {
             b"NtResumeProcess\0"
         };
 
-        unsafe {
+        let status = unsafe {
             let ntdll = GetModuleHandleW(ntdll_name.as_ptr());
             if ntdll.is_null() {
                 return Err("Не удалось получить дескриптор ntdll.dll".to_string());
@@ -4998,26 +5697,17 @@ fn suspend_process(pid: u32, suspend: bool) -> Result<(), String> {
                 return Err("Функция NtSuspendProcess/NtResumeProcess недоступна".to_string());
             }
             let nt_fn: NtProcessFn = std::mem::transmute(proc_addr);
+            nt_fn(handle.0)
+        };
 
-            let handle = OpenProcess(PROCESS_SUSPEND_RESUME, 0, pid);
-            if handle.is_null() {
-                let err = GetLastError();
-                return Err(format!(
-                    "Нет доступа к процессу PID {} (Win32 код {}). Запустите NEXUS PC от имени Администратора",
-                    pid, err
-                ));
-            }
+        drop(handle);
 
-            let status = nt_fn(handle);
-            CloseHandle(handle);
-
-            if status < 0 {
-                return Err(format!(
-                    "{} завершился с NTSTATUS 0x{:08X}",
-                    if suspend { "NtSuspendProcess" } else { "NtResumeProcess" },
-                    status as u32
-                ));
-            }
+        if status < 0 {
+            return Err(format!(
+                "{} завершился с NTSTATUS 0x{:08X}",
+                if suspend { "NtSuspendProcess" } else { "NtResumeProcess" },
+                status as u32
+            ));
         }
 
         Ok(())
@@ -5028,6 +5718,14 @@ fn suspend_process(pid: u32, suspend: bool) -> Result<(), String> {
         let _ = suspend;
         Err("Заморозка процессов поддерживается только в Windows".to_string())
     }
+}
+
+#[tauri::command]
+fn resume_process(
+    state: State<'_, AppState>,
+    target: ProcessTargetIdentity,
+) -> Result<(), String> {
+    suspend_process(state, target, false)
 }
 
 fn tcp_state_name(state: u32) -> &'static str {
@@ -5675,6 +6373,7 @@ pub fn run() {
             get_process_details,
             kill_process,
             suspend_process,
+            resume_process,
             get_network_telemetry,
             probe_network_health,
             get_network_connections,
@@ -5779,5 +6478,555 @@ mod tests {
             reused_parent, None,
             "Process older than its apparent PPID must not link to reused PID"
         );
+    }
+
+    struct TempTestDir(std::path::PathBuf);
+
+    impl TempTestDir {
+        fn new(prefix: &str) -> Self {
+            let unique = format!(
+                "nexus_stage1_test_{}_{}_{}",
+                prefix,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            );
+            let path = std::env::temp_dir().join(unique);
+            std::fs::create_dir_all(&path).expect("failed to create temp test root");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    struct ChildCleanupGuard(Option<std::process::Child>);
+
+    #[cfg(target_os = "windows")]
+    impl Drop for ChildCleanupGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[test]
+    fn critical_process_guard_blocks_system_and_self_processes() {
+        for pid in [0u32, 4u32, std::process::id()] {
+            assert!(
+                check_process_not_protected(pid, "custom.exe", None, None).is_err(),
+                "PID {pid} must be blocked by backend guard"
+            );
+        }
+        assert!(
+            check_process_not_protected(99991, "custom.exe", None, Some(99991)).is_err(),
+            "Active telemetry sidecar PID must be blocked"
+        );
+
+        let protected = [
+            "System",
+            "System Idle Process",
+            "csrss.exe",
+            "wininit.exe",
+            "services.exe",
+            "lsass.exe",
+            "winlogon.exe",
+            "smss.exe",
+            "Registry",
+            "dwm.exe",
+            "svchost.exe",
+            "explorer.exe",
+            "nexus.exe",
+            "nexus-hwmon.exe",
+        ];
+        for name in protected {
+            assert!(
+                check_process_not_protected(44444, name, None, None).is_err(),
+                "Protected process name '{name}' must be rejected"
+            );
+            let fake_path = format!(r"C:\Windows\System32\{name}");
+            assert!(
+                check_process_not_protected(44444, "renamed_client.exe", Some(&fake_path), None)
+                    .is_err(),
+                "Protected exe path '{fake_path}' must be rejected even with spoofed name"
+            );
+        }
+
+        assert!(
+            check_process_not_protected(
+                44445,
+                "notepad.exe",
+                Some(r"C:\Windows\System32\notepad.exe"),
+                Some(99991),
+            )
+            .is_ok(),
+            "Ordinary non-critical process must be allowed"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn pid_reuse_verification_rejects_mismatched_start_time_and_name() {
+        use std::os::windows::process::CommandExt;
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let child = std::process::Command::new("ping.exe")
+            .args(["-n", "30", "127.0.0.1"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("ping.exe test child should spawn cleanly");
+        let pid = child.id();
+        let mut guard = ChildCleanupGuard(Some(child));
+
+        let mut sys = System::new();
+        let mut observed_start_time = 0u64;
+        let mut observed_exe_path = String::new();
+        for _ in 0..20 {
+            sys.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+                true,
+                ProcessRefreshKind::everything(),
+            );
+            if let Some(p) = sys.process(Pid::from_u32(pid)) {
+                observed_start_time = p.start_time();
+                observed_exe_path = p.exe().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
+                if observed_start_time > 0 {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(observed_start_time > 0, "Child start_time must be readable via sysinfo");
+
+        // Mismatched start_time -> rejected (simulates PID reuse)
+        let wrong_time = ProcessTargetIdentity {
+            pid,
+            start_time: observed_start_time + 5,
+            name: "ping.exe".to_string(),
+            exe_path: Some(observed_exe_path.clone()),
+        };
+        assert!(
+            open_and_verify_process_target(
+                &wrong_time,
+                win_process_ffi::PROCESS_TERMINATE,
+                None
+            )
+            .is_err(),
+            "Mismatched start_time must fail anti-PID-reuse verification"
+        );
+
+        // Zero start_time -> rejected
+        let zero_time = ProcessTargetIdentity {
+            pid,
+            start_time: 0,
+            name: "ping.exe".to_string(),
+            exe_path: None,
+        };
+        assert!(
+            open_and_verify_process_target(
+                &zero_time,
+                win_process_ffi::PROCESS_TERMINATE,
+                None
+            )
+            .is_err(),
+            "Zero start_time must fail anti-PID-reuse verification"
+        );
+
+        // Wrong process name -> rejected
+        let wrong_name = ProcessTargetIdentity {
+            pid,
+            start_time: observed_start_time,
+            name: "completely_different.exe".to_string(),
+            exe_path: Some(observed_exe_path.clone()),
+        };
+        assert!(
+            open_and_verify_process_target(
+                &wrong_name,
+                win_process_ffi::PROCESS_TERMINATE,
+                None
+            )
+            .is_err(),
+            "Mismatched process name must fail verification"
+        );
+
+        // Wrong exe_path -> rejected
+        let wrong_exe = ProcessTargetIdentity {
+            pid,
+            start_time: observed_start_time,
+            name: "ping.exe".to_string(),
+            exe_path: Some(r"C:\Temp\evil_fake_ping.exe".to_string()),
+        };
+        assert!(
+            open_and_verify_process_target(
+                &wrong_exe,
+                win_process_ffi::PROCESS_TERMINATE,
+                None
+            )
+            .is_err(),
+            "Mismatched exe_path must fail verification"
+        );
+
+        // Exact identity -> verified HANDLE opens and terminates cleanly without taskkill
+        let exact = ProcessTargetIdentity {
+            pid,
+            start_time: observed_start_time,
+            name: "ping.exe".to_string(),
+            exe_path: if observed_exe_path.is_empty() {
+                None
+            } else {
+                Some(observed_exe_path)
+            },
+        };
+        let handle = open_and_verify_process_target(
+            &exact,
+            win_process_ffi::PROCESS_TERMINATE,
+            None,
+        )
+        .expect("Exact ProcessTargetIdentity must open a verified handle");
+        let term_ok = unsafe { win_process_ffi::TerminateProcess(handle.0, 1) };
+        drop(handle);
+        assert_ne!(term_ok, 0, "TerminateProcess via verified handle should succeed");
+        if let Some(ref mut ch) = guard.0 {
+            let _ = ch.wait();
+        }
+        guard.0 = None;
+    }
+
+    #[test]
+    fn tree_kill_validator_rejects_shell_promoted_unrelated_reused_and_protected_targets() {
+        let snapshot = vec![
+            LiveProcSnap {
+                pid: 6704,
+                ppid: Some(4000),
+                start_time: 100,
+                name: "explorer.exe".to_string(),
+                exe_path: r"C:\Windows\explorer.exe".to_string(),
+            },
+            LiveProcSnap {
+                pid: 25936,
+                ppid: Some(6704),
+                start_time: 200,
+                name: "chrome.exe".to_string(),
+                exe_path: r"C:\Program Files\Google\Chrome\Application\chrome.exe".to_string(),
+            },
+            LiveProcSnap {
+                pid: 25937,
+                ppid: Some(25936),
+                start_time: 210,
+                name: "chrome.exe".to_string(),
+                exe_path: r"C:\Program Files\Google\Chrome\Application\chrome.exe".to_string(),
+            },
+            LiveProcSnap {
+                pid: 1001,
+                ppid: Some(6704),
+                start_time: 300,
+                name: "steam.exe".to_string(),
+                exe_path: r"C:\Program Files (x86)\Steam\steam.exe".to_string(),
+            },
+            LiveProcSnap {
+                pid: 1002,
+                ppid: Some(1001),
+                start_time: 310,
+                name: "steamwebhelper.exe".to_string(),
+                exe_path: r"C:\Program Files (x86)\Steam\bin\cef\steamwebhelper.exe".to_string(),
+            },
+            LiveProcSnap {
+                pid: 9001,
+                ppid: Some(1001),
+                start_time: 400,
+                name: "svchost.exe".to_string(),
+                exe_path: r"C:\Windows\System32\svchost.exe".to_string(),
+            },
+        ];
+
+        let explorer_root = ProcessTargetIdentity {
+            pid: 6704,
+            start_time: 100,
+            name: "explorer.exe".to_string(),
+            exe_path: None,
+        };
+        assert!(
+            validate_tree_kill_batch(
+                &explorer_root,
+                std::slice::from_ref(&explorer_root),
+                &snapshot,
+                55555,
+                None,
+            )
+            .is_err(),
+            "Killing explorer.exe tree must always be rejected"
+        );
+
+        let chrome_root = ProcessTargetIdentity {
+            pid: 25936,
+            start_time: 200,
+            name: "chrome.exe".to_string(),
+            exe_path: Some(r"C:\Program Files\Google\Chrome\Application\chrome.exe".to_string()),
+        };
+        let chrome_child = ProcessTargetIdentity {
+            pid: 25937,
+            start_time: 210,
+            name: "chrome.exe".to_string(),
+            exe_path: Some(r"C:\Program Files\Google\Chrome\Application\chrome.exe".to_string()),
+        };
+        let valid_chrome = validate_tree_kill_batch(
+            &chrome_root,
+            &[chrome_child.clone(), chrome_root.clone()],
+            &snapshot,
+            55555,
+            None,
+        )
+        .expect("Clean app subtree targets in displayed NEXUS tree must be accepted");
+        assert_eq!(valid_chrome.len(), 2);
+
+        // Smuggling an unrelated process (steam.exe) into chrome_root's kill batch -> rejected
+        let unrelated_steam = ProcessTargetIdentity {
+            pid: 1001,
+            start_time: 300,
+            name: "steam.exe".to_string(),
+            exe_path: None,
+        };
+        assert!(
+            validate_tree_kill_batch(
+                &chrome_root,
+                &[chrome_child.clone(), unrelated_steam, chrome_root.clone()],
+                &snapshot,
+                55555,
+                None,
+            )
+            .is_err(),
+            "Targets outside verified subtree must be rejected"
+        );
+
+        // PID reuse on child -> rejected
+        let reused_child = ProcessTargetIdentity {
+            pid: 25937,
+            start_time: 999,
+            name: "chrome.exe".to_string(),
+            exe_path: None,
+        };
+        assert!(
+            validate_tree_kill_batch(
+                &chrome_root,
+                &[reused_child, chrome_root.clone()],
+                &snapshot,
+                55555,
+                None,
+            )
+            .is_err(),
+            "Child with mismatched start_time must be rejected"
+        );
+
+        // Subtree containing protected descendant (svchost.exe under steam.exe) -> rejected
+        let steam_root = ProcessTargetIdentity {
+            pid: 1001,
+            start_time: 300,
+            name: "steam.exe".to_string(),
+            exe_path: None,
+        };
+        let steam_child = ProcessTargetIdentity {
+            pid: 1002,
+            start_time: 310,
+            name: "steamwebhelper.exe".to_string(),
+            exe_path: None,
+        };
+        assert!(
+            validate_tree_kill_batch(
+                &steam_root,
+                &[steam_child, steam_root.clone()],
+                &snapshot,
+                55555,
+                None,
+            )
+            .is_err(),
+            "Subtree containing any protected descendant must abort whole tree kill"
+        );
+    }
+
+    #[test]
+    fn startup_folder_validation_allows_toggle_and_remove_in_allowed_dir() {
+        let root = TempTestDir::new("startup_allowed");
+        let startup_dir = root.0.join("Startup");
+        std::fs::create_dir_all(&startup_dir).unwrap();
+        let lnk = startup_dir.join("MyApp.lnk");
+        let disabled_lnk = startup_dir.join("MyApp.lnk.disabled");
+        std::fs::write(&lnk, b"dummy shortcut").unwrap();
+
+        let base_str = lnk.to_string_lossy().to_string();
+        let allowed = vec![startup_dir.clone()];
+
+        let toggled_name = toggle_startup_folder_entry_in_dirs(&base_str, false, &allowed)
+            .expect("Disable in allowed Startup dir must succeed");
+        assert_eq!(toggled_name, "MyApp.lnk");
+        assert!(!lnk.exists());
+        assert!(disabled_lnk.exists());
+
+        toggle_startup_folder_entry_in_dirs(&base_str, true, &allowed)
+            .expect("Enable from .disabled in allowed Startup dir must succeed");
+        assert!(lnk.exists());
+        assert!(!disabled_lnk.exists());
+
+        // Also test removing when disabled
+        toggle_startup_folder_entry_in_dirs(&base_str, false, &allowed).unwrap();
+        remove_startup_folder_entry_in_dirs(&base_str, &allowed)
+            .expect("Remove in allowed Startup dir must succeed");
+        assert!(!lnk.exists());
+        assert!(!disabled_lnk.exists());
+    }
+
+    #[test]
+    fn startup_folder_validation_rejects_outside_and_fake_dirs() {
+        let root = TempTestDir::new("startup_outside");
+        let startup_dir = root.0.join("Startup");
+        let fake_dir = root.0.join("Startup_fake");
+        let sub_dir = startup_dir.join("Nested");
+        std::fs::create_dir_all(&startup_dir).unwrap();
+        std::fs::create_dir_all(&fake_dir).unwrap();
+        std::fs::create_dir_all(&sub_dir).unwrap();
+
+        let outside_file = root.0.join("secret.txt");
+        let fake_file = fake_dir.join("evil.lnk");
+        let nested_file = sub_dir.join("nested.lnk");
+        std::fs::write(&outside_file, b"keep").unwrap();
+        std::fs::write(&fake_file, b"keep").unwrap();
+        std::fs::write(&nested_file, b"keep").unwrap();
+
+        let allowed = vec![startup_dir.clone()];
+        for raw in [&outside_file, &fake_file, &nested_file, &sub_dir] {
+            let s = raw.to_string_lossy().to_string();
+            assert!(
+                toggle_startup_folder_entry_in_dirs(&s, false, &allowed).is_err(),
+                "Toggle outside allowed Startup dir must be rejected: {s}"
+            );
+            assert!(
+                remove_startup_folder_entry_in_dirs(&s, &allowed).is_err(),
+                "Remove outside allowed Startup dir must be rejected: {s}"
+            );
+        }
+        assert!(outside_file.exists());
+        assert!(fake_file.exists());
+        assert!(nested_file.exists());
+        assert!(sub_dir.exists());
+    }
+
+    #[test]
+    fn startup_folder_validation_rejects_dot_dot_traversal() {
+        let root = TempTestDir::new("startup_traversal");
+        let startup_dir = root.0.join("Startup");
+        std::fs::create_dir_all(&startup_dir).unwrap();
+        let outside_secret = root.0.join("secret.txt");
+        std::fs::write(&outside_secret, b"must remain untouched").unwrap();
+
+        let traversal = format!("{}\\..\\secret.txt", startup_dir.to_string_lossy());
+        let allowed = vec![startup_dir];
+        assert!(toggle_startup_folder_entry_in_dirs(&traversal, false, &allowed).is_err());
+        assert!(remove_startup_folder_entry_in_dirs(&traversal, &allowed).is_err());
+        assert!(outside_secret.exists());
+    }
+
+    #[test]
+    fn startup_folder_validation_handles_disabled_and_blocks_invalid_names() {
+        let root = TempTestDir::new("startup_names");
+        let startup_dir = root.0.join("Startup");
+        std::fs::create_dir_all(&startup_dir).unwrap();
+
+        let desktop_ini = startup_dir.join("desktop.ini");
+        let double_disabled = startup_dir.join("App.lnk.disabled.disabled");
+        let already_disabled_arg = startup_dir.join("App.lnk.disabled");
+        let nonexistent = startup_dir.join("DoesNotExist.lnk");
+        std::fs::write(&desktop_ini, b"[.ShellClassInfo]").unwrap();
+        std::fs::write(&double_disabled, b"bad").unwrap();
+        std::fs::write(&already_disabled_arg, b"disabled").unwrap();
+
+        let allowed = vec![startup_dir];
+        for bad in [&desktop_ini, &double_disabled, &already_disabled_arg, &nonexistent] {
+            let s = bad.to_string_lossy().to_string();
+            assert!(
+                toggle_startup_folder_entry_in_dirs(&s, false, &allowed).is_err(),
+                "Must reject invalid filename or missing target: {s}"
+            );
+            assert!(
+                remove_startup_folder_entry_in_dirs(&s, &allowed).is_err(),
+                "Must reject remove for invalid filename or missing target: {s}"
+            );
+        }
+        assert!(desktop_ini.exists());
+        assert!(double_disabled.exists());
+        assert!(already_disabled_arg.exists());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn startup_folder_validation_rejects_reparse_points_and_symlinks() {
+        use std::os::windows::process::CommandExt;
+
+        let root = TempTestDir::new("startup_reparse");
+        let startup_dir = root.0.join("Startup");
+        let external_dir = root.0.join("External");
+        std::fs::create_dir_all(&startup_dir).unwrap();
+        std::fs::create_dir_all(&external_dir).unwrap();
+
+        let external_file = external_dir.join("victim.txt");
+        std::fs::write(&external_file, b"important").unwrap();
+
+        // NTFS directory junction inside Startup works without elevation and triggers FILE_ATTRIBUTE_REPARSE_POINT
+        let junction_path = startup_dir.join("LinkDir.lnk");
+        let junction_disabled = startup_dir.join("LinkDir.lnk.disabled");
+        let mklink_status = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &junction_path.to_string_lossy(),
+                &external_dir.to_string_lossy(),
+            ])
+            .creation_flags(0x0800_0000)
+            .status()
+            .expect("cmd mklink /J should execute");
+        assert!(mklink_status.success(), "NTFS junction creation must succeed");
+
+        let allowed = vec![startup_dir.clone()];
+        let j_str = junction_path.to_string_lossy().to_string();
+        assert!(
+            toggle_startup_folder_entry_in_dirs(&j_str, false, &allowed).is_err(),
+            "Reparse point/junction in Startup dir must be rejected by toggle"
+        );
+        assert!(
+            remove_startup_folder_entry_in_dirs(&j_str, &allowed).is_err(),
+            "Reparse point/junction in Startup dir must be rejected by remove"
+        );
+        assert!(junction_path.exists());
+        assert!(!junction_disabled.exists());
+        assert!(external_file.exists());
+
+        // File symlink test if Developer Mode / SeCreateSymbolicLinkPrivilege allows it
+        let symlink_path = startup_dir.join("SymApp.lnk");
+        if std::os::windows::fs::symlink_file(&external_file, &symlink_path).is_ok() {
+            let s_str = symlink_path.to_string_lossy().to_string();
+            assert!(
+                toggle_startup_folder_entry_in_dirs(&s_str, false, &allowed).is_err(),
+                "File symlink in Startup dir must be rejected by toggle"
+            );
+            assert!(
+                remove_startup_folder_entry_in_dirs(&s_str, &allowed).is_err(),
+                "File symlink in Startup dir must be rejected by remove"
+            );
+            assert!(symlink_path.exists());
+            assert!(external_file.exists());
+        }
+
+        // Remove junction itself cleanly before TempTestDir drops
+        let _ = std::fs::remove_dir(&junction_path);
     }
 }

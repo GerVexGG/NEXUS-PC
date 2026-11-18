@@ -20,6 +20,7 @@ import {
   ChevronsUpDown,
   Info,
   GitBranch,
+  Shield,
 } from "lucide-react";
 import {
   PageHeader,
@@ -29,24 +30,36 @@ import {
   type ProcessDetails,
   type ProcessItem,
   type ProcessSortKey,
+  type ProcessTargetIdentity,
 } from "../../lib/studio";
-import { buildProcessTree } from "../../lib/processTree";
+import {
+  buildProcessTree,
+  getProcessIdentityKey,
+  toProcessTargetIdentity,
+} from "../../lib/processTree";
 import type { NexusController } from "../../hooks/useNexusController";
 
 const CRITICAL_PROCESSES = new Set([
   "system",
+  "system idle process",
+  "idle",
+  "registry",
+  "memory compression",
+  "secure system",
   "smss",
   "csrss",
   "wininit",
   "services",
   "lsass",
-  "svchost",
+  "lsaiso",
   "winlogon",
   "dwm",
   "explorer",
-  "registry",
   "fontdrvhost",
   "sihost",
+  "svchost",
+  "nexus",
+  "nexus-hwmon",
 ]);
 
 function isCriticalProcess(name: string): boolean {
@@ -92,7 +105,7 @@ export function ProcessModule({ c }: { c: NexusController }) {
     processLoading,
     selectedPid,
     setSelectedPid,
-    suspendedPids,
+    isProcessSuspended,
     processMenu,
     setProcessMenu,
     fetchProcesses,
@@ -110,13 +123,13 @@ export function ProcessModule({ c }: { c: NexusController }) {
     showProcessNotice,
   } = c;
   const [viewMode, setViewMode] = useState<"tree" | "flat">("tree");
-  const [expandedPids, setExpandedPids] = useState<Set<number>>(() => new Set());
+  const [expandedKeys, setExpandedKeys] = useState<Set<string>>(() => new Set());
   const [pendingKill, setPendingKill] = useState<{
     proc: ProcessItem;
     tree: boolean;
     directCount: number;
     totalDescendants: number;
-    isCritical: boolean;
+    targets: ProcessTargetIdentity[];
   } | null>(null);
   const [detailsModal, setDetailsModal] = useState<{
     loading: boolean;
@@ -125,17 +138,17 @@ export function ProcessModule({ c }: { c: NexusController }) {
     fallbackProc: ProcessItem;
   } | null>(null);
 
-  // Удаляем из expandedPids завершившиеся PID, чтобы повторно использованные PID не унаследовали состояние раскрытия.
+  // Удаляем из expandedKeys завершившиеся/переиспользованные процессы (PID + start_time + name).
   useEffect(() => {
     if (processes.length === 0) return;
-    const activePids = new Set(processes.map((p) => p.pid));
-    setExpandedPids((prev) => {
+    const activeKeys = new Set(processes.map(getProcessIdentityKey));
+    setExpandedKeys((prev) => {
       if (prev.size === 0) return prev;
       let changed = false;
-      const next = new Set<number>();
-      for (const pid of prev) {
-        if (activePids.has(pid)) {
-          next.add(pid);
+      const next = new Set<string>();
+      for (const key of prev) {
+        if (activeKeys.has(key)) {
+          next.add(key);
         } else {
           changed = true;
         }
@@ -143,6 +156,16 @@ export function ProcessModule({ c }: { c: NexusController }) {
       return changed ? next : prev;
     });
   }, [processes]);
+
+  const expandedPids = useMemo(() => {
+    const pids = new Set<number>();
+    for (const p of processes) {
+      if (expandedKeys.has(getProcessIdentityKey(p))) {
+        pids.add(p.pid);
+      }
+    }
+    return pids;
+  }, [processes, expandedKeys]);
 
   const treeData = useMemo(
     () => buildProcessTree(processes, processSortKey, processSortDesc, processSearch, expandedPids),
@@ -170,33 +193,62 @@ export function ProcessModule({ c }: { c: NexusController }) {
     });
   }, [viewMode, treeData.rows, treeData.statsByPid, visibleProcesses]);
 
-  const toggleExpand = useCallback((pid: number) => {
-    setExpandedPids((prev) => {
-      const next = new Set(prev);
-      if (next.has(pid)) next.delete(pid);
-      else next.add(pid);
-      return next;
-    });
-  }, []);
+  const toggleExpand = useCallback(
+    (proc: ProcessItem) => {
+      const key = getProcessIdentityKey(proc);
+      setExpandedKeys((prev) => {
+        const next = new Set(prev);
+        if (next.has(key)) next.delete(key);
+        else next.add(key);
+        return next;
+      });
+    },
+    []
+  );
 
   const expandAll = useCallback(() => {
-    setExpandedPids(new Set(treeData.parentPids));
-  }, [treeData.parentPids]);
+    const parentSet = new Set(treeData.parentPids);
+    const next = new Set<string>();
+    for (const p of processes) {
+      if (parentSet.has(p.pid)) {
+        next.add(getProcessIdentityKey(p));
+      }
+    }
+    setExpandedKeys(next);
+  }, [processes, treeData.parentPids]);
 
   const collapseAll = useCallback(() => {
-    setExpandedPids(new Set());
+    setExpandedKeys(new Set());
   }, []);
 
   const requestKill = (proc: ProcessItem, tree = false) => {
-    const critical = isCriticalProcess(proc.name);
+    if (isCriticalProcess(proc.name)) {
+      setProcessError(
+        `Процесс ${proc.name} (PID ${proc.pid}) относится к защищённым системным узлам Windows и не может быть завершён`
+      );
+      return;
+    }
     const stats = treeData.statsByPid.get(proc.pid);
     const directCount = stats?.directChildCount ?? 0;
     const totalDescendants = stats?.totalDescendants ?? 0;
-    if (critical || (tree && totalDescendants > 0)) {
-      setPendingKill({ proc, tree, directCount, totalDescendants, isCritical: critical });
-      return;
+    const targets = tree
+      ? stats?.subtreeTargets ?? [toProcessTargetIdentity(proc)]
+      : [toProcessTargetIdentity(proc)];
+
+    if (tree) {
+      const protectedChild = targets.find((t) => isCriticalProcess(t.name));
+      if (protectedChild) {
+        setProcessError(
+          `Ветка содержит защищённый системный процесс ${protectedChild.name} (PID ${protectedChild.pid}) — завершение ветки заблокировано`
+        );
+        return;
+      }
+      if (totalDescendants > 0) {
+        setPendingKill({ proc, tree: true, directCount, totalDescendants, targets });
+        return;
+      }
     }
-    void handleProcessKill(proc, tree);
+    void handleProcessKill(proc, tree, targets);
   };
 
   const openProcessDetails = useCallback(async (proc: ProcessItem) => {
@@ -426,7 +478,8 @@ export function ProcessModule({ c }: { c: NexusController }) {
               displayRows.map((row) => {
                 const proc = row.process;
                 const isSelected = selectedPid === proc.pid;
-                const isSuspended = suspendedPids.includes(proc.pid);
+                const isSuspended = isProcessSuspended(proc);
+                const isProtected = isCriticalProcess(proc.name);
                 const isShell = proc.name.toLowerCase() === "explorer.exe";
                 const diskBytesPerSec = proc.disk_read_bytes_sec + proc.disk_write_bytes_sec;
                 const tone = cpuTone(proc.cpu_usage);
@@ -479,7 +532,7 @@ export function ProcessModule({ c }: { c: NexusController }) {
                             aria-label={row.isExpanded ? "Свернуть ветку" : "Развернуть ветку"}
                             onClick={(e) => {
                               e.stopPropagation();
-                              toggleExpand(proc.pid);
+                              toggleExpand(proc);
                             }}
                             className="mr-1.5 flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-[#202B38]/80 bg-[#0B0E14] text-[#8292A3] transition-colors hover:border-[#00D5E8]/45 hover:text-[#00D5E8]"
                           >
@@ -632,14 +685,20 @@ export function ProcessModule({ c }: { c: NexusController }) {
                       </button>
                       <button
                         type="button"
+                        disabled={isProtected}
+                        title={
+                          isProtected
+                            ? "Системный процесс Windows защищён"
+                            : "Завершить процесс"
+                        }
                         onClick={(event) => {
                           event.stopPropagation();
                           requestKill(proc, false);
                         }}
-                        className="inline-flex cursor-pointer items-center gap-1 whitespace-nowrap rounded-lg border border-transparent px-2 py-1 text-[11px] font-medium text-[#8292A3] transition-colors hover:border-rose-500/35 hover:bg-rose-500/12 hover:text-rose-300 lg:px-2.5"
+                        className="inline-flex cursor-pointer items-center gap-1 whitespace-nowrap rounded-lg border border-transparent px-2 py-1 text-[11px] font-medium text-[#8292A3] transition-colors hover:border-rose-500/35 hover:bg-rose-500/12 hover:text-rose-300 disabled:cursor-not-allowed disabled:opacity-35 disabled:hover:border-transparent disabled:hover:bg-transparent disabled:hover:text-[#8292A3] lg:px-2.5"
                       >
-                        <XCircle size={13} />
-                        Завершить
+                        {isProtected ? <Shield size={12} /> : <XCircle size={13} />}
+                        {isProtected ? "Защищён" : "Завершить"}
                       </button>
                     </div>
                   </div>
@@ -702,8 +761,9 @@ export function ProcessModule({ c }: { c: NexusController }) {
             <div className="my-1 h-px bg-[#202B38]" />
             <button
               type="button"
+              disabled={isCriticalProcess(processMenu.process.name)}
               onClick={() => void handleProcessSuspendToggle(processMenu.process)}
-              className="flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[#00D5E8] hover:bg-[#00D5E8]/10"
+              className="flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[#00D5E8] hover:bg-[#00D5E8]/10 disabled:cursor-not-allowed disabled:text-[#526170] disabled:hover:bg-transparent"
             >
               {menuProcessSuspended ? (
                 <Play size={14} className="shrink-0 text-[#00D5E8]" />
@@ -714,24 +774,26 @@ export function ProcessModule({ c }: { c: NexusController }) {
             </button>
             <button
               type="button"
+              disabled={isCriticalProcess(processMenu.process.name)}
               onClick={() => {
                 const proc = processMenu.process;
                 setProcessMenu(null);
                 requestKill(proc, false);
               }}
-              className="flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-rose-300 hover:bg-rose-500/15"
+              className="flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-rose-300 hover:bg-rose-500/15 disabled:cursor-not-allowed disabled:text-[#526170] disabled:hover:bg-transparent"
             >
               <XCircle size={14} className="shrink-0 text-rose-400" />
               Завершить процесс
             </button>
             <button
               type="button"
+              disabled={isCriticalProcess(processMenu.process.name)}
               onClick={() => {
                 const proc = processMenu.process;
                 setProcessMenu(null);
                 requestKill(proc, true);
               }}
-              className="flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-rose-300 hover:bg-rose-500/15"
+              className="flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-rose-300 hover:bg-rose-500/15 disabled:cursor-not-allowed disabled:text-[#526170] disabled:hover:bg-transparent"
             >
               <Trash2 size={14} className="shrink-0 text-rose-400" />
               Завершить дерево процессов
@@ -742,20 +804,28 @@ export function ProcessModule({ c }: { c: NexusController }) {
 
       {pendingKill && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-4 backdrop-blur-xs">
-          <div className="w-full max-w-md rounded-xl border border-[#202B38] bg-[#10151D] p-5 shadow-2xl">
+          <div className="w-full max-w-lg rounded-xl border border-[#202B38] bg-[#10151D] p-5 shadow-2xl">
             <h3 className="text-base font-semibold text-[#E5EDF5]">
-              {pendingKill.tree ? "Завершение дерева процессов" : "Системный процесс"}
+              Завершение ветки процессов
             </h3>
             <p className="mt-2 text-sm text-[#8292A3]">
-              <span className="font-semibold text-[#E5EDF5]">{pendingKill.proc.name}</span> (PID{" "}
-              <span className="font-mono text-[#00D5E8]">{pendingKill.proc.pid}</span>)
-              {pendingKill.isCritical
-                ? " относится к критическим службам Windows. "
-                : " "}
-              {pendingKill.tree && pendingKill.totalDescendants > 0
-                ? `Будут принудительно завершены прямые дочерние процессы (${pendingKill.directCount}) и все вложенные потомки ветки (всего ${pendingKill.totalDescendants} шт.).`
-                : "Принудительное завершение может вызвать нестабильность системы."}
+              Для <span className="font-semibold text-[#E5EDF5]">{pendingKill.proc.name}</span> (PID{" "}
+              <span className="font-mono text-[#00D5E8]">{pendingKill.proc.pid}</span>) будут завершены прямые дочерние ({pendingKill.directCount}) и вложенные процессы отображаемой ветки — всего{" "}
+              <span className="font-mono font-semibold text-[#E5EDF5]">{pendingKill.targets.length}</span> шт. (независимые приложения из оболочки Explorer не затрагиваются):
             </p>
+            <div className="mt-3 max-h-48 divide-y divide-[#202B38]/60 overflow-y-auto rounded-lg border border-[#202B38] bg-[#0B0E14] text-xs">
+              {pendingKill.targets.map((item) => (
+                <div
+                  key={`${item.pid}-${item.start_time}`}
+                  className="flex items-center justify-between gap-3 px-3 py-1.5"
+                >
+                  <span className="truncate font-medium text-[#E5EDF5]">{item.name}</span>
+                  <span className="shrink-0 font-mono text-[11px] text-[#8292A3]">
+                    PID {item.pid}
+                  </span>
+                </div>
+              ))}
+            </div>
             <div className="mt-4 flex justify-end gap-2">
               <button
                 type="button"
@@ -769,11 +839,11 @@ export function ProcessModule({ c }: { c: NexusController }) {
                 onClick={() => {
                   const item = pendingKill;
                   setPendingKill(null);
-                  void handleProcessKill(item.proc, item.tree);
+                  void handleProcessKill(item.proc, item.tree, item.targets);
                 }}
                 className="cyber-btn-danger cursor-pointer px-3.5 py-2 text-xs font-semibold text-rose-300"
               >
-                {pendingKill.tree ? "Завершить дерево" : "Принудительно завершить"}
+                Завершить выбранную ветку ({pendingKill.targets.length})
               </button>
             </div>
           </div>

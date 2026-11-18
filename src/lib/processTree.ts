@@ -1,4 +1,21 @@
-import type { ProcessItem, ProcessSortKey } from "./studio";
+import type { ProcessItem, ProcessSortKey, ProcessTargetIdentity } from "./studio";
+
+export function toProcessTargetIdentity(
+  proc: Pick<ProcessItem, "pid" | "start_time" | "name" | "exe_path">
+): ProcessTargetIdentity {
+  return {
+    pid: proc.pid,
+    start_time: proc.start_time,
+    name: proc.name,
+    exe_path: proc.exe_path || undefined,
+  };
+}
+
+export function getProcessIdentityKey(
+  proc: Pick<ProcessItem, "pid" | "start_time" | "name">
+): string {
+  return `${proc.pid}:${proc.start_time}:${proc.name.toLowerCase()}`;
+}
 
 export interface ProcessTreeNode {
   process: ProcessItem;
@@ -32,6 +49,7 @@ export interface ProcessNodeStats {
   totalDescendants: number;
   subtreeCpu: number;
   subtreeMemoryMb: number;
+  subtreeTargets: ProcessTargetIdentity[];
 }
 
 function compareNodes(
@@ -182,17 +200,29 @@ export function buildProcessTree(
     let subtreeCpu = proc.cpu_usage;
     let subtreeMemoryMb = proc.memory_mb;
     let totalDescendants = 0;
+    const subtreeTargets: ProcessTargetIdentity[] = [];
     for (const child of childNodes) {
       subtreeCpu += child.subtreeCpu;
       subtreeMemoryMb += child.subtreeMemoryMb;
       totalDescendants += 1 + child.totalDescendants;
+      const childStats = statsByPid.get(child.process.pid);
+      if (childStats) {
+        subtreeTargets.push(...childStats.subtreeTargets);
+      }
     }
+    subtreeTargets.push({
+      pid: proc.pid,
+      start_time: proc.start_time,
+      name: proc.name,
+      exe_path: proc.exe_path || undefined,
+    });
 
     statsByPid.set(proc.pid, {
       directChildCount,
       totalDescendants,
       subtreeCpu,
       subtreeMemoryMb,
+      subtreeTargets,
     });
 
     return {

@@ -314,6 +314,30 @@ export interface ProcessItem {
   icon_base64: string | null;
 }
 
+export interface ProcessTargetIdentity {
+  pid: number;
+  start_time: number;
+  name: string;
+  exe_path?: string;
+}
+
+export function toProcessTargetIdentity(
+  proc: Pick<ProcessItem, "pid" | "start_time" | "name" | "exe_path">
+): ProcessTargetIdentity {
+  return {
+    pid: proc.pid,
+    start_time: proc.start_time,
+    name: proc.name,
+    exe_path: proc.exe_path || undefined,
+  };
+}
+
+export function getProcessIdentityKey(
+  proc: Pick<ProcessItem, "pid" | "start_time" | "name">
+): string {
+  return `${proc.pid}:${proc.start_time}:${proc.name.toLowerCase()}`;
+}
+
 export interface ProcessDetails {
   pid: number;
   parent_pid: number | null;
