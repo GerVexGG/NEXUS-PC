@@ -171,6 +171,14 @@ export interface NetworkHealthProbe {
   external_method: string;
 }
 
+export interface NetworkOptimizerStatus {
+  packet_priority_enabled: boolean;
+  packet_priority_has_backup: boolean;
+  ethernet_tuned: boolean;
+  ethernet_has_backup: boolean;
+  backed_up_adapters_count: number;
+}
+
 export function formatLinkSpeed(bps: number): string {
   if (!Number.isFinite(bps) || bps <= 0) return "Не подключён";
   if (bps >= 1_000_000_000) {

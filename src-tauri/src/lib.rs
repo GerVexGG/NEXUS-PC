@@ -15,6 +15,7 @@ mod archive;
 mod drop_server;
 mod gpu_fallback;
 mod net_monitor;
+mod net_optimizer;
 mod power_manager;
 mod scripts;
 mod settings;
@@ -451,6 +452,7 @@ pub struct AppState {
     pub hwmon_watchdog: Arc<Mutex<HwmonWatchdogState>>,
     pub storage_scanner: Arc<StorageScanCoordinator>,
     pub power_timer: Arc<power_manager::PowerTimerManager>,
+    pub net_optimizer: Arc<net_optimizer::NetworkOptimizerManager>,
     pub icon_cache: Arc<Mutex<HashMap<String, String>>>,
     pub drop_hub: Arc<drop_server::DropHub>,
     pub tray_ping_item: Mutex<Option<tauri::menu::MenuItem<tauri::Wry>>>,
@@ -3723,6 +3725,7 @@ fn cleanup_app_resources(app: &tauri::AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
         let _ = state.storage_scanner.cancel_scan(None);
         let _ = state.drop_hub.stop();
+        state.drop_hub.wait_until_stopped();
         if let Ok(mut wd) = state.hwmon_watchdog.lock() {
             wd.shutdown_requested = true;
         }
@@ -3771,8 +3774,6 @@ fn flush_dns() -> Result<(), String> {
         })
     }
 }
-
-const MEDIA_PROFILE_KEY: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile";
 
 #[derive(Serialize, Clone)]
 struct RouteProbe {
@@ -4209,173 +4210,45 @@ async fn benchmark_dns() -> Result<Vec<DnsBenchRow>, String> {
     .map_err(|e| format!("Ошибка потока замера DNS: {e}"))
 }
 
-#[cfg(target_os = "windows")]
-fn media_profile_key(writable: bool) -> Result<RegKey, String> {
-    let flags = if writable {
-        KEY_READ | KEY_SET_VALUE | KEY_WOW64_64KEY
-    } else {
-        KEY_READ | KEY_WOW64_64KEY
-    };
-    RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey_with_flags(MEDIA_PROFILE_KEY, flags)
-        .map_err(|e| format!("Не удалось открыть профиль мультимедиа: {}", e))
+#[tauri::command]
+fn get_network_optimizer_status(
+    state: State<'_, AppState>,
+) -> Result<net_optimizer::NetworkOptimizerStatus, String> {
+    state.net_optimizer.get_status()
 }
 
 #[tauri::command]
-fn get_packet_priority() -> Result<bool, String> {
-    #[cfg(not(target_os = "windows"))]
-    {
-        return Ok(false);
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let key = media_profile_key(false)?;
-        let throttle: u32 = key.get_value("NetworkThrottlingIndex").unwrap_or(10);
-        Ok(throttle == u32::MAX)
-    }
+fn get_packet_priority(state: State<'_, AppState>) -> Result<bool, String> {
+    state.net_optimizer.get_packet_priority()
 }
 
 #[tauri::command]
-fn set_packet_priority(enabled: bool) -> Result<(), String> {
-    if !check_is_elevated_admin() {
-        return Err("Требуются права Администратора (кнопка в шапке)".to_string());
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let key = media_profile_key(true)?;
-        if enabled {
-            key.set_value("NetworkThrottlingIndex", &u32::MAX)
-                .map_err(|e| format!("Не удалось записать NetworkThrottlingIndex: {}", e))?;
-            key.set_value("SystemResponsiveness", &0u32)
-                .map_err(|e| format!("Не удалось записать SystemResponsiveness: {}", e))?;
-        } else {
-            key.set_value("NetworkThrottlingIndex", &10u32)
-                .map_err(|e| format!("Не удалось вернуть NetworkThrottlingIndex: {}", e))?;
-            key.set_value("SystemResponsiveness", &20u32)
-                .map_err(|e| format!("Не удалось вернуть SystemResponsiveness: {}", e))?;
-        }
-        Ok(())
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = enabled;
-        Err("Настройка доступна только в Windows".to_string())
-    }
-}
-
-fn tune_ethernet_adapter_sync() -> Result<String, String> {
-    if !check_is_elevated_admin() {
-        return Err("Требуются права Администратора (кнопка в шапке)".to_string());
-    }
-    let script = r#"
-$script:changed = 0
-Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
-  $props = Get-NetAdapterAdvancedProperty -Name $_.Name -ErrorAction SilentlyContinue
-  foreach ($p in $props) {
-    $key = [string]$p.RegistryKeyword
-    if ($key -match 'EEE|GreenEthernet|InterruptModeration') {
-      $choice = $null
-      foreach ($v in @($p.ValidDisplayValues)) {
-        if ($v -match '^(Disabled|Отключено)$') { $choice = $v; break }
-      }
-      if (-not $choice -and $key -match 'Interrupt') {
-        foreach ($v in @($p.ValidDisplayValues)) {
-          if ($v -match 'Low|Низк') { $choice = $v; break }
-        }
-      }
-      if ($choice) {
-        try {
-          Set-NetAdapterAdvancedProperty -Name $_.Name -RegistryKeyword $key -DisplayValue $choice -NoRestart -ErrorAction Stop
-          $script:changed++
-        } catch {}
-      }
-    }
-  }
-}
-Write-Output $script:changed
-"#;
-    let text = hidden_powershell(script)?;
-    let changed = text.lines().last().unwrap_or("0").trim().parse::<u32>().unwrap_or(0);
-    if changed == 0 {
-        return Err("У активного Ethernet-адаптера не найдены Energy Efficient Ethernet, Green Ethernet или Interrupt Moderation".to_string());
-    }
-    Ok(format!("Отключено параметров адаптера: {}", changed))
+fn set_packet_priority(state: State<'_, AppState>, enabled: bool) -> Result<String, String> {
+    state.net_optimizer.set_packet_priority(enabled)
 }
 
 #[tauri::command]
-async fn tune_ethernet_adapter() -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(tune_ethernet_adapter_sync)
+async fn tune_ethernet_adapter(state: State<'_, AppState>) -> Result<String, String> {
+    let opt = Arc::clone(&state.net_optimizer);
+    tauri::async_runtime::spawn_blocking(move || opt.tune_ethernet_adapter())
         .await
         .map_err(|e| format!("Ошибка потока настройки адаптера: {e}"))?
 }
 
 #[tauri::command]
-async fn get_ethernet_tuned() -> Result<bool, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let script = r#"
-$seen = 0
-$tuned = 0
-Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
-  $props = Get-NetAdapterAdvancedProperty -Name $_.Name -ErrorAction SilentlyContinue
-  foreach ($p in $props) {
-    $key = [string]$p.RegistryKeyword
-    if ($key -match 'EEE|GreenEthernet|InterruptModeration') {
-      $seen++
-      $value = [string]$p.DisplayValue
-      if ($value -match 'Disabled|Отключено|Low|Низк') { $tuned++ }
-    }
-  }
-}
-if ($seen -gt 0 -and $tuned -eq $seen) { '1' } else { '0' }
-"#;
-        let text = hidden_powershell(script)?;
-        Ok(text.lines().last().unwrap_or("0").trim() == "1")
-    })
-    .await
-    .map_err(|e| format!("Ошибка потока проверки адаптера: {e}"))?
+async fn get_ethernet_tuned(state: State<'_, AppState>) -> Result<bool, String> {
+    let opt = Arc::clone(&state.net_optimizer);
+    tauri::async_runtime::spawn_blocking(move || opt.get_ethernet_tuned())
+        .await
+        .map_err(|e| format!("Ошибка потока проверки адаптера: {e}"))?
 }
 
 #[tauri::command]
-async fn set_ethernet_tuned(enabled: bool) -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        if enabled {
-            return tune_ethernet_adapter_sync();
-        }
-        if !check_is_elevated_admin() {
-            return Err("Требуются права Администратора (кнопка в шапке)".to_string());
-        }
-        let script = r#"
-$script:changed = 0
-Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
-  $props = Get-NetAdapterAdvancedProperty -Name $_.Name -ErrorAction SilentlyContinue
-  foreach ($p in $props) {
-    $key = [string]$p.RegistryKeyword
-    if ($key -match 'EEE|GreenEthernet|InterruptModeration') {
-      $choice = $null
-      $pattern = if ($key -match 'Interrupt') { 'Enabled|Включено|Moderate|Средн' } else { '^(Enabled|Включено)$' }
-      foreach ($v in @($p.ValidDisplayValues)) {
-        if ($v -match $pattern) { $choice = $v; break }
-      }
-      if ($choice) {
-        try {
-          Set-NetAdapterAdvancedProperty -Name $_.Name -RegistryKeyword $key -DisplayValue $choice -NoRestart -ErrorAction Stop
-          $script:changed++
-        } catch {}
-      }
-    }
-  }
-}
-Write-Output $script:changed
-"#;
-        let text = hidden_powershell(script)?;
-        let changed = text.lines().last().unwrap_or("0").trim().parse::<u32>().unwrap_or(0);
-        if changed == 0 {
-            return Err("Не удалось вернуть энергосбережение сетевого адаптера".to_string());
-        }
-        Ok(format!("Возвращено параметров адаптера: {}", changed))
-    })
-    .await
-    .map_err(|e| format!("Ошибка потока переключения адаптера: {e}"))?
+async fn set_ethernet_tuned(state: State<'_, AppState>, enabled: bool) -> Result<String, String> {
+    let opt = Arc::clone(&state.net_optimizer);
+    tauri::async_runtime::spawn_blocking(move || opt.set_ethernet_tuned(enabled))
+        .await
+        .map_err(|e| format!("Ошибка потока переключения адаптера: {e}"))?
 }
 
 fn update_tray_ping(state: &AppState, ping_ms: u32) {
@@ -6584,6 +6457,7 @@ pub fn run() {
     let hwmon_watchdog = Arc::new(Mutex::new(HwmonWatchdogState::default()));
     let storage_scanner = Arc::new(StorageScanCoordinator::new());
     let power_timer = Arc::new(power_manager::PowerTimerManager::new());
+    let net_optimizer = Arc::new(net_optimizer::NetworkOptimizerManager::new());
     let history_buffer = Arc::new(RwLock::new(VecDeque::new()));
     telemetry::start_sampler(
         Arc::clone(&hw_telemetry),
@@ -6612,6 +6486,7 @@ pub fn run() {
             hwmon_watchdog,
             storage_scanner,
             power_timer,
+            net_optimizer,
             icon_cache: Arc::new(Mutex::new(HashMap::new())),
             drop_hub: Arc::new(drop_server::DropHub::new()),
             tray_ping_item: Mutex::new(None),
@@ -6725,6 +6600,7 @@ pub fn run() {
             restore_from_tray,
             flush_dns,
             probe_game_routes,
+            get_network_optimizer_status,
             get_packet_priority,
             set_packet_priority,
             tune_ethernet_adapter,

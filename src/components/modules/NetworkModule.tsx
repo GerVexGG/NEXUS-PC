@@ -26,6 +26,7 @@ import {
   formatThroughputRate,
   type NetworkAdapterInfo,
   type NetworkHealthProbe,
+  type NetworkOptimizerStatus,
 } from "../../lib/studio";
 import type { NexusController } from "../../hooks/useNexusController";
 
@@ -1224,15 +1225,63 @@ function NetworkToolkit() {
   const [dnsRows, setDnsRows] = useState<DnsBenchRow[]>([]);
   const [dnsBusy, setDnsBusy] = useState(false);
   const [dnsError, setDnsError] = useState("");
+  const [optStatus, setOptStatus] = useState<NetworkOptimizerStatus | null>(null);
+  const [optBusy, setOptBusy] = useState<"packet" | "ethernet" | null>(null);
+  const [optNotice, setOptNotice] = useState<string | null>(null);
+  const [optError, setOptError] = useState<string | null>(null);
   const progressTimerRef = useRef<number | null>(null);
 
+  const loadOptimizerStatus = useCallback(async () => {
+    try {
+      const next = await invoke<NetworkOptimizerStatus>("get_network_optimizer_status");
+      setOptStatus(next);
+    } catch {
+      // Статус может быть недоступен при ограничении чтения реестра
+    }
+  }, []);
+
   useEffect(() => {
+    void loadOptimizerStatus();
     return () => {
       if (progressTimerRef.current) {
         clearInterval(progressTimerRef.current);
       }
     };
-  }, []);
+  }, [loadOptimizerStatus]);
+
+  const handleTogglePacketPriority = async () => {
+    if (!optStatus || optBusy) return;
+    const nextEnabled = !optStatus.packet_priority_enabled;
+    setOptBusy("packet");
+    setOptError(null);
+    setOptNotice(null);
+    try {
+      const msg = await invoke<string>("set_packet_priority", { enabled: nextEnabled });
+      setOptNotice(msg);
+    } catch (err) {
+      setOptError(String(err));
+    } finally {
+      await loadOptimizerStatus();
+      setOptBusy(null);
+    }
+  };
+
+  const handleToggleEthernetTuned = async () => {
+    if (!optStatus || optBusy) return;
+    const nextEnabled = !optStatus.ethernet_tuned;
+    setOptBusy("ethernet");
+    setOptError(null);
+    setOptNotice(null);
+    try {
+      const msg = await invoke<string>("set_ethernet_tuned", { enabled: nextEnabled });
+      setOptNotice(msg);
+    } catch (err) {
+      setOptError(String(err));
+    } finally {
+      await loadOptimizerStatus();
+      setOptBusy(null);
+    }
+  };
 
   const fastest = dnsRows.reduce<number | null>((best, row) => {
     if (row.ms == null) return best;
@@ -1249,6 +1298,94 @@ function NetworkToolkit() {
 
   return (
     <div className="space-y-4">
+      <section className="tactical-card tactical-brackets rounded-xl p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#202B38] pb-3">
+          <div>
+            <h3 className="text-sm font-semibold text-[#E5EDF5]">
+              Оптимизация сетевого стека и адаптера (Network Optimizer)
+            </h3>
+            <p className="mt-0.5 text-xs text-[#8292A3]">
+              Перед изменением системных параметров сохраняет исходные значения реестра и драйвера по GUID адаптера для точного отката
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => void loadOptimizerStatus()}
+            className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-[#202B38] bg-[#0B0E14] px-2.5 py-1 text-xs text-[#8292A3] hover:text-[#E5EDF5]"
+          >
+            <RefreshCw size={11} />
+            Обновить статус
+          </button>
+        </div>
+
+        <div className="mt-3 grid gap-3 lg:grid-cols-2">
+          <div className="flex items-center justify-between gap-4 rounded-lg border border-[#202B38] bg-[#0B0E14] p-3.5">
+            <div className="min-w-0">
+              <div className="text-sm font-medium text-[#E5EDF5]">Приоритет сетевых пакетов (MMCSS)</div>
+              <div className="mt-0.5 text-xs text-[#8292A3]">
+                {optStatus?.packet_priority_has_backup
+                  ? "Исходные значения NetworkThrottlingIndex и SystemResponsiveness сохранены в резервной копии"
+                  : "При включении сохранит текущие значения Windows перед изменением"}
+              </div>
+            </div>
+            <button
+              type="button"
+              disabled={!optStatus || optBusy !== null}
+              onClick={() => void handleTogglePacketPriority()}
+              className={`shrink-0 cursor-pointer rounded-lg border px-3 py-1.5 font-mono text-xs font-semibold transition-colors disabled:opacity-50 ${
+                optStatus?.packet_priority_enabled
+                  ? "border-[#00D5E8]/45 bg-[#00D5E8]/15 text-[#00D5E8]"
+                  : "border-[#202B38] bg-[#151C26] text-[#E5EDF5] hover:border-[#00D5E8]/35"
+              }`}
+            >
+              {optBusy === "packet"
+                ? "ПРИМЕНЕНИЕ…"
+                : optStatus?.packet_priority_enabled
+                ? "ВКЛЮЧЕНО · ОТКАТИТЬ"
+                : "ВКЛЮЧИТЬ"}
+            </button>
+          </div>
+
+          <div className="flex items-center justify-between gap-4 rounded-lg border border-[#202B38] bg-[#0B0E14] p-3.5">
+            <div className="min-w-0">
+              <div className="text-sm font-medium text-[#E5EDF5]">Тюнинг Ethernet (EEE / Interrupts)</div>
+              <div className="mt-0.5 text-xs text-[#8292A3]">
+                {optStatus?.ethernet_has_backup
+                  ? `Сохранена резервная копия драйвера для адаптеров: ${optStatus.backed_up_adapters_count}`
+                  : "Отключает энергосбережение EEE и снижает задержки с транзакционным откатом"}
+              </div>
+            </div>
+            <button
+              type="button"
+              disabled={!optStatus || optBusy !== null}
+              onClick={() => void handleToggleEthernetTuned()}
+              className={`shrink-0 cursor-pointer rounded-lg border px-3 py-1.5 font-mono text-xs font-semibold transition-colors disabled:opacity-50 ${
+                optStatus?.ethernet_tuned
+                  ? "border-[#00D5E8]/45 bg-[#00D5E8]/15 text-[#00D5E8]"
+                  : "border-[#202B38] bg-[#151C26] text-[#E5EDF5] hover:border-[#00D5E8]/35"
+              }`}
+            >
+              {optBusy === "ethernet"
+                ? "ПРИМЕНЕНИЕ…"
+                : optStatus?.ethernet_tuned
+                ? "ОПТИМИЗИРОВАНО · ВОССТАНОВИТЬ"
+                : "ОПТИМИЗИРОВАТЬ"}
+            </button>
+          </div>
+        </div>
+
+        {optNotice && (
+          <div className="mt-3 rounded-lg border border-[#00D5E8]/35 bg-[#00D5E8]/10 px-3 py-2 text-xs text-[#00D5E8]">
+            {optNotice}
+          </div>
+        )}
+        {optError && (
+          <div className="mt-3 rounded-lg border border-rose-500/35 bg-rose-500/12 px-3 py-2 text-xs text-rose-300">
+            {optError}
+          </div>
+        )}
+      </section>
+
       <section className="tactical-card tactical-brackets rounded-xl p-5">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>

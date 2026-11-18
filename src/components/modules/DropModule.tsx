@@ -33,6 +33,12 @@ interface DropSessionInfo {
   save_dir: string;
   qr_svg: string;
   transfer?: DropTransfer | null;
+  session_files_count?: number;
+  session_total_bytes?: number;
+  max_file_bytes?: number;
+  max_session_bytes?: number;
+  max_session_files?: number;
+  limit_reached_reason?: string | null;
 }
 
 interface DroppedFileItem {
@@ -208,6 +214,21 @@ export function DropModule() {
         </div>
       )}
 
+      <div className="flex items-start gap-3 rounded-xl border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-xs text-amber-200">
+        <AlertTriangle size={16} className="mt-0.5 shrink-0 text-amber-400" />
+        <div>
+          <span className="font-semibold text-amber-100">Незашифрованный локальный HTTP:</span>{" "}
+          передача внутри сети Wi-Fi выполняется по открытому HTTP без TLS-шифрования (трафик защищён от случайного подключения 130-битным одноразовым токеном, но не шифруется в канале). Используйте только в доверенной домашней сети.
+        </div>
+      </div>
+
+      {session.limit_reached_reason && (
+        <div className="flex items-center gap-3 rounded-xl border border-amber-500/45 bg-amber-500/15 px-4 py-3 text-xs text-amber-200">
+          <AlertTriangle size={16} className="shrink-0 text-amber-400" />
+          <span>{session.limit_reached_reason}</span>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
         {/* Левая колонка: Терминал подключения */}
         <div className="tactical-card tactical-brackets flex flex-col justify-between rounded-xl p-5 lg:col-span-6">
@@ -218,11 +239,11 @@ export function DropModule() {
                 <p className="text-xs text-[#8292A3]">
                   {session.is_running
                     ? "Отсканируйте QR-код камерой смартфона или откройте адрес в браузере"
-                    : "Запустите локальный узел для генерации одноразового токена и QR-кода"}
+                    : "Запустите локальный узел для генерации криптостойкого токена и QR-кода"}
                 </p>
               </div>
-              <span className="rounded border border-[#202B38] bg-[#0B0E14] px-2 py-0.5 font-mono text-[10px] text-[#00D5E8]">
-                LAN // HTTP
+              <span className="rounded border border-amber-500/35 bg-amber-500/10 px-2 py-0.5 font-mono text-[10px] text-amber-300">
+                LAN // HTTP (без TLS)
               </span>
             </div>
 
@@ -254,17 +275,17 @@ export function DropModule() {
                   </div>
 
                   <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] p-3">
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <div className="text-[11px] text-[#8292A3]">Код доступа (PIN-токен)</div>
-                        <div className="mt-0.5 font-mono text-lg font-bold tracking-[0.22em] text-[#E5EDF5]">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="text-[11px] text-[#8292A3]">Токен доступа сессии (130 бит)</div>
+                        <div className="mt-1 font-mono text-xs font-bold tracking-wider break-all text-[#E5EDF5] sm:text-sm">
                           {session.token}
                         </div>
                       </div>
                       <button
                         type="button"
                         onClick={() => void copyValue(session.token, "token")}
-                        className="inline-flex cursor-pointer items-center gap-1 rounded border border-[#202B38] bg-[#151C26] px-2.5 py-1.5 text-[11px] text-[#E5EDF5] hover:border-[#00D5E8]/40"
+                        className="inline-flex shrink-0 cursor-pointer items-center gap-1 rounded border border-[#202B38] bg-[#151C26] px-2.5 py-1.5 text-[11px] text-[#E5EDF5] hover:border-[#00D5E8]/40"
                       >
                         <Copy size={11} />
                         {copied === "token" ? "Скопировано" : "Копировать"}
@@ -325,12 +346,12 @@ export function DropModule() {
             <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] p-2.5">
               <div className="font-mono text-[10px] text-[#00D5E8]">ШАГ 02</div>
               <div className="mt-0.5 text-xs font-medium text-[#E5EDF5]">Камера / QR</div>
-              <div className="mt-0.5 text-[11px] text-[#8292A3]">Авторизация по PIN-токену</div>
+              <div className="mt-0.5 text-[11px] text-[#8292A3]">Токен в #fragment и X-Nexus-Token</div>
             </div>
             <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] p-2.5">
               <div className="font-mono text-[10px] text-[#00D5E8]">ШАГ 03</div>
-              <div className="mt-0.5 text-xs font-medium text-[#E5EDF5]">Прямой приём</div>
-              <div className="mt-0.5 text-[11px] text-[#8292A3]">Без сжатия и ограничений</div>
+              <div className="mt-0.5 text-xs font-medium text-[#E5EDF5]">Контролируемый приём</div>
+              <div className="mt-0.5 text-[11px] text-[#8292A3]">До 200 МБ/файл · 1 ГБ / 50 файлов</div>
             </div>
           </div>
         </div>
@@ -342,7 +363,9 @@ export function DropModule() {
               <ShieldCheck size={15} className="text-[#00D5E8]" />
               <h3 className="text-sm font-semibold text-[#E5EDF5]">Журнал принятых данных</h3>
               <span className="rounded border border-[#202B38] bg-[#0B0E14] px-2 py-0.5 font-mono text-[10px] text-[#8292A3]">
-                {files.length} файл.
+                {session.is_running
+                  ? `${session.session_files_count ?? 0}/${session.max_session_files ?? 50} файл. · ${formatBytes(session.session_total_bytes ?? 0)}`
+                  : `${files.length} файл.`}
               </span>
             </div>
             <button
