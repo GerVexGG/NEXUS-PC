@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-// Документированные лимиты безопасности и квоты NEXUS Drop (без магических констант)
+// Документированные лимиты безопасности и квоты AURORA Drop (без магических констант)
 
 /// Длина токена доступа: 26 символов из 32-символьного алфавита = 130 бит криптографической энтропии (>= 128 бит).
 pub const TOKEN_LENGTH_CHARS: usize = 26;
@@ -233,9 +233,8 @@ impl DropHub {
         // При любой ошибке генератора сервер не запускается.
         let token = generate_secure_token()?;
         let listener = match explicit_bind {
-            Some((host, port)) => {
-                TcpListener::bind((host, port)).map_err(|err| format!("Порт приёма занят: {err}"))?
-            }
+            Some((host, port)) => TcpListener::bind((host, port))
+                .map_err(|err| format!("Порт приёма занят: {err}"))?,
             None => bind_listener()?,
         };
         let port = listener
@@ -514,7 +513,11 @@ fn authenticate_request(
     }
 }
 
-fn handle_client(mut stream: TcpStream, generation: u64, hub: &Arc<DropHubInner>) -> Result<(), ()> {
+fn handle_client(
+    mut stream: TcpStream,
+    generation: u64,
+    hub: &Arc<DropHubInner>,
+) -> Result<(), ()> {
     let peer = peer_key(&stream);
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_nodelay(true);
@@ -525,8 +528,17 @@ fn handle_client(mut stream: TcpStream, generation: u64, hub: &Arc<DropHubInner>
         Ok(value) => value,
         Err(err) => {
             if !hub.is_stopped(generation) {
-                let status = if err.contains("таймаут") { 408 } else { 400 };
-                let _ = respond(&mut stream, status, "text/plain; charset=utf-8", err.as_bytes());
+                let status = if err.contains("таймаут") {
+                    408
+                } else {
+                    400
+                };
+                let _ = respond(
+                    &mut stream,
+                    status,
+                    "text/plain; charset=utf-8",
+                    err.as_bytes(),
+                );
             }
             return Ok(());
         }
@@ -565,7 +577,7 @@ fn handle_client(mut stream: TcpStream, generation: u64, hub: &Arc<DropHubInner>
                 &mut stream,
                 403,
                 "text/plain; charset=utf-8",
-                "Сессия NEXUS Drop остановлена".as_bytes(),
+                "Сессия AURORA Drop остановлена".as_bytes(),
             );
             return Ok(());
         }
@@ -592,7 +604,12 @@ fn handle_client(mut stream: TcpStream, generation: u64, hub: &Arc<DropHubInner>
                 }
             }
         }
-        let _ = respond(&mut stream, 200, "text/html; charset=utf-8", PHONE_PAGE.as_bytes());
+        let _ = respond(
+            &mut stream,
+            200,
+            "text/html; charset=utf-8",
+            PHONE_PAGE.as_bytes(),
+        );
         return Ok(());
     }
 
@@ -646,10 +663,20 @@ fn handle_client(mut stream: TcpStream, generation: u64, hub: &Arc<DropHubInner>
                 );
             }
             UploadOutcome::TooLarge(err) => {
-                let _ = respond(&mut stream, 413, "text/plain; charset=utf-8", err.as_bytes());
+                let _ = respond(
+                    &mut stream,
+                    413,
+                    "text/plain; charset=utf-8",
+                    err.as_bytes(),
+                );
             }
             UploadOutcome::Failed(err) => {
-                let _ = respond(&mut stream, 400, "text/plain; charset=utf-8", err.as_bytes());
+                let _ = respond(
+                    &mut stream,
+                    400,
+                    "text/plain; charset=utf-8",
+                    err.as_bytes(),
+                );
             }
         }
         return Ok(());
@@ -680,10 +707,20 @@ fn handle_client(mut stream: TcpStream, generation: u64, hub: &Arc<DropHubInner>
                 );
             }
             UploadOutcome::TooLarge(err) => {
-                let _ = respond(&mut stream, 413, "text/plain; charset=utf-8", err.as_bytes());
+                let _ = respond(
+                    &mut stream,
+                    413,
+                    "text/plain; charset=utf-8",
+                    err.as_bytes(),
+                );
             }
             UploadOutcome::Failed(err) => {
-                let _ = respond(&mut stream, 400, "text/plain; charset=utf-8", err.as_bytes());
+                let _ = respond(
+                    &mut stream,
+                    400,
+                    "text/plain; charset=utf-8",
+                    err.as_bytes(),
+                );
             }
         }
         return Ok(());
@@ -715,9 +752,8 @@ impl<'a> QuotaReservation<'a> {
             .lock()
             .map_err(|_| "Состояние сессии заблокировано".to_string())?;
         if guard.info.session_files_count + guard.reserved_files >= MAX_SESSION_FILES_COUNT {
-            let msg = format!(
-                "Достигнут лимит файлов за сессию (максимум {MAX_SESSION_FILES_COUNT})"
-            );
+            let msg =
+                format!("Достигнут лимит файлов за сессию (максимум {MAX_SESSION_FILES_COUNT})");
             guard.info.limit_reached_reason = Some(msg.clone());
             return Err(msg);
         }
@@ -752,8 +788,10 @@ impl<'a> QuotaReservation<'a> {
         if let Ok(mut guard) = self.hub.inner.lock() {
             guard.reserved_files = guard.reserved_files.saturating_sub(self.reserved_files);
             guard.reserved_bytes = guard.reserved_bytes.saturating_sub(self.reserved_bytes);
-            guard.info.session_files_count = guard.info.session_files_count.saturating_add(actual_files);
-            guard.info.session_total_bytes = guard.info.session_total_bytes.saturating_add(actual_bytes);
+            guard.info.session_files_count =
+                guard.info.session_files_count.saturating_add(actual_files);
+            guard.info.session_total_bytes =
+                guard.info.session_total_bytes.saturating_add(actual_bytes);
         }
     }
 }
@@ -777,9 +815,7 @@ fn can_accept_additional_file_in_request(hub: &DropHubInner) -> Result<(), Strin
         .lock()
         .map_err(|_| "Состояние сессии заблокировано".to_string())?;
     if guard.info.session_files_count + guard.reserved_files >= MAX_SESSION_FILES_COUNT {
-        let msg = format!(
-            "Достигнут лимит файлов за сессию (максимум {MAX_SESSION_FILES_COUNT})"
-        );
+        let msg = format!("Достигнут лимит файлов за сессию (максимум {MAX_SESSION_FILES_COUNT})");
         guard.info.limit_reached_reason = Some(msg.clone());
         return Err(msg);
     }
@@ -849,8 +885,8 @@ fn receive_upload(
     pending: Vec<u8>,
     token: Option<&str>,
 ) -> UploadOutcome {
-    let parsed_length = header_value(headers, "content-length")
-        .and_then(|raw| raw.trim().parse::<u64>().ok());
+    let parsed_length =
+        header_value(headers, "content-length").and_then(|raw| raw.trim().parse::<u64>().ok());
 
     match authenticate_request(hub, peer, token, generation) {
         AuthCheck::Valid => {}
@@ -867,15 +903,23 @@ fn receive_upload(
     if let Some(te) = header_value(headers, "transfer-encoding") {
         if !te.trim().eq_ignore_ascii_case("identity") {
             drain_small_rejected_body(stream, pending, parsed_length, hub, generation);
-            return UploadOutcome::Failed("Transfer-Encoding не поддерживается — передайте Content-Length".to_string());
+            return UploadOutcome::Failed(
+                "Transfer-Encoding не поддерживается — передайте Content-Length".to_string(),
+            );
         }
     }
 
     let length = match header_value(headers, "content-length") {
         Some(raw) => match raw.trim().parse::<u64>() {
             Ok(v) if v > 0 => v,
-            Ok(_) => return UploadOutcome::Failed("Пустое тело запроса (Content-Length: 0)".to_string()),
-            Err(_) => return UploadOutcome::Failed("Некорректный заголовок Content-Length".to_string()),
+            Ok(_) => {
+                return UploadOutcome::Failed(
+                    "Пустое тело запроса (Content-Length: 0)".to_string(),
+                );
+            }
+            Err(_) => {
+                return UploadOutcome::Failed("Некорректный заголовок Content-Length".to_string());
+            }
         },
         None => return UploadOutcome::Failed("Нет заголовка Content-Length".to_string()),
     };
@@ -911,7 +955,14 @@ fn receive_upload(
 
     let mut reader = BodyReader::new(stream, pending, length);
     let outcome = if let Some(boundary) = content_boundary(headers) {
-        save_multipart(hub, generation, &mut reader, &canon_save_dir, &boundary, length)
+        save_multipart(
+            hub,
+            generation,
+            &mut reader,
+            &canon_save_dir,
+            &boundary,
+            length,
+        )
     } else {
         save_raw(hub, generation, &mut reader, &canon_save_dir, length)
     };
@@ -999,7 +1050,11 @@ fn note_transfer(hub: &DropHubInner, filename: &str, received: u64, total: u64) 
             let elapsed = now.saturating_duration_since(prev.sample_at).as_secs_f64();
             if elapsed >= 0.2 {
                 let delta = received.saturating_sub(prev.sample_bytes) as f64;
-                if elapsed > 0.0 { delta / elapsed } else { prev.speed_bps }
+                if elapsed > 0.0 {
+                    delta / elapsed
+                } else {
+                    prev.speed_bps
+                }
             } else {
                 prev.speed_bps
             }
@@ -1061,7 +1116,13 @@ impl<'a> BodyReader<'a> {
         }
         let want = BODY_CHUNK.min(self.remaining as usize);
         let mut buf = vec![0u8; want];
-        let read = read_chunk(self.stream, &mut buf, BODY_CHUNK_READ_TIMEOUT, hub, generation)?;
+        let read = read_chunk(
+            self.stream,
+            &mut buf,
+            BODY_CHUNK_READ_TIMEOUT,
+            hub,
+            generation,
+        )?;
         if read == 0 {
             return Err("Соединение закрыто до конца файла".to_string());
         }
@@ -1272,7 +1333,12 @@ fn save_raw(
             file.write_all(&buf[..read])
                 .map_err(|err| format!("Запись файла: {err}"))?;
             reader.remaining -= read as u64;
-            note_transfer(hub, "Входящий файл", total.saturating_sub(reader.remaining), total);
+            note_transfer(
+                hub,
+                "Входящий файл",
+                total.saturating_sub(reader.remaining),
+                total,
+            );
         }
         file.flush().map_err(|err| format!("Запись файла: {err}"))?;
     }
@@ -1321,7 +1387,12 @@ fn save_multipart(
             let filename = sanitize_filename(&name);
             let part_path = new_temp_part_path(save_dir, hub, generation);
             let mut part_guard = TempPartFileGuard::new(part_path);
-            note_transfer(hub, &filename, total.saturating_sub(reader.remaining), total);
+            note_transfer(
+                hub,
+                &filename,
+                total.saturating_sub(reader.remaining),
+                total,
+            );
             match write_until_mark(
                 hub,
                 generation,
@@ -1457,7 +1528,12 @@ fn respond_cors_preflight(stream: &mut TcpStream) -> Result<(), String> {
     Ok(())
 }
 
-fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) -> Result<(), String> {
+fn respond(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> Result<(), String> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -1518,7 +1594,11 @@ fn content_boundary(headers: &str) -> Option<String> {
         .unwrap_or("")
         .trim_matches('"')
         .trim();
-    if raw.is_empty() { None } else { Some(raw.to_string()) }
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw.to_string())
+    }
 }
 
 fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
@@ -1604,12 +1684,7 @@ pub fn sanitize_filename(raw: &str) -> String {
         .unwrap_or(without_drive);
     let mut cleaned = String::new();
     for ch in base.chars() {
-        if ch.is_control()
-            || matches!(
-                ch,
-                '<' | '>' | ':' | '"' | '|' | '?' | '*' | '/' | '\\'
-            )
-        {
+        if ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*' | '/' | '\\') {
             continue;
         }
         cleaned.push(ch);
@@ -1620,7 +1695,7 @@ pub fn sanitize_filename(raw: &str) -> String {
     }
     trimmed = trimmed.trim().trim_matches('.').to_string();
     if trimmed.is_empty() || is_windows_reserved_name(&trimmed) {
-        return "nexus-file".to_string();
+        return "aurora-file".to_string();
     }
     if trimmed.to_ascii_lowercase().ends_with(".part") {
         trimmed.push_str(".bin");
@@ -1645,7 +1720,7 @@ fn unique_path(dir: &Path, filename: &str) -> Result<PathBuf, String> {
         .file_stem()
         .and_then(|v| v.to_str())
         .filter(|s| !s.is_empty())
-        .unwrap_or("nexus-file");
+        .unwrap_or("aurora-file");
     let ext = path.extension().and_then(|v| v.to_str()).unwrap_or("");
     for index in 1..10_000 {
         let name = if ext.is_empty() {
@@ -1665,7 +1740,8 @@ fn find_slice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || hay.len() < needle.len() {
         return None;
     }
-    hay.windows(needle.len()).position(|window| window == needle)
+    hay.windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn detect_local_ipv4() -> String {
@@ -1693,22 +1769,12 @@ fn bind_listener() -> Result<TcpListener, String> {
 }
 
 fn default_save_dir() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            let candidate = exe_dir.join("NexusDrop");
-            if fs::create_dir_all(&candidate).is_ok() {
-                return candidate;
-            }
-        }
-    }
-    if let Ok(base) = std::env::var("LOCALAPPDATA").or_else(|_| std::env::var("APPDATA")) {
-        let candidate = PathBuf::from(base).join("nexus").join("NexusDrop");
-        let _ = fs::create_dir_all(&candidate);
-        return candidate;
-    }
-    let fallback = PathBuf::from("NexusDrop");
-    let _ = fs::create_dir_all(&fallback);
-    fallback
+    // Keep received files outside the install directory through upgrades and uninstall.
+    std::env::var_os("LOCALAPPDATA")
+        .filter(|dir| !dir.is_empty())
+        .or_else(|| std::env::var_os("APPDATA").filter(|dir| !dir.is_empty()))
+        .map(|dir| PathBuf::from(dir).join("AURORA").join("Drop"))
+        .unwrap_or_else(|| PathBuf::from("aurora-data").join("Drop"))
 }
 
 pub fn generate_secure_token() -> Result<String, String> {
@@ -1717,7 +1783,7 @@ pub fn generate_secure_token() -> Result<String, String> {
     // Дополнительная страховка от вырожденного нулевого буфера
     if bytes.iter().all(|&b| b == bytes[0]) {
         return Err(
-            "Криптографический генератор вернул вырожденную последовательность — запуск NEXUS Drop отменён"
+            "Криптографический генератор вернул вырожденную последовательность — запуск AURORA Drop отменён"
                 .to_string(),
         );
     }
@@ -1741,7 +1807,7 @@ fn fill_csprng(buf: &mut [u8]) -> Result<(), String> {
         let ok = unsafe { SystemFunction036(buf.as_mut_ptr(), buf.len() as u32) };
         if ok == 0 {
             return Err(
-                "Сбой системного CSPRNG (SystemFunction036 / RtlGenRandom) — небезопасный запуск NEXUS Drop запрещён"
+                "Сбой системного CSPRNG (SystemFunction036 / RtlGenRandom) — небезопасный запуск AURORA Drop запрещён"
                     .to_string(),
             );
         }
@@ -1749,8 +1815,9 @@ fn fill_csprng(buf: &mut [u8]) -> Result<(), String> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let mut urandom = fs::File::open("/dev/urandom")
-            .map_err(|err| format!("Не удалось открыть /dev/urandom для генерации токена: {err}"))?;
+        let mut urandom = fs::File::open("/dev/urandom").map_err(|err| {
+            format!("Не удалось открыть /dev/urandom для генерации токена: {err}")
+        })?;
         urandom
             .read_exact(buf)
             .map_err(|err| format!("Не удалось прочитать случайные байты из /dev/urandom: {err}"))
@@ -1758,7 +1825,8 @@ fn fill_csprng(buf: &mut [u8]) -> Result<(), String> {
 }
 
 fn render_qr_svg(url: &str) -> Result<String, String> {
-    let code = QrCode::new(url.as_bytes()).map_err(|err| format!("Не удалось построить QR: {err}"))?;
+    let code =
+        QrCode::new(url.as_bytes()).map_err(|err| format!("Не удалось построить QR: {err}"))?;
     let size = code.width();
     let mut svg = format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {size} {size}\" shape-rendering=\"crispEdges\"><rect width=\"{size}\" height=\"{size}\" fill=\"#ffffff\"/>"
@@ -1766,7 +1834,9 @@ fn render_qr_svg(url: &str) -> Result<String, String> {
     for y in 0..size {
         for x in 0..size {
             if code[(x, y)] == Color::Dark {
-                svg.push_str(&format!("<rect x=\"{x}\" y=\"{y}\" width=\"1\" height=\"1\" fill=\"#111722\"/>"));
+                svg.push_str(&format!(
+                    "<rect x=\"{x}\" y=\"{y}\" width=\"1\" height=\"1\" fill=\"#111722\"/>"
+                ));
             }
         }
     }
@@ -1872,7 +1942,9 @@ fn open_in_explorer(path: &Path) -> Result<(), String> {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000);
     }
-    command.spawn().map_err(|err| format!("Не удалось открыть Проводник: {err}"))?;
+    command
+        .spawn()
+        .map_err(|err| format!("Не удалось открыть Проводник: {err}"))?;
     Ok(())
 }
 
@@ -1900,7 +1972,7 @@ const PHONE_PAGE: &str = r####"<!doctype html>
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>NEXUS Drop</title>
+<title>AURORA Drop</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -1925,11 +1997,11 @@ const PHONE_PAGE: &str = r####"<!doctype html>
 </head>
 <body>
 <main>
-  <h1>NEXUS DROP</h1>
+  <h1>AURORA Drop</h1>
   <p>Отправка файлов и текста на компьютер по домашней сети Wi-Fi (до 200 МБ за файл, до 50 файлов / 1 ГБ за сессию).</p>
   <div class="warn">Локальный HTTP-канал без TLS-шифрования: передаваемые файлы внутри Wi-Fi сети не шифруются. Используйте только в доверенной домашней сети.</div>
   <div id="tokenCard" class="card" style="display:none">
-    <div style="font-size:12px;color:#8793a5">Введите токен сессии из окна NEXUS на ПК:</div>
+    <div style="font-size:12px;color:#8793a5">Введите токен сессии из окна AURORA на ПК:</div>
     <div id="tokenRow" class="visible">
       <input id="tokenInput" type="text" placeholder="Токен доступа"/>
       <button id="tokenApply" type="button" style="width:auto;padding:0 16px">ОК</button>
@@ -1965,7 +2037,7 @@ async function verifyToken() {
     const res = await fetch("/api/auth", { headers: { "X-Nexus-Token": token } });
     if (res.ok) { tokenCard.style.display = "none"; setLog("Готово к передаче"); }
     else { tokenCard.style.display = "block"; setLog(await res.text() || "Неверный токен"); }
-  } catch { setLog("Узел NEXUS недоступен"); }
+  } catch { setLog("Узел AURORA недоступен"); }
 }
 document.getElementById("tokenApply").addEventListener("click", () => {
   token = (tokenInput.value || "").trim().toUpperCase();
@@ -2120,7 +2192,10 @@ mod tests {
         let info = hub
             .start_with_config(dir.0.clone(), Some(("127.0.0.1", 0)))
             .expect("session");
-        assert!(info.url.contains("/#token="), "QR URL must use URL fragment instead of query string");
+        assert!(
+            info.url.contains("/#token="),
+            "QR URL must use URL fragment instead of query string"
+        );
 
         let payload = vec![0xA5u8; 2 * 1024 * 1024];
         let (status, text) = http_multipart_upload(info.port, &info.token, "photo.jpg", &payload);
@@ -2153,7 +2228,10 @@ mod tests {
             if attempt < MAX_AUTH_FAILURES_PER_WINDOW {
                 assert_eq!(status, 403, "attempt {attempt}: {text}");
             } else {
-                assert_eq!(status, 429, "rate limit must trigger on attempt {attempt}: {text}");
+                assert_eq!(
+                    status, 429,
+                    "rate limit must trigger on attempt {attempt}: {text}"
+                );
             }
         }
         assert!(hub.history().is_empty());
@@ -2164,12 +2242,12 @@ mod tests {
     fn filename_sanitizer_blocks_path_traversal_windows_paths_and_reserved_names() {
         assert_eq!(sanitize_filename("../../evil.txt"), "evil.txt");
         assert_eq!(sanitize_filename(r"C:\Windows\System32\cmd.exe"), "cmd.exe");
-        assert_eq!(sanitize_filename(r"..\..\..\.."), "nexus-file");
-        assert_eq!(sanitize_filename(""), "nexus-file");
-        assert_eq!(sanitize_filename("   ...  "), "nexus-file");
-        assert_eq!(sanitize_filename("CON.txt"), "nexus-file");
-        assert_eq!(sanitize_filename("nul"), "nexus-file");
-        assert_eq!(sanitize_filename("LPT1.log"), "nexus-file");
+        assert_eq!(sanitize_filename(r"..\..\..\.."), "aurora-file");
+        assert_eq!(sanitize_filename(""), "aurora-file");
+        assert_eq!(sanitize_filename("   ...  "), "aurora-file");
+        assert_eq!(sanitize_filename("CON.txt"), "aurora-file");
+        assert_eq!(sanitize_filename("nul"), "aurora-file");
+        assert_eq!(sanitize_filename("LPT1.log"), "aurora-file");
         assert_eq!(sanitize_filename("secret.part"), "secret.part.bin");
 
         // Сквозной тест через HTTP multipart с traversal и дублирующимся именем
@@ -2179,7 +2257,8 @@ mod tests {
             .start_with_config(dir.0.clone(), Some(("127.0.0.1", 0)))
             .expect("session");
 
-        let (s1, _) = http_multipart_upload(info.port, &info.token, r"C:\..\..\outside.txt", b"first");
+        let (s1, _) =
+            http_multipart_upload(info.port, &info.token, r"C:\..\..\outside.txt", b"first");
         let (s2, _) = http_multipart_upload(info.port, &info.token, r"../outside.txt", b"second");
         assert_eq!(s1, 200);
         assert_eq!(s2, 200);
@@ -2189,9 +2268,17 @@ mod tests {
         let canon_dir = fs::canonicalize(&dir.0).unwrap();
         for item in &files {
             let p = Path::new(&item.path);
-            assert_eq!(p.parent(), Some(canon_dir.as_path()), "Saved file escaped save_dir: {}", item.path);
+            assert_eq!(
+                p.parent(),
+                Some(canon_dir.as_path()),
+                "Saved file escaped save_dir: {}",
+                item.path
+            );
         }
-        assert_ne!(files[0].path, files[1].path, "Duplicate names must remain distinct");
+        assert_ne!(
+            files[0].path, files[1].path,
+            "Duplicate names must remain distinct"
+        );
         hub.stop().ok();
     }
 
@@ -2222,7 +2309,8 @@ mod tests {
             let mut guard = hub.shared.inner.lock().unwrap();
             guard.info.session_total_bytes = MAX_SESSION_TOTAL_BYTES - 10;
         }
-        let (st, txt) = http_multipart_upload(info.port, &info.token, "over_quota.bin", &[b'x'; 512]);
+        let (st, txt) =
+            http_multipart_upload(info.port, &info.token, "over_quota.bin", &[b'x'; 512]);
         assert_eq!(st, 413, "Session byte quota must return 413: {txt}");
         assert!(hub.session().limit_reached_reason.is_some());
 
@@ -2271,7 +2359,10 @@ mod tests {
             .unwrap()
             .filter_map(Result::ok)
             .collect();
-        assert!(leftover.is_empty(), "No .part or corrupted files may remain: {leftover:?}");
+        assert!(
+            leftover.is_empty(),
+            "No .part or corrupted files may remain: {leftover:?}"
+        );
         hub.stop().ok();
     }
 
@@ -2285,12 +2376,16 @@ mod tests {
 
         // Открываем медленное соединение (прислали только часть заголовков) и держим его открытым
         let mut slow = TcpStream::connect(("127.0.0.1", info.port)).unwrap();
-        slow.write_all(b"POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\n").unwrap();
+        slow.write_all(b"POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+            .unwrap();
         slow.flush().unwrap();
 
         // Пока slow клиент висит, быстрый клиент должен немедленно завершить загрузку!
         let (st, txt) = http_multipart_upload(info.port, &info.token, "fast.txt", b"parallel_ok");
-        assert_eq!(st, 200, "Fast client must not be blocked by slow client: {txt}");
+        assert_eq!(
+            st, 200,
+            "Fast client must not be blocked by slow client: {txt}"
+        );
         assert_eq!(hub.history().len(), 1);
 
         drop(slow);

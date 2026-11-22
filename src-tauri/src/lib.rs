@@ -1,15 +1,15 @@
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
+use std::collections::VecDeque;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Disks, Networks, System};
 mod archive;
 mod drop_server;
@@ -17,20 +17,24 @@ mod gpu_fallback;
 mod net_monitor;
 mod net_optimizer;
 mod power_manager;
+mod process_io;
+mod process_labels;
+mod profile;
 mod scripts;
 mod settings;
+mod storage_index;
 mod storage_smart;
 mod telemetry;
 
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
 #[cfg(target_os = "windows")]
-use winreg::enums::*;
-#[cfg(target_os = "windows")]
 use winreg::RegKey;
+#[cfg(target_os = "windows")]
+use winreg::enums::*;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -54,6 +58,7 @@ pub struct SystemMetrics {
     pub net_tx_kbps: f32,
     pub net_ping_ms: u32,
     pub net_ping_method: String,
+    net_ping_sample: Option<ExternalRtt>,
 }
 
 // Структура записи автозагрузки Windows
@@ -93,7 +98,7 @@ pub struct ScanResult {
     pub total_scanned_bytes: u64,
     pub total_files_count: u64,
     pub root_node: FolderNode,
-    pub top_files: Vec<FileEntry>,          // ТОП-100 самых больших файлов
+    pub top_files: Vec<FileEntry>, // ТОП-100 самых больших файлов
     pub category_sizes: Vec<(String, u64)>, // ("Видео", 12345678), ("Игры и софт", ...)
     #[serde(default)]
     pub scan_id: u64,
@@ -107,6 +112,25 @@ pub struct ScanResult {
     pub is_partial: bool,
     #[serde(default)]
     pub skipped_samples: Vec<String>,
+    #[serde(default)]
+    pub total_dirs_count: u64,
+    #[serde(default)]
+    pub excluded_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<StorageScanDiagnostics>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct StorageScanDiagnostics {
+    elapsed_ms: f64,
+    enumeration_worker_ms: f64,
+    metadata_worker_ms: f64,
+    counting_worker_ms: f64,
+    aggregation_worker_ms: f64,
+    tree_worker_ms: f64,
+    finalize_ms: f64,
+    serialization_sample_ms: f64,
+    json_bytes: usize,
 }
 
 // Структуры модуля Hardware Monitor (Мониторинг железа через LibreHardwareMonitor sidecar)
@@ -120,6 +144,8 @@ pub struct CoreTemp {
 pub struct CpuTelemetry {
     pub name: String,
     pub package_temp_c: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_temp_sensor: Option<String>,
     pub max_core_temp_c: Option<f32>,
     pub avg_clock_mhz: Option<f32>,
     pub power_watts: Option<f32>,
@@ -137,6 +163,16 @@ pub struct CpuTelemetry {
     pub core_loads: Vec<f32>,
     #[serde(default)]
     pub hvci_enabled: bool,
+}
+
+fn validate_cpu_package(cpu: &mut CpuTelemetry) {
+    let named_package = cpu.package_temp_sensor.as_deref().is_some_and(|sensor| {
+        sensor.eq_ignore_ascii_case("CPU Package") || sensor.eq_ignore_ascii_case("Package")
+    });
+    if !named_package || !cpu.package_temp_c.is_some_and(f32::is_finite) {
+        cpu.package_temp_c = None;
+        cpu.package_temp_sensor = None;
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -248,14 +284,18 @@ pub struct CleanupReport {
 // Структура процесса модуля Process Explorer
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ProcessItem {
+    pub has_main_window: bool,
     pub pid: u32,
     pub parent_pid: Option<u32>,
     pub name: String,
     pub exe_path: String,
-    pub cpu_usage: f32,  // процент загрузки CPU (нормализован к числу логических ядер)
-    pub memory_mb: f64,  // занятая память в МБ
-    pub disk_read_bytes_sec: u64,
-    pub disk_write_bytes_sec: u64,
+    pub cpu_usage: f32, // процент загрузки CPU (нормализован к числу логических ядер)
+    pub memory_mb: f64, // занятая память в МБ
+    pub disk_read_bytes_sec: f64,
+    pub disk_write_bytes_sec: f64,
+    disk_status: process_io::Status,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_error_code: Option<u32>,
     pub run_time_sec: u64,
     pub start_time: u64,
     pub thread_count: u32,
@@ -331,6 +371,7 @@ pub struct HwmonWatchdogState {
     pub restart_count: u32,
     pub last_error: Option<String>,
     pub last_stderr_line: Option<String>,
+    generation: u64,
     pub manual_restart_in_progress: bool,
     pub shutdown_requested: bool,
     pub initial_spawn_attempted: bool,
@@ -347,6 +388,7 @@ impl Default for HwmonWatchdogState {
             restart_count: 0,
             last_error: None,
             last_stderr_line: None,
+            generation: 0,
             manual_restart_in_progress: false,
             shutdown_requested: false,
             initial_spawn_attempted: false,
@@ -379,6 +421,7 @@ impl Drop for ScanOperationGuard {
 pub struct StorageScanCoordinator {
     next_scan_id: AtomicU64,
     active: Mutex<Option<ActiveStorageScan>>,
+    indexes: Mutex<VecDeque<(u64, Arc<storage_index::StorageIndex>)>>,
 }
 
 impl StorageScanCoordinator {
@@ -386,6 +429,7 @@ impl StorageScanCoordinator {
         Self {
             next_scan_id: AtomicU64::new(1),
             active: Mutex::new(None),
+            indexes: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -414,7 +458,10 @@ impl StorageScanCoordinator {
 
     pub fn release_scan(&self, scan_id: u64) {
         if let Ok(mut guard) = self.active.lock() {
-            if guard.as_ref().is_some_and(|active| active.scan_id == scan_id) {
+            if guard
+                .as_ref()
+                .is_some_and(|active| active.scan_id == scan_id)
+            {
                 *guard = None;
             }
         }
@@ -432,6 +479,41 @@ impl StorageScanCoordinator {
         false
     }
 
+    fn store_index(&self, id: u64, index: storage_index::StorageIndex) -> Result<(), String> {
+        let active = self
+            .active
+            .lock()
+            .map_err(|_| "Состояние сканера недоступно")?;
+        if !active
+            .as_ref()
+            .is_some_and(|scan| scan.scan_id == id && !scan.cancel_token.load(Ordering::SeqCst))
+        {
+            return Err("SCAN_CANCELLED".into());
+        }
+        let mut indexes = self
+            .indexes
+            .lock()
+            .map_err(|_| "Индекс сканирования недоступен")?;
+        indexes.retain(|(_, old)| old.path != index.path);
+        indexes.push_back((id, Arc::new(index)));
+        while indexes.len() > 2 {
+            indexes.pop_front();
+        }
+        Ok(())
+    }
+
+    fn index(&self, id: u64) -> Result<Arc<storage_index::StorageIndex>, String> {
+        let indexes = self
+            .indexes
+            .lock()
+            .map_err(|_| "Индекс сканирования недоступен")?;
+        indexes
+            .iter()
+            .find(|(scan_id, _)| *scan_id == id)
+            .map(|(_, index)| Arc::clone(index))
+            .ok_or_else(|| "Снимок устарел. Просканируйте том повторно.".into())
+    }
+
     pub fn active_scan_snapshot(&self) -> Option<(u64, String)> {
         self.active
             .lock()
@@ -446,8 +528,8 @@ pub struct AppState {
     pub networks: Arc<Mutex<Networks>>,
     pub networks_last_refresh: Arc<Mutex<Option<Instant>>>,
     pub disk_space: Arc<Mutex<(u64, u64)>>,
-    pub ping_cache: Arc<Mutex<(u32, String, Option<Instant>, bool)>>,
-    pub process_last_refresh: Arc<Mutex<Option<Instant>>>,
+    ping_cache: Arc<Mutex<ExternalPingCache>>,
+    process_io_sample: Arc<Mutex<process_io::History>>,
     pub pid_cache: Arc<Mutex<HashMap<u32, (String, String)>>>,
     pub hw_telemetry: Arc<Mutex<Option<HardwareTelemetry>>>,
     pub hw_sidecar_child: Arc<Mutex<Option<Child>>>,
@@ -484,71 +566,47 @@ fn normalize_sidecar_path(cand: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(stripped))
 }
 
-// Поиск скомпилированного бинарника nexus-hwmon.exe (абсолютный путь без UNC-префикса)
 fn find_hwmon_sidecar_exe() -> Option<PathBuf> {
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            let exe_candidates = [
-                exe_dir.join("nexus-hwmon.exe"),
-                exe_dir.join("../../nexus-hwmon.exe"),
-                exe_dir.join("../../../hwmon-sidecar/bin/publish/nexus-hwmon.exe"),
-                exe_dir.join("../../../hwmon-sidecar/bin/Release/net9.0/win-x64/publish/nexus-hwmon.exe"),
-                exe_dir.join("../../hwmon-sidecar/bin/publish/nexus-hwmon.exe"),
-            ];
-            for cand in &exe_candidates {
-                if let Some(resolved) = normalize_sidecar_path(cand) {
-                    return Some(resolved);
-                }
-            }
-        }
+    // The installed application may be elevated. Only its own bundled
+    // helper is eligible in production, regardless of the working directory.
+    let exe = std::env::current_exe().ok()?;
+    let installed = exe.parent()?.join("aurora-hwmon.exe");
+    if !cfg!(debug_assertions) || installed.is_file() {
+        return normalize_sidecar_path(&installed);
     }
-
-    let candidates = [
-        PathBuf::from("nexus-hwmon.exe"),
-        PathBuf::from("src-tauri/nexus-hwmon.exe"),
-        PathBuf::from("../src-tauri/nexus-hwmon.exe"),
-        PathBuf::from("hwmon-sidecar/bin/publish/nexus-hwmon.exe"),
-        PathBuf::from("../hwmon-sidecar/bin/publish/nexus-hwmon.exe"),
-        PathBuf::from("hwmon-sidecar/bin/Release/net9.0/win-x64/publish/nexus-hwmon.exe"),
-        PathBuf::from("../hwmon-sidecar/bin/Release/net9.0/win-x64/publish/nexus-hwmon.exe"),
-        PathBuf::from("src-tauri/hwmon-sidecar/bin/publish/nexus-hwmon.exe"),
-    ];
-
-    for cand in &candidates {
-        if let Some(resolved) = normalize_sidecar_path(cand) {
-            return Some(resolved);
-        }
-    }
-
-    None
+    // Cargo tests and Tauri dev can start with different current directories.
+    // Use the staged, project-owned resource for both.
+    normalize_sidecar_path(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("nexus-hwmon.exe"))
 }
 
 fn is_driver_blocked_indicator(exit_code: Option<i32>, stderr_line: Option<&str>) -> bool {
-    if let Some(code) = exit_code {
-        // 1275 (0x4FB) = ERROR_DRIVER_BLOCKED, -1073740777 / 0xC0000428 = STATUS_INVALID_IMAGE_HASH
-        if code == 1275 || code == 0x4FB || code == -1073740777i32 {
-            return true;
-        }
+    if exit_code.is_some_and(|code| matches!(code as u32, 1275 | 577 | 0xC0000428)) {
+        return true;
     }
-    if let Some(line) = stderr_line {
+    stderr_line.is_some_and(|line| {
         let lower = line.to_ascii_lowercase();
-        if lower.contains("winring0")
-            || lower.contains("hvci")
-            || lower.contains("driver")
-            || lower.contains("inpout")
-            || lower.contains("ring0")
-            || lower.contains("kernel isolation")
-            || lower.contains("1275")
-            || lower.contains("0x4fb")
-        {
-            return true;
-        }
-    }
-    false
+        let driver = ["driver", "winring0", "inpout", "ring0"]
+            .iter()
+            .any(|part| lower.contains(part));
+        driver
+            && [
+                "blocked",
+                "invalid image hash",
+                "cannot verify the digital signature",
+                "0x4fb",
+                "1275",
+            ]
+            .iter()
+            .any(|part| lower.contains(part))
+    })
 }
 
 fn terminate_sidecar_child(child_holder: &Mutex<Option<Child>>) {
     let taken = child_holder.lock().ok().and_then(|mut guard| guard.take());
+    stop_sidecar_process(taken);
+}
+
+fn stop_sidecar_process(taken: Option<Child>) {
     if let Some(mut child) = taken {
         drop(child.stdin.take());
         if matches!(child.try_wait(), Ok(None) | Err(_)) {
@@ -558,21 +616,23 @@ fn terminate_sidecar_child(child_holder: &Mutex<Option<Child>>) {
     }
 }
 
-fn check_sidecar_child_live(child_holder: &Mutex<Option<Child>>) -> (bool, Option<Option<i32>>) {
+fn check_sidecar_child_live(
+    child_holder: &Mutex<Option<Child>>,
+    consume_exit: bool,
+) -> (bool, Option<Option<i32>>) {
     let Ok(mut guard) = child_holder.lock() else {
         return (false, None);
     };
     match guard.as_mut() {
         Some(child) => match child.try_wait() {
             Ok(Some(status)) => {
-                let _ = guard.take();
+                if consume_exit {
+                    let _ = guard.take();
+                }
                 (false, Some(status.code()))
             }
             Ok(None) => (true, None),
-            Err(_) => {
-                let _ = guard.take();
-                (false, Some(None))
-            }
+            Err(_) => (true, None),
         },
         None => (false, None),
     }
@@ -654,9 +714,13 @@ fn evaluate_hwmon_watchdog_step(
     } else if wd.initial_spawn_attempted
         && wd.status != HwmonStatus::DriverBlocked
         && !wd.auto_restarts_exhausted
+        && (wd.last_error.is_some()
+            || wd.last_spawn_at.is_none_or(|started| {
+                now.saturating_duration_since(started) >= HWMON_STARTUP_GRACE
+            }))
     {
         let reason = wd.last_error.clone().unwrap_or_else(|| {
-            "Процесс nexus-hwmon не запущен после первоначального сбоя".to_string()
+            "Сервис аппаратных датчиков не запущен после первоначального сбоя".to_string()
         });
         Some((false, None, reason))
     } else {
@@ -691,9 +755,8 @@ fn evaluate_hwmon_watchdog_step(
     } else {
         wd.auto_restarts_exhausted = true;
         wd.status = HwmonStatus::Offline;
-        wd.last_error = Some(
-            "Служба датчиков остановлена после 5 неудачных попыток перезапуска".to_string(),
-        );
+        wd.last_error =
+            Some("Служба датчиков остановлена после 5 неудачных попыток перезапуска".to_string());
         HwmonWatchdogAction::StopWithFailure {
             kill_hung_child,
             driver_blocked: false,
@@ -705,25 +768,38 @@ fn spawn_hwmon_sidecar(
     telemetry_cache: Arc<Mutex<Option<HardwareTelemetry>>>,
     child_holder: Arc<Mutex<Option<Child>>>,
     watchdog_state: Arc<Mutex<HwmonWatchdogState>>,
+    expected_generation: u64,
 ) -> Result<(), String> {
-    terminate_sidecar_child(&child_holder);
-
-    if let Ok(mut wd) = watchdog_state.lock() {
-        if wd.shutdown_requested {
-            return Err("Приложение завершает работу".to_string());
+    let (generation, previous) = {
+        let mut wd = watchdog_state
+            .lock()
+            .map_err(|_| "Недоступно состояние службы датчиков")?;
+        if !accepts_hwmon_generation(&wd, expected_generation) {
+            return Err("Запуск службы датчиков отменён".to_string());
         }
+        let previous = child_holder
+            .lock()
+            .map_err(|_| "Недоступен процесс службы датчиков")?
+            .take();
+        wd.generation += 1;
         wd.initial_spawn_attempted = true;
         wd.last_spawn_at = Some(Instant::now());
         wd.last_sample_at = None;
         wd.last_stderr_line = None;
-    }
+        wd.last_error = None;
+        (wd.generation, previous)
+    };
+    stop_sidecar_process(previous);
 
     let Some(exe_path) = find_hwmon_sidecar_exe() else {
-        if let Ok(mut wd) = watchdog_state.lock() {
+        if let Ok(mut wd) = watchdog_state.lock()
+            && accepts_hwmon_generation(&wd, generation)
+        {
             wd.status = HwmonStatus::Offline;
-            wd.last_error = Some("Исполняемый файл nexus-hwmon.exe не найден".to_string());
+            wd.last_error =
+                Some("Сервис аппаратных датчиков отсутствует в каталоге приложения".to_string());
         }
-        return Err("Исполняемый файл nexus-hwmon.exe не найден".to_string());
+        return Err("Сервис аппаратных датчиков отсутствует в каталоге приложения".to_string());
     };
 
     let mut cmd = Command::new(&exe_path);
@@ -740,8 +816,10 @@ fn spawn_hwmon_sidecar(
     cmd.creation_flags(CREATE_NO_WINDOW);
 
     let mut child = cmd.spawn().map_err(|e| {
-        let msg = format!("Не удалось запустить nexus-hwmon.exe: {e}");
-        if let Ok(mut wd) = watchdog_state.lock() {
+        let msg = format!("Не удалось запустить сервис аппаратных датчиков: {e}");
+        if let Ok(mut wd) = watchdog_state.lock()
+            && accepts_hwmon_generation(&wd, generation)
+        {
             wd.status = HwmonStatus::Offline;
             wd.last_error = Some(msg.clone());
         }
@@ -752,7 +830,9 @@ fn spawn_hwmon_sidecar(
         drop(child.stdin.take());
         let _ = child.kill();
         let _ = child.wait();
-        if let Ok(mut wd) = watchdog_state.lock() {
+        if let Ok(mut wd) = watchdog_state.lock()
+            && accepts_hwmon_generation(&wd, generation)
+        {
             wd.status = HwmonStatus::Offline;
             wd.last_error = Some("Не удалось подключиться к stdout сайдкара".to_string());
         }
@@ -760,8 +840,16 @@ fn spawn_hwmon_sidecar(
     };
     let stderr_opt = child.stderr.take();
 
-    if let Ok(mut guard) = child_holder.lock() {
-        *guard = Some(child);
+    let mut candidate = Some(child);
+    if let Ok(wd) = watchdog_state.lock()
+        && accepts_hwmon_generation(&wd, generation)
+        && let Ok(mut guard) = child_holder.lock()
+    {
+        *guard = candidate.take();
+    }
+    if candidate.is_some() {
+        stop_sidecar_process(candidate);
+        return Err("Запуск службы датчиков отменён".into());
     }
 
     if let Some(stderr) = stderr_opt {
@@ -777,6 +865,9 @@ fn spawn_hwmon_sidecar(
                     continue;
                 }
                 if let Ok(mut wd) = wd_stderr.lock() {
+                    if !accepts_hwmon_generation(&wd, generation) {
+                        break;
+                    }
                     wd.last_stderr_line = Some(trimmed.to_string());
                     if is_driver_blocked_indicator(None, Some(trimmed)) {
                         wd.status = HwmonStatus::DriverBlocked;
@@ -799,9 +890,13 @@ fn spawn_hwmon_sidecar(
                 continue;
             }
             if let Ok(mut parsed) = serde_json::from_str::<HardwareTelemetry>(trimmed) {
+                validate_cpu_package(&mut parsed.cpu);
                 parsed.telemetry_stale = false;
                 parsed.sample_age_ms = Some(0);
                 if let Ok(mut wd) = wd_stdout.lock() {
+                    if !accepts_hwmon_generation(&wd, generation) {
+                        break;
+                    }
                     wd.last_sample_at = Some(Instant::now());
                     wd.last_sample_timestamp_ms = Some(parsed.timestamp_ms);
                     if wd.status != HwmonStatus::DriverBlocked {
@@ -810,15 +905,57 @@ fn spawn_hwmon_sidecar(
                         wd.restart_count = 0;
                         wd.auto_restarts_exhausted = false;
                     }
-                }
-                if let Ok(mut cache) = telemetry_cache.lock() {
-                    *cache = Some(parsed);
+                    if let Ok(mut cache) = telemetry_cache.lock() {
+                        *cache = Some(parsed);
+                    }
                 }
             }
         }
     });
 
     Ok(())
+}
+
+fn accepts_hwmon_generation(wd: &HwmonWatchdogState, generation: u64) -> bool {
+    !wd.shutdown_requested && wd.generation == generation
+}
+
+#[test]
+fn hardware_package_provenance_and_watchdog_restart_are_independent() {
+    let mut cpu = CpuTelemetry {
+        package_temp_c: Some(52.0),
+        max_core_temp_c: Some(65.0),
+        package_temp_sensor: Some("Core #1".into()),
+        ..Default::default()
+    };
+    validate_cpu_package(&mut cpu);
+    assert_eq!(cpu.package_temp_c, None);
+    assert_eq!(cpu.max_core_temp_c, Some(65.0));
+    cpu.package_temp_sensor = Some("CPU Package".into());
+    cpu.package_temp_c = Some(55.0);
+    validate_cpu_package(&mut cpu);
+    assert_eq!(cpu.package_temp_c, Some(55.0));
+
+    let mut wd = HwmonWatchdogState {
+        generation: 2,
+        ..Default::default()
+    };
+    assert!(!accepts_hwmon_generation(&wd, 1));
+    assert!(accepts_hwmon_generation(&wd, 2));
+    wd.shutdown_requested = true;
+    assert!(!accepts_hwmon_generation(&wd, 2));
+    assert!(!is_driver_blocked_indicator(
+        None,
+        Some("driver telemetry initialized")
+    ));
+    assert!(is_driver_blocked_indicator(
+        None,
+        Some("WinRing0 driver blocked")
+    ));
+    assert!(is_driver_blocked_indicator(
+        Some(0xC0000428u32 as i32),
+        None
+    ));
 }
 
 fn start_hwmon_watchdog(
@@ -832,48 +969,48 @@ fn start_hwmon_watchdog(
             loop {
                 std::thread::sleep(Duration::from_secs(1));
 
-                let (child_alive, exit_status) = check_sidecar_child_live(&child_holder);
                 let now = Instant::now();
 
-                let action = {
+                let (action, generation, stopped_child) = {
                     let Ok(mut wd) = watchdog_state.lock() else {
                         continue;
                     };
-                    evaluate_hwmon_watchdog_step(&mut wd, child_alive, exit_status, now)
+                    let (child_alive, exit_status) = check_sidecar_child_live(&child_holder, true);
+                    let action =
+                        evaluate_hwmon_watchdog_step(&mut wd, child_alive, exit_status, now);
+                    let stopped_child = match action {
+                        HwmonWatchdogAction::RestartAfterBackoff {
+                            kill_hung_child, ..
+                        }
+                        | HwmonWatchdogAction::StopWithFailure {
+                            kill_hung_child, ..
+                        } => {
+                            wd.generation += 1;
+                            if kill_hung_child {
+                                child_holder.lock().ok().and_then(|mut guard| guard.take())
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    (action, wd.generation, stopped_child)
                 };
+                stop_sidecar_process(stopped_child);
 
                 match action {
                     HwmonWatchdogAction::ExitThread => break,
                     HwmonWatchdogAction::Idle => continue,
                     HwmonWatchdogAction::StopWithFailure {
-                        kill_hung_child,
+                        kill_hung_child: _,
                         driver_blocked: _,
                     } => {
-                        if kill_hung_child {
-                            terminate_sidecar_child(&child_holder);
-                        }
-                        if let Ok(mut cache) = telemetry_cache.lock() {
-                            if let Some(ref mut data) = *cache {
-                                data.sidecar_online = false;
-                                data.telemetry_stale = true;
-                            }
-                        }
                         continue;
                     }
                     HwmonWatchdogAction::RestartAfterBackoff {
                         delay_secs,
-                        kill_hung_child,
+                        kill_hung_child: _,
                     } => {
-                        if kill_hung_child {
-                            terminate_sidecar_child(&child_holder);
-                        }
-                        if let Ok(mut cache) = telemetry_cache.lock() {
-                            if let Some(ref mut data) = *cache {
-                                data.sidecar_online = false;
-                                data.telemetry_stale = true;
-                            }
-                        }
-
                         let mut cancelled_or_shutdown = false;
                         for _ in 0..(delay_secs * 5) {
                             std::thread::sleep(Duration::from_millis(200));
@@ -881,7 +1018,7 @@ fn start_hwmon_watchdog(
                                 if wd.shutdown_requested {
                                     return;
                                 }
-                                if wd.manual_restart_in_progress {
+                                if !accepts_hwmon_generation(&wd, generation) {
                                     cancelled_or_shutdown = true;
                                     break;
                                 }
@@ -893,7 +1030,7 @@ fn start_hwmon_watchdog(
                         }
                         if watchdog_state
                             .lock()
-                            .map(|wd| wd.shutdown_requested || wd.manual_restart_in_progress)
+                            .map(|wd| !accepts_hwmon_generation(&wd, generation))
                             .unwrap_or(false)
                         {
                             continue;
@@ -903,6 +1040,7 @@ fn start_hwmon_watchdog(
                             Arc::clone(&telemetry_cache),
                             Arc::clone(&child_holder),
                             Arc::clone(&watchdog_state),
+                            generation,
                         );
                     }
                 }
@@ -913,9 +1051,9 @@ fn start_hwmon_watchdog(
 
 #[tauri::command]
 fn get_hwmon_status(state: State<'_, AppState>) -> HwmonStatusResponse {
-    let (has_live_child, _) = check_sidecar_child_live(&state.hw_sidecar_child);
     let now = Instant::now();
     if let Ok(wd) = state.hwmon_watchdog.lock() {
+        let (has_live_child, _) = check_sidecar_child_live(&state.hw_sidecar_child, false);
         let (telemetry_stale, sample_age_ms) = compute_hwmon_staleness(&wd, has_live_child, now);
         HwmonStatusResponse {
             status: wd.status,
@@ -942,27 +1080,32 @@ async fn restart_hwmon(state: State<'_, AppState>) -> Result<(), String> {
     let watchdog_state = Arc::clone(&state.hwmon_watchdog);
 
     tauri::async_runtime::spawn_blocking(move || {
-        if let Ok(mut wd) = watchdog_state.lock() {
+        let generation = {
+            let mut wd = watchdog_state
+                .lock()
+                .map_err(|_| "Недоступно состояние службы датчиков")?;
+            if wd.shutdown_requested || wd.manual_restart_in_progress {
+                return Err("Перезапуск службы датчиков сейчас недоступен".into());
+            }
+            wd.generation += 1;
             wd.manual_restart_in_progress = true;
-            wd.shutdown_requested = false;
             wd.status = HwmonStatus::Restarting;
             wd.restart_count = 0;
             wd.auto_restarts_exhausted = false;
             wd.last_error = None;
             wd.last_stderr_line = None;
             wd.last_sample_at = None;
-        }
-
-        terminate_sidecar_child(&child_holder);
-
-        if let Ok(mut cache) = telemetry_cache.lock() {
-            *cache = None;
-        }
+            if let Ok(mut cache) = telemetry_cache.lock() {
+                *cache = None;
+            }
+            wd.generation
+        };
 
         let res = spawn_hwmon_sidecar(
             Arc::clone(&telemetry_cache),
             Arc::clone(&child_holder),
             Arc::clone(&watchdog_state),
+            generation,
         );
 
         if let Ok(mut wd) = watchdog_state.lock() {
@@ -1024,29 +1167,7 @@ fn build_storage_temp_items(lhm_items: &[StorageTempItem]) -> Vec<StorageTempIte
     };
 
     if !lhm_items.is_empty() {
-        return lhm_items
-            .iter()
-            .map(|item| {
-                let mut cloned = item.clone();
-                if cloned.temp_c.is_none() {
-                    let item_low = cloned.name.to_ascii_lowercase();
-                    if let Some(matched) = smart_disks
-                        .iter()
-                        .find(|s| {
-                            let m = s.model.to_ascii_lowercase();
-                            !m.is_empty() && (item_low.contains(&m) || m.contains(&item_low))
-                        })
-                        .or_else(|| if smart_disks.len() == 1 { smart_disks.first() } else { None })
-                    {
-                        cloned.temp_c = matched.temp_c.map(|t| t as f32);
-                    }
-                }
-                if cloned.used_percent.is_none() && smart_disks.len() <= 1 {
-                    cloned.used_percent = overall_used_pct;
-                }
-                cloned
-            })
-            .collect();
+        return merge_lhm_storage_items(lhm_items, &smart_disks, overall_used_pct);
     }
 
     let result = if !smart_disks.is_empty() {
@@ -1072,6 +1193,42 @@ fn build_storage_temp_items(lhm_items: &[StorageTempItem]) -> Vec<StorageTempIte
         *guard = Some((Instant::now(), result.clone()));
     }
     result
+}
+
+pub(crate) fn merge_lhm_storage_items(
+    lhm_items: &[StorageTempItem],
+    smart_disks: &[storage_smart::SmartDiskMetrics],
+    overall_used_pct: Option<f32>,
+) -> Vec<StorageTempItem> {
+    lhm_items
+        .iter()
+        .map(|item| {
+            let mut cloned = item.clone();
+            if cloned.temp_c.is_none() {
+                let item_low = cloned.name.to_ascii_lowercase();
+                if let Some(matched) = smart_disks
+                    .iter()
+                    .find(|s| {
+                        let m = s.model.to_ascii_lowercase();
+                        !m.is_empty() && (item_low.contains(&m) || m.contains(&item_low))
+                    })
+                    .or_else(|| {
+                        if smart_disks.len() == 1 {
+                            smart_disks.first()
+                        } else {
+                            None
+                        }
+                    })
+                {
+                    cloned.temp_c = matched.temp_c.map(|t| t as f32);
+                }
+            }
+            if cloned.used_percent.is_none() && smart_disks.len() <= 1 {
+                cloned.used_percent = overall_used_pct;
+            }
+            cloned
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -1120,12 +1277,20 @@ async fn get_hardware_telemetry(state: State<'_, AppState>) -> Result<HardwareTe
         };
 
         let hvci_enabled = gpu_fallback::is_hvci_enabled();
-        let (has_live_child, _) = check_sidecar_child_live(&hw_sidecar_child_arc);
-        let (watchdog_stale, watchdog_age_ms) = hwmon_watchdog_arc
-            .lock()
-            .map(|wd| compute_hwmon_staleness(&wd, has_live_child, Instant::now()))
-            .unwrap_or((!has_live_child, None));
-        let existing_telemetry = hw_telemetry_arc.lock().ok().and_then(|guard| guard.clone());
+        let (has_live_child, watchdog_stale, watchdog_age_ms, existing_telemetry) =
+            hwmon_watchdog_arc
+                .lock()
+                .map(|wd| {
+                    let (live, _) = check_sidecar_child_live(&hw_sidecar_child_arc, false);
+                    let (stale, age) = compute_hwmon_staleness(&wd, live, Instant::now());
+                    (
+                        live,
+                        stale,
+                        age,
+                        hw_telemetry_arc.lock().ok().and_then(|guard| guard.clone()),
+                    )
+                })
+                .unwrap_or((false, true, None, None));
 
         if let Some(mut data) = existing_telemetry {
             let needs_gpu_pdh =
@@ -1153,16 +1318,21 @@ async fn get_hardware_telemetry(state: State<'_, AppState>) -> Result<HardwareTe
             data.cpu.core_loads = core_loads;
             data.cpu.hvci_enabled = hvci_enabled;
             if data.cpu.avg_clock_mhz.is_none() {
-                data.cpu.avg_clock_mhz = pdh_cpu_clock.or(base_clock_mhz);
+                data.cpu.avg_clock_mhz = pdh_cpu_clock;
             }
 
             gpu_fallback::enrich_gpus(&mut data.gpus, pdh_gpu_load);
             data.storage_temps = build_storage_temp_items(&data.storage_temps);
 
-            settings::consider_hardware(
-                data.cpu.package_temp_c.or(data.cpu.max_core_temp_c),
-                data.gpus.iter().filter_map(|gpu| gpu.core_temp_c).reduce(f32::max),
-            );
+            if data.sidecar_online && !data.telemetry_stale {
+                settings::consider_hardware(
+                    data.cpu.package_temp_c,
+                    data.gpus
+                        .iter()
+                        .filter_map(|gpu| gpu.core_temp_c)
+                        .reduce(f32::max),
+                );
+            }
             return Ok(data);
         }
 
@@ -1186,8 +1356,9 @@ async fn get_hardware_telemetry(state: State<'_, AppState>) -> Result<HardwareTe
             cpu: CpuTelemetry {
                 name: fallback_cpu_name,
                 package_temp_c: None,
+                package_temp_sensor: None,
                 max_core_temp_c: None,
-                avg_clock_mhz: pdh_cpu_clock.or(base_clock_mhz),
+                avg_clock_mhz: pdh_cpu_clock,
                 power_watts: None,
                 voltage_v: None,
                 core_temps: Vec::new(),
@@ -1232,7 +1403,9 @@ fn expand_environment_path(input: &str) -> String {
                 let written = ExpandEnvironmentStringsW(wide.as_ptr(), buf.as_mut_ptr(), needed);
                 if written > 0 {
                     let end = buf.iter().position(|unit| *unit == 0).unwrap_or(buf.len());
-                    return OsString::from_wide(&buf[..end]).to_string_lossy().into_owned();
+                    return OsString::from_wide(&buf[..end])
+                        .to_string_lossy()
+                        .into_owned();
                 }
             }
         }
@@ -1556,9 +1729,8 @@ fn validate_startup_folder_item_paths(
         );
     }
 
-    let parent_meta = std::fs::symlink_metadata(parent).map_err(|e| {
-        format!("Разрешённая папка автозагрузки недоступна: {e}")
-    })?;
+    let parent_meta = std::fs::symlink_metadata(parent)
+        .map_err(|e| format!("Разрешённая папка автозагрузки недоступна: {e}"))?;
     if !parent_meta.is_dir() || is_reparse_meta(&parent_meta) {
         return Err(
             "Каталог автозагрузки не является обычной директорией или является reparse point"
@@ -1611,7 +1783,7 @@ fn validate_startup_folder_item_paths(
                 })?;
                 if canon_file.parent() != Some(canon_parent.as_path()) {
                     return Err(
-                        "Объект автозагрузки указывает за пределы разрешённой папки".to_string(),
+                        "Объект автозагрузки указывает за пределы разрешённой папки".to_string()
                     );
                 }
             }
@@ -1692,7 +1864,9 @@ fn scan_startup_folder(
         } else {
             None
         };
-        let clean_path = resolved_target.clone().unwrap_or_else(|| actual_path_str.clone());
+        let clean_path = resolved_target
+            .clone()
+            .unwrap_or_else(|| actual_path_str.clone());
         let file_exists = if actual_path_str.to_ascii_lowercase().contains(".lnk") {
             resolved_target
                 .as_ref()
@@ -1850,7 +2024,9 @@ fn pretty_store_name(family: &str) -> String {
 
 #[allow(dead_code)]
 fn name_already_listed(items: &[StartupItem], name: &str) -> bool {
-    items.iter().any(|item| item.name.eq_ignore_ascii_case(name))
+    items
+        .iter()
+        .any(|item| item.name.eq_ignore_ascii_case(name))
 }
 
 #[cfg(target_os = "windows")]
@@ -1950,7 +2126,11 @@ fn collect_run_value_names() -> HashSet<String> {
     let keys = [
         (HKEY_CURRENT_USER, RUN_KEY_PATH, KEY_READ),
         (HKEY_LOCAL_MACHINE, RUN_KEY_PATH, KEY_READ | KEY_WOW64_64KEY),
-        (HKEY_LOCAL_MACHINE, RUN_WOW64_KEY_PATH, KEY_READ | KEY_WOW64_64KEY),
+        (
+            HKEY_LOCAL_MACHINE,
+            RUN_WOW64_KEY_PATH,
+            KEY_READ | KEY_WOW64_64KEY,
+        ),
     ];
     for (root, path, access) in keys {
         let Ok(key) = RegKey::predef(root).open_subkey_with_flags(path, access) else {
@@ -1977,7 +2157,9 @@ fn collect_startup_file_names() -> HashSet<String> {
                 .join("Startup"),
         );
     }
-    if let Ok(program_data) = std::env::var("PROGRAMDATA").or_else(|_| std::env::var("ALLUSERSPROFILE")) {
+    if let Ok(program_data) =
+        std::env::var("PROGRAMDATA").or_else(|_| std::env::var("ALLUSERSPROFILE"))
+    {
         folders.push(
             Path::new(&program_data)
                 .join("Microsoft")
@@ -2071,7 +2253,12 @@ fn collect_install_names(dir: &Path, depth: u8, names: &mut HashSet<String>) {
 fn collect_program_names() -> HashSet<String> {
     let mut names = HashSet::new();
     let mut roots = Vec::new();
-    for var in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA", "APPDATA"] {
+    for var in [
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "LOCALAPPDATA",
+        "APPDATA",
+    ] {
         if let Ok(value) = std::env::var(var) {
             if !value.is_empty() {
                 roots.push(PathBuf::from(value));
@@ -2152,7 +2339,10 @@ fn append_orphan_approved(items: &mut Vec<StartupItem>, seen_ids: &mut HashSet<S
 
 fn decode_command_output(bytes: &[u8]) -> String {
     let utf16 = bytes.starts_with(&[0xFF, 0xFE])
-        || bytes.windows(4).take(8).any(|chunk| chunk[1] == 0 && chunk[3] == 0);
+        || bytes
+            .windows(4)
+            .take(8)
+            .any(|chunk| chunk[1] == 0 && chunk[3] == 0);
     if utf16 {
         let words: Vec<u16> = bytes
             .chunks_exact(2)
@@ -2324,17 +2514,13 @@ fn toggle_startup_folder_entry_in_dirs(
         if disabled_path.exists() {
             let _ = validate_startup_folder_item_paths(raw_base_path, allowed_dirs)?;
             std::fs::rename(&disabled_path, &base_path).map_err(|e| {
-                format!(
-                    "Не удалось включить ярлык автозагрузки (проверьте права доступа): {e}"
-                )
+                format!("Не удалось включить ярлык автозагрузки (проверьте права доступа): {e}")
             })?;
         }
     } else if base_path.exists() {
         let _ = validate_startup_folder_item_paths(raw_base_path, allowed_dirs)?;
         std::fs::rename(&base_path, &disabled_path).map_err(|e| {
-            format!(
-                "Не удалось отключить ярлык автозагрузки (проверьте права доступа): {e}"
-            )
+            format!("Не удалось отключить ярлык автозагрузки (проверьте права доступа): {e}")
         })?;
     }
     Ok(file_name)
@@ -2343,7 +2529,9 @@ fn toggle_startup_folder_entry_in_dirs(
 #[tauri::command]
 fn toggle_startup_item(id: String, enable: bool) -> Result<(), String> {
     if id.starts_with("approved|") {
-        return Err("Осиротевшую запись реестра нельзя переключить — её можно только удалить".to_string());
+        return Err(
+            "Осиротевшую запись реестра нельзя переключить — её можно только удалить".to_string(),
+        );
     }
 
     if let Some(base_path) = id.strip_prefix("dir|") {
@@ -2352,8 +2540,7 @@ fn toggle_startup_item(id: String, enable: bool) -> Result<(), String> {
         if enable {
             #[cfg(target_os = "windows")]
             {
-                let folder_approved =
-                    r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder";
+                let folder_approved = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder";
                 let _ = restore_startup_approved_if_disabled(
                     HKEY_CURRENT_USER,
                     folder_approved,
@@ -2434,7 +2621,7 @@ fn toggle_startup_item(id: String, enable: bool) -> Result<(), String> {
 
             let (backup_key, _) = hkcu
                 .create_subkey(&backup_subkey_path)
-                .map_err(|e| format!("Не удалось создать резервный ключ Nexus: {}", e))?;
+                .map_err(|e| format!("Не удалось создать резервный ключ автозагрузки: {}", e))?;
 
             backup_key
                 .set_value(value_name, &command)
@@ -2442,10 +2629,7 @@ fn toggle_startup_item(id: String, enable: bool) -> Result<(), String> {
 
             if let Err(e) = active_key.delete_value(value_name) {
                 let _ = backup_key.delete_value(value_name);
-                return Err(format!(
-                    "Не удалось удалить запись из автозагрузки: {}",
-                    e
-                ));
+                return Err(format!("Не удалось удалить запись из автозагрузки: {}", e));
             }
         } else {
             // Сначала проверяем, не осталась ли запись в активной ветке Run,
@@ -2460,7 +2644,9 @@ fn toggle_startup_item(id: String, enable: bool) -> Result<(), String> {
                 .and_then(|key| key.get_value::<String, _>(value_name).map(|cmd| (key, cmd)))
                 .or_else(|_| {
                     hkcu.open_subkey_with_flags(NEXUS_DISABLED_REG_BASE, KEY_READ | KEY_SET_VALUE)
-                        .and_then(|key| key.get_value::<String, _>(value_name).map(|cmd| (key, cmd)))
+                        .and_then(|key| {
+                            key.get_value::<String, _>(value_name).map(|cmd| (key, cmd))
+                        })
                 });
 
             if let Ok((backup_key, command)) = backup_entry {
@@ -2533,11 +2719,14 @@ fn shortcut_target(path: &Path) -> Option<String> {
 
 fn shortcut_target_via_shell(path: &Path) -> Option<String> {
     let escaped = path.to_string_lossy().replace('\'', "''");
-    let script = format!(
-        "(New-Object -ComObject WScript.Shell).CreateShortcut('{escaped}').TargetPath"
-    );
+    let script =
+        format!("(New-Object -ComObject WScript.Shell).CreateShortcut('{escaped}').TargetPath");
     let text = hidden_powershell(&script).ok()?;
-    let line = text.lines().find(|line| !line.trim().is_empty())?.trim().to_string();
+    let line = text
+        .lines()
+        .find(|line| !line.trim().is_empty())?
+        .trim()
+        .to_string();
     if line.is_empty() { None } else { Some(line) }
 }
 
@@ -2545,8 +2734,13 @@ fn read_cstr(bytes: &[u8], offset: usize) -> Option<String> {
     if offset == 0 || offset >= bytes.len() {
         return None;
     }
-    let end = bytes[offset..].iter().position(|byte| *byte == 0).map(|pos| offset + pos)?;
-    let text = String::from_utf8_lossy(&bytes[offset..end]).trim().to_string();
+    let end = bytes[offset..]
+        .iter()
+        .position(|byte| *byte == 0)
+        .map(|pos| offset + pos)?;
+    let text = String::from_utf8_lossy(&bytes[offset..end])
+        .trim()
+        .to_string();
     if text.len() > 3 { Some(text) } else { None }
 }
 
@@ -2598,7 +2792,10 @@ fn parse_shell_link_target(bytes: &[u8]) -> Option<String> {
         let suffix_off = read_u32(info, 24).unwrap_or(0) as usize;
         if let Some(suffix) = read_cstr(info, suffix_off) {
             if let Some(base) = target.as_mut() {
-                if !base.to_ascii_lowercase().ends_with(&suffix.to_ascii_lowercase()) {
+                if !base
+                    .to_ascii_lowercase()
+                    .ends_with(&suffix.to_ascii_lowercase())
+                {
                     if !base.ends_with('\\') && !suffix.starts_with('\\') {
                         base.push('\\');
                     }
@@ -2607,23 +2804,45 @@ fn parse_shell_link_target(bytes: &[u8]) -> Option<String> {
             }
         }
     }
-    target.filter(|value| value.contains(":\\") || value.contains(":/") || value.starts_with("\\\\"))
+    target
+        .filter(|value| value.contains(":\\") || value.contains(":/") || value.starts_with("\\\\"))
 }
 
 fn find_slice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn is_path_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric()
         || matches!(
             byte,
-            b'\\' | b'/' | b':' | b'.' | b' ' | b'(' | b')' | b'-' | b'_' | b'&' | b'\'' | b'[' | b']' | b'+' | b',' | b'~'
+            b'\\'
+                | b'/'
+                | b':'
+                | b'.'
+                | b' '
+                | b'('
+                | b')'
+                | b'-'
+                | b'_'
+                | b'&'
+                | b'\''
+                | b'['
+                | b']'
+                | b'+'
+                | b','
+                | b'~'
         )
 }
 
 fn find_embedded_path(bytes: &[u8]) -> Option<String> {
-    let lower: Vec<u8> = bytes.iter().copied().map(|byte| byte.to_ascii_lowercase()).collect();
+    let lower: Vec<u8> = bytes
+        .iter()
+        .copied()
+        .map(|byte| byte.to_ascii_lowercase())
+        .collect();
     for ext in [b".exe".as_slice(), b".bat", b".cmd", b".com"] {
         let mut from = 0usize;
         while let Some(rel) = find_slice(&lower[from..], ext) {
@@ -2633,7 +2852,9 @@ fn find_embedded_path(bytes: &[u8]) -> Option<String> {
                 start -= 1;
             }
             if end - start > 5 {
-                let text = String::from_utf8_lossy(&bytes[start..end]).trim().to_string();
+                let text = String::from_utf8_lossy(&bytes[start..end])
+                    .trim()
+                    .to_string();
                 if text.contains(":\\") || text.contains(":/") {
                     return Some(text);
                 }
@@ -2690,8 +2911,7 @@ fn delete_registry_value(root: winreg::HKEY, subkey: &str, name: &str) -> Result
     let key = RegKey::predef(root)
         .open_subkey_with_flags(subkey, KEY_SET_VALUE)
         .map_err(|e| startup_delete_error(&e))?;
-    key.delete_value(name)
-        .map_err(|e| startup_delete_error(&e))
+    key.delete_value(name).map_err(|e| startup_delete_error(&e))
 }
 
 fn remove_startup_folder_entry_in_dirs(
@@ -2728,8 +2948,7 @@ fn remove_startup_entry(entry_id: String, source: String) -> Result<(), String> 
     }
 
     if let Some(base_path) = entry_id.strip_prefix("dir|") {
-        let file_name =
-            remove_startup_folder_entry_in_dirs(base_path, &allowed_startup_folders())?;
+        let file_name = remove_startup_folder_entry_in_dirs(base_path, &allowed_startup_folders())?;
         settings::record_startup_removal(&entry_id, &source);
         let _ = delete_registry_value(
             HKEY_CURRENT_USER,
@@ -2819,12 +3038,18 @@ fn remove_startup_entry(entry_id: String, source: String) -> Result<(), String> 
             (HKEY_LOCAL_MACHINE, RUN_KEY_PATH),
             (HKEY_LOCAL_MACHINE, RUN_WOW64_KEY_PATH),
         ] {
-            if let Ok(key) = RegKey::predef(root).open_subkey_with_flags(subkey, KEY_READ | KEY_SET_VALUE) {
-                let names: Vec<String> = key.enum_values().filter_map(|item| item.ok().map(|(value_name, _)| value_name)).collect();
+            if let Ok(key) =
+                RegKey::predef(root).open_subkey_with_flags(subkey, KEY_READ | KEY_SET_VALUE)
+            {
+                let names: Vec<String> = key
+                    .enum_values()
+                    .filter_map(|item| item.ok().map(|(value_name, _)| value_name))
+                    .collect();
                 for value_name in names {
                     if value_name.eq_ignore_ascii_case(name) {
-                        key.delete_value(&value_name)
-                            .map_err(|e| format!("Не удалось удалить запись «{value_name}»: {e}"))?;
+                        key.delete_value(&value_name).map_err(|e| {
+                            format!("Не удалось удалить запись «{value_name}»: {e}")
+                        })?;
                         removed = true;
                     }
                 }
@@ -2842,7 +3067,9 @@ fn remove_startup_entry(entry_id: String, source: String) -> Result<(), String> 
         let mut cmd = Command::new("schtasks");
         cmd.args(["/Delete", "/TN", task, "/F"]);
         cmd.creation_flags(CREATE_NO_WINDOW);
-        let output = cmd.output().map_err(|e| format!("Не удалось запустить schtasks: {e}"))?;
+        let output = cmd
+            .output()
+            .map_err(|e| format!("Не удалось запустить schtasks: {e}"))?;
         if output.status.success() {
             settings::record_startup_removal(&entry_id, &source);
             return Ok(());
@@ -2992,13 +3219,24 @@ fn classify_extension(ext: &str) -> &'static str {
             "Игры и софт"
         }
         "mp3" | "flac" | "wav" | "ogg" | "m4a" | "aac" | "wma" => "Аудио",
-        "pdf" | "docx" | "doc" | "xlsx" | "xls" | "pptx" | "ppt" | "txt" | "md" | "rtf"
-        | "csv" => "Документы",
+        "pdf" | "docx" | "doc" | "xlsx" | "xls" | "pptx" | "ppt" | "txt" | "md" | "rtf" | "csv" => {
+            "Документы"
+        }
         _ => "Прочее",
     }
 }
 
+const SCAN_ENUMERATION: usize = 0;
+const SCAN_METADATA: usize = 1;
+const SCAN_COUNT: usize = 2;
+const SCAN_AGGREGATION: usize = 3;
+const SCAN_TREE: usize = 4;
+
 struct ScanShared {
+    folders: AtomicU64,
+    excluded: AtomicU64,
+    profiling: bool,
+    timings_ns: [AtomicU64; 5],
     files: AtomicU64,
     bytes: AtomicU64,
     cats: [AtomicU64; 6],
@@ -3065,10 +3303,12 @@ fn content_label(path: &str) -> String {
         }
     };
     for index in 0..lower.len() {
-        if lower[index] == "steamapps" && lower.get(index + 1).map(String::as_str) == Some("common") {
+        if lower[index] == "steamapps" && lower.get(index + 1).map(String::as_str) == Some("common")
+        {
             consider(&mut best, 100, index + 2);
         }
-        if lower[index] == "gog galaxy" && lower.get(index + 1).map(String::as_str) == Some("games") {
+        if lower[index] == "gog galaxy" && lower.get(index + 1).map(String::as_str) == Some("games")
+        {
             consider(&mut best, 90, index + 2);
         }
         if matches!(lower[index].as_str(), "gog games" | "epic games") {
@@ -3080,7 +3320,10 @@ fn content_label(path: &str) -> String {
         if lower[index] == "games" {
             consider(&mut best, 70, index + 1);
         }
-        if matches!(lower[index].as_str(), "program files" | "program files (x86)") {
+        if matches!(
+            lower[index].as_str(),
+            "program files" | "program files (x86)"
+        ) {
             consider(&mut best, 40, index + 1);
         }
     }
@@ -3133,19 +3376,38 @@ fn push_top_file(shared: &ScanShared, size: u64, path: String, name: String, ext
     }
 }
 
+fn timed_scan_step<T>(enabled: bool, sum: &mut u64, work: impl FnOnce() -> T) -> T {
+    if !enabled {
+        return work();
+    }
+    let start = Instant::now();
+    let result = work();
+    *sum += start.elapsed().as_nanos() as u64;
+    result
+}
+
 /// Параллельный обход без повторного запроса атрибутов безопасности.
 /// Размер берётся из записи каталога, символические ссылки и точки повторной обработки не раскрываются.
 fn scan_worker_loop(
     path: &Path,
-    depth: u8,
+    depth: usize,
     shared: &ScanShared,
     token: &AtomicBool,
-) -> (u64, u64, Vec<FolderNode>) {
+) -> storage_index::ScannedFolder {
+    use storage_index::{ScannedFile, ScannedFolder};
+    let mut folder = ScannedFolder {
+        name: path.file_name().map(Box::from).unwrap_or_default(),
+        ..Default::default()
+    };
     if token.load(Ordering::Relaxed) {
-        return (0, 0, Vec::new());
+        return folder;
     }
 
-    let entries = match std::fs::read_dir(path) {
+    let mut times = [0; 5];
+    let profile = shared.profiling;
+    let mut entries = match timed_scan_step(profile, &mut times[SCAN_ENUMERATION], || {
+        std::fs::read_dir(path)
+    }) {
         Ok(rd) => rd,
         Err(err) => {
             if !token.load(Ordering::Relaxed) {
@@ -3153,18 +3415,23 @@ fn scan_worker_loop(
                 shared.skipped_dirs.fetch_add(1, Ordering::Relaxed);
                 record_skipped_sample(shared, path, denied);
             }
-            return (0, 0, Vec::new());
+            return folder;
         }
     };
 
+    folder.readable = true;
+    shared.folders.fetch_add(1, Ordering::Relaxed);
+    let mut excluded = 0;
     let mut direct_bytes = 0u64;
     let mut local_files = 0u64;
     let mut local_cats = [0u64; 6];
     let mut subdirs: Vec<PathBuf> = Vec::new();
+    let mut files = Vec::new();
 
-    for item in entries {
+    while let Some(item) = timed_scan_step(profile, &mut times[SCAN_ENUMERATION], || entries.next())
+    {
         if token.load(Ordering::Relaxed) {
-            return (0, 0, Vec::new());
+            return folder;
         }
         let entry = match item {
             Ok(e) => e,
@@ -3180,74 +3447,80 @@ fn scan_worker_loop(
         let name = entry.file_name();
         let name_text = name.to_string_lossy();
         if skip_scan_name(&name_text) {
+            excluded += 1;
             continue;
         }
-        let entry_path = path.join(&name);
-        let file_type = match entry.file_type() {
-            Ok(ft) => ft,
+
+        // Windows DirEntry metadata is already carried by directory enumeration.
+        let meta = match timed_scan_step(profile, &mut times[SCAN_METADATA], || entry.metadata()) {
+            Ok(metadata) => metadata,
             Err(err) => {
                 if !token.load(Ordering::Relaxed) {
                     let denied = err.kind() == std::io::ErrorKind::PermissionDenied;
-                    shared.skipped_files.fetch_add(1, Ordering::Relaxed);
-                    record_skipped_sample(shared, &entry_path, denied);
-                }
-                continue;
-            }
-        };
-        if file_type.is_symlink() {
-            continue;
-        }
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(err) => {
-                if !token.load(Ordering::Relaxed) {
-                    let denied = err.kind() == std::io::ErrorKind::PermissionDenied;
-                    if file_type.is_dir() {
+                    if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                         shared.skipped_dirs.fetch_add(1, Ordering::Relaxed);
                     } else {
                         shared.skipped_files.fetch_add(1, Ordering::Relaxed);
                     }
-                    record_skipped_sample(shared, &entry_path, denied);
+                    record_skipped_sample(shared, &path.join(&name), denied);
                 }
                 continue;
             }
         };
-        if metadata_is_reparse(&meta) {
+        if meta.is_symlink() || metadata_is_reparse(&meta) {
+            excluded += 1;
             continue;
         }
-        if file_type.is_dir() {
-            subdirs.push(entry_path);
+        if meta.is_dir() {
+            subdirs.push(path.join(&name));
             continue;
         }
-        if !file_type.is_file() {
+        if !meta.is_file() {
+            excluded += 1;
             continue;
         }
-
         let size = meta.len();
-        direct_bytes = direct_bytes.saturating_add(size);
-        local_files = local_files.saturating_add(1);
-        let ext = Path::new(&name)
-            .extension()
-            .map(|value| value.to_string_lossy().to_ascii_lowercase())
-            .unwrap_or_default();
-        local_cats[category_index(&ext)] = local_cats[category_index(&ext)].saturating_add(size);
+        timed_scan_step(profile, &mut times[SCAN_COUNT], || {
+            local_files = local_files.saturating_add(1);
+        });
+        timed_scan_step(profile, &mut times[SCAN_AGGREGATION], || {
+            direct_bytes = direct_bytes.saturating_add(size);
+            let extension = Path::new(&name)
+                .extension()
+                .map(|value| value.to_string_lossy())
+                .unwrap_or_default();
+            let ext = if extension.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                std::borrow::Cow::Owned(extension.to_ascii_lowercase())
+            } else {
+                extension
+            };
+            let category = category_index(&ext);
+            local_cats[category] = local_cats[category].saturating_add(size);
 
-        let floor = shared.top_floor.load(Ordering::Relaxed);
-        if size > 0 && (floor == 0 || size > floor) {
-            push_top_file(
-                shared,
-                size,
-                entry_path.to_string_lossy().into_owned(),
-                name_text.into_owned(),
-                ext,
-            );
-        }
+            let floor = shared.top_floor.load(Ordering::Relaxed);
+            if size > 0 && (floor == 0 || size > floor) {
+                push_top_file(
+                    shared,
+                    size,
+                    path.join(&name).to_string_lossy().into_owned(),
+                    name_text.into_owned(),
+                    ext.into_owned(),
+                );
+            }
+        });
+        files.push(ScannedFile {
+            name: name.into_boxed_os_str(),
+            bytes: size,
+        });
     }
 
     if token.load(Ordering::Relaxed) {
-        return (0, 0, Vec::new());
+        return folder;
     }
 
+    drop(entries);
+    folder.files = files.into_boxed_slice();
+    shared.excluded.fetch_add(excluded, Ordering::Relaxed);
     shared.bytes.fetch_add(direct_bytes, Ordering::Relaxed);
     shared.files.fetch_add(local_files, Ordering::Relaxed);
     for (idx, bytes) in local_cats.iter().enumerate() {
@@ -3256,69 +3529,34 @@ fn scan_worker_loop(
         }
     }
 
-    let nested: Vec<(PathBuf, u64, Vec<FolderNode>)> = if subdirs.len() > 1 && depth < 4 {
-        subdirs
-            .into_par_iter()
-            .filter_map(|sub| {
-                if token.load(Ordering::Relaxed) {
-                    return None;
-                }
-                let (bytes, _direct, children) = scan_worker_loop(&sub, depth + 1, shared, token);
-                if token.load(Ordering::Relaxed) {
-                    return None;
-                }
-                Some((sub, bytes, children))
-            })
-            .collect()
-    } else {
-        let mut results = Vec::new();
-        for sub in subdirs {
-            if token.load(Ordering::Relaxed) {
-                break;
-            }
-            let (bytes, _direct, children) = scan_worker_loop(&sub, depth + 1, shared, token);
-            if token.load(Ordering::Relaxed) {
-                break;
-            }
-            results.push((sub, bytes, children));
-        }
-        results
+    let scan_child = |sub: PathBuf| {
+        (!token.load(Ordering::Relaxed)).then(|| scan_worker_loop(&sub, depth + 1, shared, token))
     };
-
+    let children: Vec<_> = if (depth < 4 && subdirs.len() > 1) || (depth < 12 && subdirs.len() >= 4)
+    {
+        subdirs.into_par_iter().filter_map(scan_child).collect()
+    } else {
+        subdirs.into_iter().map_while(scan_child).collect()
+    };
+    folder.folders = children.into_boxed_slice();
     if token.load(Ordering::Relaxed) {
-        return (0, 0, Vec::new());
+        return folder;
     }
-
-    let mut tree_bytes = direct_bytes;
-    let mut children = Vec::new();
-    for (sub, bytes, kids) in nested {
-        tree_bytes = tree_bytes.saturating_add(bytes);
-        if depth < 5 {
-            children.push(FolderNode {
-                name: sub
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                path: sub.to_string_lossy().into_owned(),
-                size_bytes: bytes,
-                children: if depth < 4 { kids } else { Vec::new() },
-            });
+    let tree_start = profile.then(Instant::now);
+    folder.bytes = direct_bytes;
+    folder.file_count = local_files;
+    for child in &folder.folders {
+        folder.bytes = folder.bytes.saturating_add(child.bytes);
+        folder.file_count = folder.file_count.saturating_add(child.file_count);
+        folder.folder_count = folder.folder_count.saturating_add(child.folder_count + 1);
+    }
+    if let Some(start) = tree_start {
+        times[SCAN_TREE] += start.elapsed().as_nanos() as u64;
+        for (counter, elapsed) in shared.timings_ns.iter().zip(times) {
+            counter.fetch_add(elapsed, Ordering::Relaxed);
         }
     }
-    if depth < 5 {
-        if depth > 0 && direct_bytes > 0 && !children.is_empty() {
-            children.push(FolderNode {
-                name: "[Файлы в папке]".to_string(),
-                path: path.to_string_lossy().into_owned(),
-                size_bytes: direct_bytes,
-                children: Vec::new(),
-            });
-        }
-        children.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
-        children.truncate(12);
-    }
-
-    (tree_bytes, direct_bytes, children)
+    folder
 }
 
 #[tauri::command]
@@ -3330,7 +3568,9 @@ fn cancel_storage_scan(state: State<'_, AppState>, scan_id: Option<u64>) -> Resu
 async fn execute_drive_storage_scan(
     coordinator: Arc<StorageScanCoordinator>,
     path: String,
+    profile: bool,
 ) -> Result<ScanResult, String> {
+    let start = Instant::now();
     let mut normalized = path.trim().to_string();
     if normalized.is_empty() {
         return Err("Не указан путь для сканирования".to_string());
@@ -3350,10 +3590,17 @@ async fn execute_drive_storage_scan(
             return Err(format!("Указанный путь не существует: {}", normalized));
         }
         if let Err(err) = std::fs::read_dir(&root_path) {
-            return Err(format!("Не удалось открыть каталог {}: {}", normalized, err));
+            return Err(format!(
+                "Не удалось открыть каталог {}: {}",
+                normalized, err
+            ));
         }
 
         let shared = ScanShared {
+            folders: AtomicU64::new(0),
+            excluded: AtomicU64::new(0),
+            profiling: profile,
+            timings_ns: std::array::from_fn(|_| AtomicU64::new(0)),
             files: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
             cats: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -3364,13 +3611,13 @@ async fn execute_drive_storage_scan(
             skipped_files: AtomicU64::new(0),
             skipped_samples: Mutex::new(Vec::new()),
         };
-        let (_tree_bytes, root_direct_files_bytes, mut root_children) =
-            scan_worker_loop(&root_path, 0, &shared, token);
+        let indexed_root = scan_worker_loop(&root_path, 0, &shared, token);
 
         if token.load(Ordering::Relaxed) {
             return Err("SCAN_CANCELLED".to_string());
         }
 
+        let finalize_start = Instant::now();
         let total_scanned_bytes = shared.bytes.load(Ordering::Relaxed);
         let total_files_count = shared.files.load(Ordering::Relaxed);
         let skipped_dirs_count = shared.skipped_dirs.load(Ordering::Relaxed);
@@ -3405,17 +3652,6 @@ async fn execute_drive_storage_scan(
             .collect();
         top_files.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
 
-        if root_direct_files_bytes > 0 {
-            root_children.push(FolderNode {
-                name: "[Файлы в корне]".to_string(),
-                path: normalized.clone(),
-                size_bytes: root_direct_files_bytes,
-                children: Vec::new(),
-            });
-            root_children.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
-            root_children.truncate(10);
-        }
-
         let root_name = root_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -3425,19 +3661,28 @@ async fn execute_drive_storage_scan(
             name: root_name,
             path: normalized.clone(),
             size_bytes: total_scanned_bytes,
-            children: root_children,
+            children: Vec::new(),
         };
 
         let category_sizes = vec![
-            ("Игры и софт".to_string(), shared.cats[1].load(Ordering::Relaxed)),
+            (
+                "Игры и софт".to_string(),
+                shared.cats[1].load(Ordering::Relaxed),
+            ),
             ("Видео".to_string(), shared.cats[0].load(Ordering::Relaxed)),
-            ("Архивы и образы".to_string(), shared.cats[2].load(Ordering::Relaxed)),
+            (
+                "Архивы и образы".to_string(),
+                shared.cats[2].load(Ordering::Relaxed),
+            ),
             ("Аудио".to_string(), shared.cats[3].load(Ordering::Relaxed)),
-            ("Документы".to_string(), shared.cats[4].load(Ordering::Relaxed)),
+            (
+                "Документы".to_string(),
+                shared.cats[4].load(Ordering::Relaxed),
+            ),
             ("Прочее".to_string(), shared.cats[5].load(Ordering::Relaxed)),
         ];
 
-        Ok(ScanResult {
+        let mut result = ScanResult {
             target_path: normalized,
             total_scanned_bytes,
             total_files_count,
@@ -3450,7 +3695,38 @@ async fn execute_drive_storage_scan(
             skipped_files_count,
             is_partial,
             skipped_samples,
-        })
+            total_dirs_count: shared.folders.load(Ordering::Relaxed),
+            excluded_count: shared.excluded.load(Ordering::Relaxed),
+            diagnostics: None,
+        };
+        if profile {
+            let finalize_ms = finalize_start.elapsed().as_secs_f64() * 1000.0;
+            let serialization_start = Instant::now();
+            let json_bytes = serde_json::to_vec(&result)
+                .map_err(|err| err.to_string())?
+                .len();
+            let serialization_sample_ms = serialization_start.elapsed().as_secs_f64() * 1000.0;
+            let ms = |index: usize| shared.timings_ns[index].load(Ordering::Relaxed) as f64 / 1e6;
+            result.diagnostics = Some(StorageScanDiagnostics {
+                elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+                enumeration_worker_ms: ms(SCAN_ENUMERATION),
+                metadata_worker_ms: ms(SCAN_METADATA),
+                counting_worker_ms: ms(SCAN_COUNT),
+                aggregation_worker_ms: ms(SCAN_AGGREGATION),
+                tree_worker_ms: ms(SCAN_TREE),
+                finalize_ms,
+                serialization_sample_ms,
+                json_bytes,
+            });
+        }
+        coordinator.store_index(
+            scan_guard.scan_id,
+            storage_index::StorageIndex {
+                path: root_path,
+                root: indexed_root,
+            },
+        )?;
+        Ok(result)
     })
     .await
     .map_err(|e| format!("Ошибка выполнения фонового потока сканирования: {}", e))?
@@ -3458,34 +3734,108 @@ async fn execute_drive_storage_scan(
 
 // Многопоточное сканирование выбранного диска или папки через rayon
 #[tauri::command]
-async fn scan_storage(state: State<'_, AppState>, path: String) -> Result<ScanResult, String> {
+async fn scan_storage(
+    state: State<'_, AppState>,
+    path: String,
+    profile: Option<bool>,
+) -> Result<ScanResult, String> {
     let coordinator = Arc::clone(&state.storage_scanner);
-    execute_drive_storage_scan(coordinator, path).await
+    execute_drive_storage_scan(coordinator, path, profile.unwrap_or(false)).await
 }
 
 #[tauri::command]
-async fn scan_drive_storage(state: State<'_, AppState>, path: String) -> Result<ScanResult, String> {
+async fn scan_drive_storage(
+    state: State<'_, AppState>,
+    path: String,
+    profile: Option<bool>,
+) -> Result<ScanResult, String> {
     let coordinator = Arc::clone(&state.storage_scanner);
-    execute_drive_storage_scan(coordinator, path).await
+    execute_drive_storage_scan(coordinator, path, profile.unwrap_or(false)).await
 }
 
-fn probe_gateway_ping_ms() -> (u32, &'static str) {
+#[tauri::command]
+async fn locate_storage_file(
+    state: State<'_, AppState>,
+    scan_id: u64,
+    path: String,
+) -> Result<(String, String), String> {
+    let index = state.storage_scanner.index(scan_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        index
+            .locate_file(Path::new(&path))
+            .ok_or_else(|| "Файл отсутствует в снимке".to_owned())
+    })
+    .await
+    .map_err(|err| format!("Не удалось прочитать индекс: {err}"))?
+}
+
+#[tauri::command]
+async fn get_storage_directory(
+    state: State<'_, AppState>,
+    scan_id: u64,
+    folder: String,
+    offset: usize,
+    sort: storage_index::SortBy,
+    descending: bool,
+) -> Result<storage_index::DirectoryPage, String> {
+    let index = state.storage_scanner.index(scan_id)?;
+    tauri::async_runtime::spawn_blocking(move || index.page(&folder, offset, sort, descending))
+        .await
+        .map_err(|err| format!("Не удалось прочитать индекс: {err}"))?
+}
+
+#[derive(Clone, Serialize)]
+struct ExternalRtt {
+    timestamp_ms: u64,
+    host: Ipv4Addr,
+    method: &'static str,
+    route: Option<String>,
+    rtt_ms: Option<u32>,
+}
+
+#[derive(Default)]
+struct ExternalPingCache {
+    sample: Option<ExternalRtt>,
+    completed_at: Option<Instant>,
+    pending: bool,
+}
+
+fn probe_external_rtt() -> ExternalRtt {
     let hosts = [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)];
-    for ip in &hosts {
-        if let Some(ms) = net_monitor::icmp_ping_ipv4(*ip, 450) {
-            return (ms.max(1), "ICMP");
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    for method in ["ICMP", "TCP:53"] {
+        for host in hosts {
+            let before = net_monitor::route_key(host);
+            let rtt = if method == "ICMP" {
+                net_monitor::icmp_ping_ipv4(host, 450)
+            } else {
+                let addr = SocketAddr::new(IpAddr::V4(host), 53);
+                let start = Instant::now();
+                TcpStream::connect_timeout(&addr, Duration::from_millis(450))
+                    .ok()
+                    .map(|_| start.elapsed().as_millis() as u32)
+            };
+            if let Some(rtt_ms) = rtt {
+                return ExternalRtt {
+                    timestamp_ms,
+                    host,
+                    method,
+                    route: net_monitor::confirmed_route(host, before),
+                    rtt_ms: Some(rtt_ms),
+                };
+            }
         }
     }
-    let timeout = Duration::from_millis(450);
-    for ip in &hosts {
-        let addr = SocketAddr::new(IpAddr::V4(*ip), 53);
-        let start = Instant::now();
-        if TcpStream::connect_timeout(&addr, timeout).is_ok() {
-            let ms = start.elapsed().as_millis() as u32;
-            return (ms.max(1), "TCP");
-        }
+    ExternalRtt {
+        timestamp_ms,
+        host: hosts[0],
+        method: "",
+        route: None,
+        rtt_ms: None,
     }
-    (0, "")
 }
 
 pub(crate) fn compute_throughput_kbps(
@@ -3503,36 +3853,26 @@ pub(crate) fn compute_throughput_kbps(
     )
 }
 
-// Неблокирующий замер пинга до 1.1.1.1 / 8.8.8.8 (ICMP с явным TCP-фоллбэком) и фоновым обновлением кэша раз в 2.5 сек
-fn measure_network_ping_ms(state: &AppState) -> (u32, String) {
-    let mut should_spawn = false;
-    let mut cached_ms = 0u32;
-    let mut cached_method = String::new();
-
-    if let Ok(mut guard) = state.ping_cache.lock() {
-        cached_ms = guard.0;
-        cached_method = guard.1.clone();
-        let expired = guard
-            .2
-            .map(|last| last.elapsed() >= Duration::from_millis(2500))
-            .unwrap_or(true);
-        if expired && !guard.3 {
-            guard.3 = true;
-            should_spawn = true;
-        }
-    }
-
-    if should_spawn {
+fn measure_network_ping(state: &AppState) -> Option<ExternalRtt> {
+    let mut guard = state.ping_cache.lock().ok()?;
+    let elapsed = guard.completed_at.map(|last| last.elapsed());
+    if elapsed.is_none_or(|age| age >= Duration::from_millis(2500)) && !guard.pending {
+        guard.pending = true;
         let cache = Arc::clone(&state.ping_cache);
         tauri::async_runtime::spawn_blocking(move || {
-            let (measured, method) = probe_gateway_ping_ms();
+            let sample = probe_external_rtt();
             if let Ok(mut guard) = cache.lock() {
-                *guard = (measured, method.to_string(), Some(Instant::now()), false);
+                guard.sample = Some(sample);
+                guard.completed_at = Some(Instant::now());
+                guard.pending = false;
             }
         });
     }
-
-    (cached_ms, cached_method)
+    // Do not present a pre-suspend sample as current when the window is restored.
+    guard
+        .sample
+        .clone()
+        .filter(|_| elapsed.is_some_and(|age| age <= Duration::from_secs(8)))
 }
 
 #[tauri::command]
@@ -3603,14 +3943,20 @@ async fn get_system_metrics(state: State<'_, AppState>) -> Result<SystemMetrics,
         (0.0, 0.0)
     };
 
-    let (net_ping_ms, net_ping_method) = measure_network_ping_ms(&state);
-    update_tray_ping(&state, net_ping_ms, &net_ping_method);
+    let net_ping_sample = measure_network_ping(&state);
+    let net_ping_ms = net_ping_sample
+        .as_ref()
+        .and_then(|sample| sample.rtt_ms)
+        .map(|ms| ms.max(1))
+        .unwrap_or(0);
+    let net_ping_method = net_ping_sample
+        .as_ref()
+        .map(|sample| sample.method)
+        .unwrap_or("");
+    update_tray_ping(&state, net_ping_ms, net_ping_method);
 
-    let (mut disk_free_gb, mut disk_total_gb) = state
-        .disk_space
-        .lock()
-        .map(|slot| *slot)
-        .unwrap_or((0, 0));
+    let (mut disk_free_gb, mut disk_total_gb) =
+        state.disk_space.lock().map(|slot| *slot).unwrap_or((0, 0));
     if disk_total_gb == 0 {
         let disks = Disks::new_with_refreshed_list();
         let sample = system_drive_space_gb(&disks);
@@ -3634,7 +3980,8 @@ async fn get_system_metrics(state: State<'_, AppState>) -> Result<SystemMetrics,
         net_rx_kbps,
         net_tx_kbps,
         net_ping_ms,
-        net_ping_method,
+        net_ping_method: net_ping_method.to_owned(),
+        net_ping_sample,
     })
 }
 
@@ -3776,7 +4123,9 @@ fn hide_to_tray(app: tauri::AppHandle) {
         let _ = hud.hide();
     }
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.hide();
+        if window.hide().is_ok() {
+            let _ = window.emit_to("main", "aurora-window-visibility", false);
+        }
     }
 }
 
@@ -3785,8 +4134,7 @@ fn restore_from_tray(app: tauri::AppHandle) {
     reveal_main_window(&app);
 }
 
-#[tauri::command]
-fn flush_dns() -> Result<(), String> {
+fn flush_dns_cache() -> Result<(), String> {
     let mut cmd = Command::new("ipconfig");
     cmd.args(["/flushdns"]);
     #[cfg(target_os = "windows")]
@@ -3806,16 +4154,23 @@ fn flush_dns() -> Result<(), String> {
     }
 }
 
+#[tauri::command]
+async fn flush_dns() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(flush_dns_cache)
+        .await
+        .map_err(|err| format!("Ошибка потока очистки кэша DNS: {err}"))?
+}
+
 #[derive(Serialize, Clone)]
 struct RouteProbe {
     label: String,
     host: String,
     ping_ms: u32,
-    jitter_ms: u32,
+    rtt_range_ms: Option<u32>,
     method: String,
 }
 
-fn sample_tcp_route(ip: Ipv4Addr, port: u16) -> (u32, u32, &'static str) {
+fn sample_tcp_route(ip: Ipv4Addr, port: u16) -> (u32, Option<u32>, &'static str) {
     if let Some(first) = net_monitor::icmp_ping_ipv4(ip, 500) {
         let mut samples = vec![first.max(1)];
         for _ in 0..2 {
@@ -3825,7 +4180,11 @@ fn sample_tcp_route(ip: Ipv4Addr, port: u16) -> (u32, u32, &'static str) {
         }
         let fastest = *samples.iter().min().unwrap_or(&0);
         let slowest = *samples.iter().max().unwrap_or(&0);
-        return (fastest, slowest.saturating_sub(fastest), "ICMP");
+        return (
+            fastest,
+            (samples.len() >= 2).then(|| slowest.saturating_sub(fastest)),
+            "ICMP",
+        );
     }
 
     let addr = SocketAddr::new(IpAddr::V4(ip), port);
@@ -3837,11 +4196,15 @@ fn sample_tcp_route(ip: Ipv4Addr, port: u16) -> (u32, u32, &'static str) {
         }
     }
     if samples.is_empty() {
-        return (0, 0, "");
+        return (0, None, "");
     }
     let fastest = *samples.iter().min().unwrap_or(&0);
     let slowest = *samples.iter().max().unwrap_or(&0);
-    (fastest, slowest.saturating_sub(fastest), "TCP")
+    (
+        fastest,
+        (samples.len() >= 2).then(|| slowest.saturating_sub(fastest)),
+        "TCP",
+    )
 }
 
 #[tauri::command]
@@ -3856,12 +4219,12 @@ async fn probe_game_routes() -> Result<Vec<RouteProbe>, String> {
             let mut handles = Vec::new();
             for (label, ip, port) in targets {
                 handles.push(scope.spawn(move || {
-                    let (ping_ms, jitter_ms, method) = sample_tcp_route(ip, port);
+                    let (ping_ms, rtt_range_ms, method) = sample_tcp_route(ip, port);
                     RouteProbe {
                         label: label.to_string(),
                         host: ip.to_string(),
                         ping_ms,
-                        jitter_ms,
+                        rtt_range_ms,
                         method: method.to_string(),
                     }
                 }));
@@ -3873,7 +4236,7 @@ async fn probe_game_routes() -> Result<Vec<RouteProbe>, String> {
                         label: String::new(),
                         host: String::new(),
                         ping_ms: 0,
-                        jitter_ms: 0,
+                        rtt_range_ms: None,
                         method: String::new(),
                     })
                 })
@@ -4017,7 +4380,9 @@ ConvertTo-Json -InputObject @($rows.ToArray()) -Compress
                 .power_cycles
                 .filter(|v| v.is_finite() && *v >= 0.0)
                 .map(|v| v.round() as u64),
-            wear: row.wear.filter(|v| v.is_finite() && *v >= 0.0 && *v <= 100.0),
+            wear: row
+                .wear
+                .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 100.0),
             bytes_written: row
                 .bytes_written
                 .filter(|v| v.is_finite() && *v > 0.0)
@@ -4085,10 +4450,33 @@ struct StabilityReport {
     sent: u32,
     received: u32,
     loss_percent: f32,
-    min_ms: u32,
-    avg_ms: f32,
-    max_ms: u32,
-    jitter_ms: f32,
+    min_ms: Option<u32>,
+    avg_ms: Option<f32>,
+    max_ms: Option<u32>,
+    jitter_ms: Option<f32>,
+}
+
+fn summarize_stability(samples: &[u32], sent: u32) -> StabilityReport {
+    let received = samples.len() as u32;
+    let avg_ms = (!samples.is_empty())
+        .then(|| samples.iter().map(|&value| value as f32).sum::<f32>() / received as f32);
+    let jitter_ms = avg_ms.filter(|_| received > 1).map(|avg| {
+        let variance = samples
+            .iter()
+            .map(|&value| (value as f32 - avg).powi(2))
+            .sum::<f32>()
+            / received as f32;
+        variance.sqrt()
+    });
+    StabilityReport {
+        sent,
+        received,
+        loss_percent: ((sent - received) as f32 / sent as f32) * 100.0,
+        min_ms: samples.iter().min().copied(),
+        avg_ms,
+        max_ms: samples.iter().max().copied(),
+        jitter_ms,
+    }
 }
 
 static STABILITY_DONE: AtomicU32 = AtomicU32::new(0);
@@ -4098,7 +4486,10 @@ fn allowed_probe_host(host: &str) -> bool {
 }
 
 fn parse_ping_ms(stdout: &[u8]) -> Option<u32> {
-    let lower: Vec<u8> = stdout.iter().map(|byte| byte.to_ascii_lowercase()).collect();
+    let lower: Vec<u8> = stdout
+        .iter()
+        .map(|byte| byte.to_ascii_lowercase())
+        .collect();
     let ttl = lower.windows(4).position(|window| window == b"ttl=")?;
     if let Some(pos) = lower.windows(5).position(|window| window == b"time=") {
         return Some(read_leading_u32(&lower[pos + 5..]).unwrap_or(1));
@@ -4112,8 +4503,17 @@ fn parse_ping_ms(stdout: &[u8]) -> Option<u32> {
 }
 
 fn read_leading_u32(bytes: &[u8]) -> Option<u32> {
-    let digits: String = bytes.iter().copied().take_while(|byte| byte.is_ascii_digit()).map(char::from).collect();
-    if digits.is_empty() { None } else { digits.parse().ok() }
+    let digits: String = bytes
+        .iter()
+        .copied()
+        .take_while(|byte| byte.is_ascii_digit())
+        .map(char::from)
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
 }
 
 fn ping_once(host: &str) -> Option<u32> {
@@ -4129,16 +4529,23 @@ fn ping_once(host: &str) -> Option<u32> {
 }
 
 #[tauri::command]
-fn get_network_telemetry(
+async fn get_network_telemetry(
     state: State<'_, AppState>,
     selected_adapter_id: Option<String>,
     reset_session: Option<bool>,
 ) -> Result<net_monitor::NetworkTelemetrySnapshot, String> {
-    let mut monitor = state
-        .net_monitor
-        .lock()
-        .map_err(|_| "Монитор сетевых интерфейсов заблокирован".to_string())?;
-    monitor.snapshot(selected_adapter_id.as_deref(), reset_session.unwrap_or(false))
+    let monitor = Arc::clone(&state.net_monitor);
+    tauri::async_runtime::spawn_blocking(move || {
+        monitor
+            .lock()
+            .map_err(|_| "Монитор сетевых интерфейсов заблокирован".to_string())?
+            .snapshot(
+                selected_adapter_id.as_deref(),
+                reset_session.unwrap_or(false),
+            )
+    })
+    .await
+    .map_err(|e| format!("Ошибка потока опроса сетевых интерфейсов: {e}"))?
 }
 
 #[tauri::command]
@@ -4173,39 +4580,7 @@ async fn run_stability_probe(host: String) -> Result<StabilityReport, String> {
             }
             STABILITY_DONE.store(index, Ordering::Relaxed);
         }
-        let received = samples.len() as u32;
-        let loss_percent = ((sent - received) as f32 / sent as f32) * 100.0;
-        if samples.is_empty() {
-            return Ok(StabilityReport {
-                sent,
-                received: 0,
-                loss_percent,
-                min_ms: 0,
-                avg_ms: 0.0,
-                max_ms: 0,
-                jitter_ms: 0.0,
-            });
-        }
-        let min_ms = *samples.iter().min().unwrap_or(&0);
-        let max_ms = *samples.iter().max().unwrap_or(&0);
-        let avg_ms = samples.iter().map(|value| *value as f32).sum::<f32>() / received as f32;
-        let variance = samples
-            .iter()
-            .map(|value| {
-                let delta = *value as f32 - avg_ms;
-                delta * delta
-            })
-            .sum::<f32>()
-            / received as f32;
-        Ok(StabilityReport {
-            sent,
-            received,
-            loss_percent,
-            min_ms,
-            avg_ms,
-            max_ms,
-            jitter_ms: variance.sqrt(),
-        })
+        Ok(summarize_stability(&samples, sent))
     })
     .await
     .map_err(|e| format!("Ошибка потока теста стабильности: {e}"))?
@@ -4239,14 +4614,16 @@ fn build_dns_query_packet(tx_id: u16, domain: &str) -> Vec<u8> {
     pkt
 }
 
-fn is_valid_dns_response(pkt: &[u8], expected_tx_id: u16) -> bool {
-    if pkt.len() < 12 {
+fn is_valid_dns_response(pkt: &[u8], query: &[u8]) -> bool {
+    const HEADER_LEN: usize = 12;
+    if pkt.len() < query.len() {
         return false;
     }
-    let rx_id = u16::from_be_bytes([pkt[0], pkt[1]]);
-    let is_response = pkt[2] & 0x80 != 0;
-    let rcode = pkt[3] & 0x0F;
-    rx_id == expected_tx_id && is_response && rcode == 0
+    pkt[..2] == query[..2]
+        && pkt[2] & 0xFA == 0x80 // Response to QUERY, without truncation
+        && pkt[3] & 0x0F == 0
+        && pkt[4..6] == [0, 1]
+        && pkt[HEADER_LEN..query.len()].eq_ignore_ascii_case(&query[HEADER_LEN..])
 }
 
 pub(crate) fn query_dns_udp_ms(addr: SocketAddr, domain: &str, timeout: Duration) -> Option<u32> {
@@ -4254,7 +4631,11 @@ pub(crate) fn query_dns_udp_ms(addr: SocketAddr, domain: &str, timeout: Duration
     let tx_id = (NEXT_TX_ID.fetch_add(1, Ordering::Relaxed) & 0xFFFF) as u16;
     let packet = build_dns_query_packet(tx_id, domain);
 
-    let bind_addr = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let bind_addr = if addr.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
     let socket = UdpSocket::bind(bind_addr).ok()?;
     let _ = socket.set_read_timeout(Some(timeout));
     let _ = socket.set_write_timeout(Some(timeout));
@@ -4264,7 +4645,7 @@ pub(crate) fn query_dns_udp_ms(addr: SocketAddr, domain: &str, timeout: Duration
     socket.send(&packet).ok()?;
     let mut buf = [0u8; 512];
     let n = socket.recv(&mut buf).ok()?;
-    if !is_valid_dns_response(&buf[..n], tx_id) {
+    if !is_valid_dns_response(&buf[..n], &packet) {
         return None;
     }
     Some(started.elapsed().as_millis().max(1) as u32)
@@ -4284,7 +4665,8 @@ fn time_dns_nslookup(server: Option<&str>) -> Option<u32> {
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout).to_lowercase();
-    if text.contains("timed out") || text.contains("превышен") || !text.contains("google.com") {
+    if text.contains("timed out") || text.contains("превышен") || !text.contains("google.com")
+    {
         return None;
     }
     Some(started.elapsed().as_millis().max(1) as u32)
@@ -4349,10 +4731,13 @@ async fn benchmark_dns() -> Result<Vec<DnsBenchRow>, String> {
 }
 
 #[tauri::command]
-fn get_network_optimizer_status(
+async fn get_network_optimizer_status(
     state: State<'_, AppState>,
 ) -> Result<net_optimizer::NetworkOptimizerStatus, String> {
-    state.net_optimizer.get_status()
+    let optimizer = Arc::clone(&state.net_optimizer);
+    tauri::async_runtime::spawn_blocking(move || optimizer.get_status())
+        .await
+        .map_err(|e| format!("Ошибка потока проверки Network Optimizer: {e}"))?
 }
 
 #[tauri::command]
@@ -4361,8 +4746,11 @@ fn get_packet_priority(state: State<'_, AppState>) -> Result<bool, String> {
 }
 
 #[tauri::command]
-fn set_packet_priority(state: State<'_, AppState>, enabled: bool) -> Result<String, String> {
-    state.net_optimizer.set_packet_priority(enabled)
+async fn set_packet_priority(state: State<'_, AppState>, enabled: bool) -> Result<String, String> {
+    let opt = Arc::clone(&state.net_optimizer);
+    tauri::async_runtime::spawn_blocking(move || opt.set_packet_priority(enabled))
+        .await
+        .map_err(|err| format!("Ошибка потока настройки приоритета пакетов: {err}"))?
 }
 
 #[tauri::command]
@@ -4409,6 +4797,9 @@ fn update_tray_ping(state: &AppState, ping_ms: u32, method: &str) {
 }
 
 fn reveal_main_window(app: &tauri::AppHandle) {
+    app.state::<ShowMainOnReady>()
+        .0
+        .store(false, Ordering::Relaxed);
     if let Some(hud) = app.get_webview_window("tray_hud") {
         let _ = hud.hide();
     }
@@ -4418,6 +4809,16 @@ fn reveal_main_window(app: &tauri::AppHandle) {
             let _ = window.unminimize();
         }
         let _ = window.set_focus();
+        let _ = window.emit_to("main", "aurora-window-visibility", true);
+    }
+}
+
+struct ShowMainOnReady(AtomicBool);
+
+#[tauri::command]
+fn main_window_ready(window: tauri::WebviewWindow, show: State<'_, ShowMainOnReady>) {
+    if window.label() == "main" && show.0.swap(false, Ordering::Relaxed) {
+        reveal_main_window(window.app_handle());
     }
 }
 
@@ -4508,7 +4909,10 @@ fn build_cleanup_specs() -> Vec<CleanupTargetSpec> {
         let base = PathBuf::from(&local_app_data);
         push_chromium_caches(&mut browser_dirs, base.join(r"Google\Chrome\User Data"));
         push_chromium_caches(&mut browser_dirs, base.join(r"Microsoft\Edge\User Data"));
-        push_chromium_caches(&mut browser_dirs, base.join(r"Yandex\YandexBrowser\User Data"));
+        push_chromium_caches(
+            &mut browser_dirs,
+            base.join(r"Yandex\YandexBrowser\User Data"),
+        );
     }
 
     let mut discord_dirs = Vec::new();
@@ -4672,7 +5076,12 @@ fn is_cleanup_file_eligible(category_id: &str, file_path: &Path) -> bool {
 }
 
 // Безопасный рекурсивный подсчёт размера и количества файлов в категории (без перехода по симлинкам)
-fn scan_category_dir_recursive(category_id: &str, dir: &Path, size_acc: &mut u64, count_acc: &mut u64) {
+fn scan_category_dir_recursive(
+    category_id: &str,
+    dir: &Path,
+    size_acc: &mut u64,
+    count_acc: &mut u64,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -4682,7 +5091,9 @@ fn scan_category_dir_recursive(category_id: &str, dir: &Path, size_acc: &mut u64
             continue;
         };
         let path = entry.path();
-        if matches!(category_id, "browser_cache" | "discord_cache") && is_protected_browser_entry(&path) {
+        if matches!(category_id, "browser_cache" | "discord_cache")
+            && is_protected_browser_entry(&path)
+        {
             continue;
         }
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
@@ -4722,7 +5133,9 @@ fn clean_category_dir_recursive(
             continue;
         };
         let path = entry.path();
-        if matches!(category_id, "browser_cache" | "discord_cache") && is_protected_browser_entry(&path) {
+        if matches!(category_id, "browser_cache" | "discord_cache")
+            && is_protected_browser_entry(&path)
+        {
             continue;
         }
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
@@ -4880,8 +5293,18 @@ async fn execute_cleanup(category_ids: Vec<String>) -> Result<CleanupReport, Str
 
 // ===================== Process Explorer =====================
 
+#[derive(Default)]
+struct ProcessNativeCounters {
+    threads: u32,
+    handles: u32,
+    io: Option<Result<process_io::Observation, process_io::Failure>>,
+}
+
 #[cfg(target_os = "windows")]
 mod win_proc_counters {
+    use super::ProcessNativeCounters;
+    use super::process_io::{Failure, Observation};
+    use super::win_process_ffi::{FILETIME, GetLastError, GetProcessTimes, filetime_to_unix_secs};
     use std::collections::HashMap;
     use std::ffi::c_void;
 
@@ -4904,6 +5327,17 @@ mod win_proc_counters {
         szExeFile: [u16; 260],
     }
 
+    #[repr(C)]
+    #[derive(Default)]
+    struct IoCounters {
+        read_operations: u64,
+        write_operations: u64,
+        other_operations: u64,
+        read_bytes: u64,
+        write_bytes: u64,
+        other_bytes: u64,
+    }
+
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn CreateToolhelp32Snapshot(dw_flags: u32, th32_process_id: u32) -> isize;
@@ -4911,10 +5345,35 @@ mod win_proc_counters {
         fn Process32NextW(h_snapshot: isize, lppe: *mut PROCESSENTRY32W) -> i32;
         fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
         fn GetProcessHandleCount(h_process: *mut c_void, pdw_handle_count: *mut u32) -> i32;
+        fn GetProcessIoCounters(h_process: *mut c_void, counters: *mut IoCounters) -> i32;
         fn CloseHandle(handle: *mut c_void) -> i32;
     }
 
-    pub fn collect(pids: &[u32]) -> HashMap<u32, (u32, u32)> {
+    fn read_io(handle: *mut c_void) -> Result<Observation, Failure> {
+        let mut counts = IoCounters::default();
+        let (mut creation, mut exit, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        unsafe {
+            if GetProcessIoCounters(handle, &mut counts) == 0
+                || GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) == 0
+            {
+                return Err(Failure::windows(GetLastError()));
+            }
+        }
+        Ok(Observation {
+            started: filetime_to_unix_secs(creation),
+            creation_ticks: (u64::from(creation.dwHighDateTime) << 32)
+                | u64::from(creation.dwLowDateTime),
+            read_bytes: counts.read_bytes,
+            written_bytes: counts.write_bytes,
+        })
+    }
+
+    pub(super) fn collect(pids: &[u32], with_io: bool) -> HashMap<u32, ProcessNativeCounters> {
         let mut threads_by_pid: HashMap<u32, u32> = HashMap::with_capacity(pids.len());
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -4933,20 +5392,27 @@ mod win_proc_counters {
             }
         }
 
-        let mut out: HashMap<u32, (u32, u32)> = HashMap::with_capacity(pids.len());
+        let mut out = HashMap::with_capacity(pids.len());
         for &pid in pids {
-            let thread_cnt = threads_by_pid.get(&pid).copied().unwrap_or(0);
-            let mut handle_cnt = 0u32;
+            let mut values = ProcessNativeCounters {
+                threads: threads_by_pid.get(&pid).copied().unwrap_or(0),
+                ..Default::default()
+            };
             if pid > 4 {
                 unsafe {
                     let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
                     if !h.is_null() {
-                        let _ = GetProcessHandleCount(h, &mut handle_cnt);
+                        let _ = GetProcessHandleCount(h, &mut values.handles);
+                        if with_io {
+                            values.io = Some(read_io(h));
+                        }
                         CloseHandle(h);
+                    } else if with_io {
+                        values.io = Some(Err(Failure::windows(GetLastError())));
                     }
                 }
             }
-            out.insert(pid, (thread_cnt, handle_cnt));
+            out.insert(pid, values);
         }
         out
     }
@@ -4954,8 +5420,9 @@ mod win_proc_counters {
 
 #[cfg(not(target_os = "windows"))]
 mod win_proc_counters {
+    use super::ProcessNativeCounters;
     use std::collections::HashMap;
-    pub fn collect(_pids: &[u32]) -> HashMap<u32, (u32, u32)> {
+    pub(super) fn collect(_pids: &[u32], _with_io: bool) -> HashMap<u32, ProcessNativeCounters> {
         HashMap::new()
     }
 }
@@ -4970,9 +5437,47 @@ fn process_status_ru(status: sysinfo::ProcessStatus) -> String {
     }
 }
 
-fn is_shell_launcher_parent(parent_name: &str, child_name: &str) -> bool {
-    parent_name.eq_ignore_ascii_case("explorer.exe")
-        && !child_name.eq_ignore_ascii_case("explorer.exe")
+#[cfg(windows)]
+fn process_window_pids() -> HashSet<u32> {
+    use std::ffi::c_void;
+    type Window = *mut c_void;
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumWindows(
+            callback: unsafe extern "system" fn(Window, isize) -> i32,
+            data: isize,
+        ) -> i32;
+        fn IsWindowVisible(window: Window) -> i32;
+        fn GetWindow(window: Window, command: u32) -> Window;
+        fn GetWindowLongW(window: Window, index: i32) -> i32;
+        fn GetWindowThreadProcessId(window: Window, pid: *mut u32) -> u32;
+    }
+    unsafe extern "system" fn collect(window: Window, data: isize) -> i32 {
+        const GW_OWNER: u32 = 4;
+        const GWL_EXSTYLE: i32 = -20;
+        const WS_EX_TOOLWINDOW: i32 = 0x80;
+        unsafe {
+            if IsWindowVisible(window) != 0
+                && GetWindow(window, GW_OWNER).is_null()
+                && GetWindowLongW(window, GWL_EXSTYLE) & WS_EX_TOOLWINDOW == 0
+            {
+                let mut pid = 0;
+                if GetWindowThreadProcessId(window, &mut pid) != 0 && pid > 0 {
+                    (&mut *(data as *mut HashSet<u32>)).insert(pid);
+                }
+            }
+        }
+        1
+    }
+    let mut pids = HashSet::new();
+    // EnumWindows calls the callback synchronously, while the set is alive.
+    unsafe { EnumWindows(collect, &mut pids as *mut _ as isize) };
+    pids
+}
+
+#[cfg(not(windows))]
+fn process_window_pids() -> HashSet<u32> {
+    HashSet::new()
 }
 
 fn compute_process_tree_counts(
@@ -4996,12 +5501,11 @@ fn compute_process_tree_counts(
     let mut pids: Vec<u32> = by_pid.keys().copied().collect();
     pids.sort_unstable();
 
-    let mut real_parent_of: HashMap<u32, u32> = HashMap::with_capacity(by_pid.len());
     let mut tree_parent_of: HashMap<u32, u32> = HashMap::with_capacity(by_pid.len());
     let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
 
     for &pid in &pids {
-        let Some(&(ppid_opt, child_start, child_name)) = by_pid.get(&pid) else {
+        let Some(&(ppid_opt, child_start, _)) = by_pid.get(&pid) else {
             continue;
         };
         let Some(ppid) = ppid_opt else {
@@ -5010,17 +5514,11 @@ fn compute_process_tree_counts(
         if ppid == 0 || ppid == pid {
             continue;
         }
-        let Some(&(_, parent_start, parent_name)) = by_pid.get(&ppid) else {
+        let Some(&(_, parent_start, _)) = by_pid.get(&ppid) else {
             continue;
         };
         // Защита от переиспользования PID: родитель не мог стартовать позже дочернего процесса
         if parent_start != 0 && child_start != 0 && parent_start > child_start {
-            continue;
-        }
-        real_parent_of.insert(pid, ppid);
-        // Обычные приложения, запущенные пользователем из оболочки explorer.exe,
-        // отображаются как самостоятельные корни, как в System Informer
-        if is_shell_launcher_parent(parent_name, child_name) {
             continue;
         }
         // Проверка на циклы по уже принятой цепи предков
@@ -5042,7 +5540,7 @@ fn compute_process_tree_counts(
         children_of.entry(ppid).or_default().push(pid);
     }
 
-    let validated_real_parent = real_parent_of.get(&target_pid).copied();
+    let validated_real_parent = tree_parent_of.get(&target_pid).copied();
     let direct_children = children_of.get(&target_pid).map(|v| v.len()).unwrap_or(0);
 
     let mut total_descendants = 0usize;
@@ -5066,68 +5564,79 @@ fn compute_process_tree_counts(
 
 #[tauri::command]
 async fn get_process_list(state: State<'_, AppState>) -> Result<Vec<ProcessItem>, String> {
-    let last_refresh_arc = Arc::clone(&state.process_last_refresh);
+    let io_sample = Arc::clone(&state.process_io_sample);
     let sys_arc = Arc::clone(&state.sys);
     let pid_cache_arc = Arc::clone(&state.pid_cache);
     let icon_cache_arc = Arc::clone(&state.icon_cache);
 
     tauri::async_runtime::spawn_blocking(move || {
-        // Интервал с прошлого опроса нужен для пересчёта дельты дискового I/O в байт/сек
-        let elapsed_secs = {
-            let mut guard = last_refresh_arc
-                .lock()
-                .map_err(|_| "Состояние процессов заблокировано".to_string())?;
-            let now = Instant::now();
-            let secs = guard
-                .map(|prev| now.duration_since(prev).as_secs_f64())
-                .unwrap_or(1.0)
-                .max(0.25);
-            *guard = Some(now);
-            secs
-        };
-
         let mut list: Vec<ProcessItem> = {
             let mut sys = sys_arc
                 .lock()
                 .map_err(|_| "Системный монитор заблокирован".to_string())?;
 
-            sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            sys.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::All,
+                true,
+                sysinfo::ProcessRefreshKind::nothing()
+                    .with_memory()
+                    .with_cpu()
+                    .with_exe(sysinfo::UpdateKind::OnlyIfNotSet),
+            );
             let cpu_count = sys.cpus().len().max(1) as f32;
 
             sys.processes()
                 .values()
                 .filter(|p| p.pid().as_u32() != 0)
-                .map(|p| {
-                    let disk = p.disk_usage();
-                    ProcessItem {
-                        pid: p.pid().as_u32(),
-                        parent_pid: p.parent().map(|pp| pp.as_u32()),
-                        name: p.name().to_string_lossy().to_string(),
-                        exe_path: p
-                            .exe()
-                            .map(|e| e.to_string_lossy().to_string())
-                            .unwrap_or_default(),
-                        cpu_usage: (p.cpu_usage() / cpu_count).clamp(0.0, 100.0),
-                        memory_mb: p.memory() as f64 / 1024.0 / 1024.0,
-                        disk_read_bytes_sec: (disk.read_bytes as f64 / elapsed_secs) as u64,
-                        disk_write_bytes_sec: (disk.written_bytes as f64 / elapsed_secs) as u64,
-                        run_time_sec: p.run_time(),
-                        start_time: p.start_time(),
-                        thread_count: 0,
-                        handle_count: 0,
-                        status: process_status_ru(p.status()),
-                        icon_base64: None,
-                    }
+                .map(|p| ProcessItem {
+                    has_main_window: false,
+                    pid: p.pid().as_u32(),
+                    parent_pid: p.parent().map(|pp| pp.as_u32()),
+                    name: p.name().to_string_lossy().to_string(),
+                    exe_path: p
+                        .exe()
+                        .map(|e| e.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                    cpu_usage: (p.cpu_usage() / cpu_count).clamp(0.0, 100.0),
+                    memory_mb: p.memory() as f64 / 1024.0 / 1024.0,
+                    disk_read_bytes_sec: 0.0,
+                    disk_write_bytes_sec: 0.0,
+                    disk_status: process_io::Status::Unavailable,
+                    disk_error_code: None,
+                    run_time_sec: p.run_time(),
+                    start_time: p.start_time(),
+                    thread_count: 0,
+                    handle_count: 0,
+                    status: process_status_ru(p.status()),
+                    icon_base64: None,
                 })
                 .collect()
         };
 
         let all_pids: Vec<u32> = list.iter().map(|item| item.pid).collect();
-        let counters = win_proc_counters::collect(&all_pids);
-        for item in &mut list {
-            if let Some(&(threads, handles)) = counters.get(&item.pid) {
-                item.thread_count = threads;
-                item.handle_count = handles;
+        let visible_windows = process_window_pids();
+        {
+            let mut previous = io_sample
+                .lock()
+                .map_err(|_| "Состояние процессов заблокировано".to_string())?;
+            let at = Instant::now();
+            let counters = win_proc_counters::collect(&all_pids, true);
+            let live: HashMap<_, _> = list
+                .iter()
+                .map(|item| (item.pid, item.start_time))
+                .collect();
+            previous.retain(|pid, started| live.get(&pid) == Some(&started));
+            for item in &mut list {
+                item.has_main_window = visible_windows.contains(&item.pid);
+                if let Some(counters) = counters.get(&item.pid) {
+                    item.thread_count = counters.threads;
+                    item.handle_count = counters.handles;
+                    let rates = previous.measure(item.pid, item.start_time, counters.io, at);
+                    item.disk_read_bytes_sec = rates.read;
+                    item.disk_write_bytes_sec = rates.written;
+                    item.disk_status = rates.status;
+                    item.disk_error_code = rates.code;
+                }
             }
         }
 
@@ -5151,9 +5660,127 @@ async fn get_process_list(state: State<'_, AppState>) -> Result<Vec<ProcessItem>
 }
 
 #[tauri::command]
-fn get_process_details(state: State<'_, AppState>, pid: u32) -> Result<ProcessDetails, String> {
-    let sys = state
-        .sys
+async fn get_process_labels(
+    state: State<'_, AppState>,
+    targets: Vec<ProcessTargetIdentity>,
+) -> Result<Vec<process_labels::ProcessLabels>, String> {
+    if targets.len() > 128 {
+        return Err("Слишком много процессов в запросе".into());
+    }
+    let system = Arc::clone(&state.sys);
+    tauri::async_runtime::spawn_blocking(move || {
+        let inputs: Vec<_> = {
+            let system = system.lock().map_err(|e| e.to_string())?;
+            targets
+                .iter()
+                .map(|target| {
+                    let process = system.process(sysinfo::Pid::from_u32(target.pid))?;
+                    (target.start_time != 0
+                        && process.start_time() == target.start_time
+                        && process
+                            .name()
+                            .to_string_lossy()
+                            .eq_ignore_ascii_case(&target.name))
+                    .then(|| {
+                        (
+                            target.pid,
+                            target.start_time,
+                            process.exe().map(Path::to_path_buf),
+                        )
+                    })
+                })
+                .collect()
+        };
+        Ok(inputs
+            .into_iter()
+            .map(|input| {
+                #[cfg(windows)]
+                if let Some((pid, start_time, path)) = input {
+                    return process_labels::ProcessLabels {
+                        owner: process_labels::windows_labels::owner(pid, start_time),
+                        description: path
+                            .as_deref()
+                            .and_then(process_labels::windows_labels::description),
+                    };
+                }
+                #[cfg(not(windows))]
+                let _ = input;
+                process_labels::ProcessLabels::default()
+            })
+            .collect())
+    })
+    .await
+    .map_err(|e| format!("Не удалось прочитать сведения о процессах: {e}"))?
+}
+
+#[tauri::command]
+async fn get_process_details(
+    state: State<'_, AppState>,
+    target: ProcessTargetIdentity,
+) -> Result<ProcessDetails, String> {
+    let system = Arc::clone(&state.sys);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut details = read_process_details(&system, &target)?;
+        let counters = win_proc_counters::collect(&[target.pid], false);
+        if let Some(counters) = counters.get(&target.pid) {
+            details.thread_count = counters.threads;
+            details.handle_count = counters.handles;
+        }
+        Ok(details)
+    })
+    .await
+    .map_err(|err| format!("Ошибка потока чтения свойств процесса: {err}"))?
+}
+
+fn matches_details_target(
+    target: &ProcessTargetIdentity,
+    start_time: u64,
+    name: &str,
+    path: &str,
+) -> bool {
+    target.start_time == start_time
+        && target.name.eq_ignore_ascii_case(name)
+        && target
+            .exe_path
+            .as_deref()
+            .is_none_or(|expected| expected.eq_ignore_ascii_case(path))
+}
+
+#[cfg(test)]
+#[test]
+fn process_details_reject_reused_pids_and_mismatched_executables() {
+    let target = ProcessTargetIdentity {
+        pid: 12_345,
+        name: "worker.exe".into(),
+        start_time: 1000,
+        exe_path: Some(r"C:\Apps\worker.exe".into()),
+    };
+    assert!(matches_details_target(
+        &target,
+        1000,
+        "Worker.exe",
+        r"C:\apps\WORKER.EXE"
+    ));
+    assert!(!matches_details_target(
+        &target,
+        1001,
+        "worker.exe",
+        r"C:\Apps\worker.exe"
+    ));
+    assert!(!matches_details_target(
+        &target,
+        1000,
+        "worker.exe",
+        r"C:\Other\worker.exe"
+    ));
+}
+
+fn read_process_details(
+    system: &Mutex<System>,
+    target: &ProcessTargetIdentity,
+) -> Result<ProcessDetails, String> {
+    let pid = target.pid;
+    let sys = system
         .lock()
         .map_err(|_| "Системный монитор заблокирован".to_string())?;
     let key = sysinfo::Pid::from_u32(pid);
@@ -5161,6 +5788,14 @@ fn get_process_details(state: State<'_, AppState>, pid: u32) -> Result<ProcessDe
         .processes()
         .get(&key)
         .ok_or_else(|| format!("Процесс PID {pid} уже завершён или не найден"))?;
+    let name = proc_ref.name().to_string_lossy().into_owned();
+    let exe_path = proc_ref
+        .exe()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if !matches_details_target(target, proc_ref.start_time(), &name, &exe_path) {
+        return Err(format!("PID {pid} теперь принадлежит другому процессу"));
+    }
     let cpu_count = sys.cpus().len().max(1) as f32;
 
     let tree_snapshot: Vec<(u32, Option<u32>, u64, String)> = sys
@@ -5189,18 +5824,12 @@ fn get_process_details(state: State<'_, AppState>, pid: u32) -> Result<ProcessDe
         .collect::<Vec<_>>()
         .join(" ");
 
-    let counters = win_proc_counters::collect(&[pid]);
-    let (thread_count, handle_count) = counters.get(&pid).copied().unwrap_or((0, 0));
-
     Ok(ProcessDetails {
         pid,
         parent_pid,
         parent_name,
-        name: proc_ref.name().to_string_lossy().to_string(),
-        exe_path: proc_ref
-            .exe()
-            .map(|e| e.to_string_lossy().to_string())
-            .unwrap_or_default(),
+        name,
+        exe_path,
         command_line,
         working_dir: proc_ref
             .cwd()
@@ -5212,8 +5841,8 @@ fn get_process_details(state: State<'_, AppState>, pid: u32) -> Result<ProcessDe
         virtual_memory_mb: proc_ref.virtual_memory() as f64 / 1024.0 / 1024.0,
         run_time_sec: proc_ref.run_time(),
         start_time: proc_ref.start_time(),
-        thread_count,
-        handle_count,
+        thread_count: 0,
+        handle_count: 0,
         child_count,
         total_descendants,
     })
@@ -5503,6 +6132,8 @@ const PROTECTED_PROCESS_STEMS: &[&str] = &[
     "explorer",
     "nexus",
     "nexus-hwmon",
+    "aurora",
+    "aurora-hwmon",
 ];
 
 fn normalize_process_stem(raw: &str) -> String {
@@ -5529,10 +6160,10 @@ fn check_process_not_protected(
         return Err("Системный процесс ядра Windows защищён от изменения".to_string());
     }
     if pid == std::process::id() {
-        return Err("Нельзя применить действие к самому NEXUS PC".to_string());
+        return Err("Нельзя применить действие к самой AURORA".to_string());
     }
     if sidecar_pid == Some(pid) {
-        return Err("Системный сервис телеметрии NEXUS защищён от изменения".to_string());
+        return Err("Системный сервис телеметрии AURORA защищён от изменения".to_string());
     }
 
     let stem_from_name = normalize_process_stem(name);
@@ -5671,7 +6302,7 @@ fn open_and_verify_process_target(
             return Err(format!("Процесс PID {} уже завершён", target.pid));
         }
         return Err(format!(
-            "Нет доступа к процессу {} (PID {}, Win32 код {}). Запустите NEXUS PC от имени Администратора",
+            "Нет доступа к процессу {} (PID {}, Win32 код {}). Запустите AURORA от имени Администратора",
             target.name, target.pid, err
         ));
     }
@@ -5794,7 +6425,7 @@ fn validate_tree_kill_batch(
         ));
     }
 
-    // Восстанавливаем отображаемое дерево NEXUS (исключая независимые приложения, запущенные через explorer.exe)
+    // Validate against real PPIDs; the display mode does not participate in mutations.
     let mut pids: Vec<u32> = by_pid.keys().copied().collect();
     pids.sort_unstable();
     let mut tree_parent_of: HashMap<u32, u32> = HashMap::with_capacity(by_pid.len());
@@ -5817,9 +6448,6 @@ fn validate_tree_kill_batch(
             && proc_snap.start_time != 0
             && parent_snap.start_time > proc_snap.start_time
         {
-            continue;
-        }
-        if is_shell_launcher_parent(&parent_snap.name, &proc_snap.name) {
             continue;
         }
         let mut creates_cycle = false;
@@ -5848,7 +6476,7 @@ fn validate_tree_kill_batch(
         }
         if let Some(live_node) = by_pid.get(&curr) {
             if curr == self_pid {
-                return Err("Ветка содержит процесс NEXUS PC — завершение заблокировано".to_string());
+                return Err("Ветка содержит процесс AURORA — завершение заблокировано".to_string());
             }
             check_process_not_protected(
                 live_node.pid,
@@ -5871,14 +6499,9 @@ fn validate_tree_kill_batch(
             continue;
         }
         if item.pid == self_pid {
-            return Err("Нельзя завершить сам NEXUS PC через дерево процессов".to_string());
+            return Err("Нельзя завершить AURORA через дерево процессов".to_string());
         }
-        check_process_not_protected(
-            item.pid,
-            &item.name,
-            item.exe_path.as_deref(),
-            sidecar_pid,
-        )?;
+        check_process_not_protected(item.pid, &item.name, item.exe_path.as_deref(), sidecar_pid)?;
         if item.pid == root_target.pid {
             root_included = true;
         }
@@ -5929,8 +6552,7 @@ fn kill_process(
         use win_process_ffi::*;
 
         if !tree {
-            let handle =
-                open_and_verify_process_target(&target, PROCESS_TERMINATE, sidecar_pid)?;
+            let handle = open_and_verify_process_target(&target, PROCESS_TERMINATE, sidecar_pid)?;
             let ok = unsafe { TerminateProcess(handle.0, 1) };
             if ok != 0 {
                 return Ok(());
@@ -5943,8 +6565,7 @@ fn kill_process(
         }
 
         let batch = targets.ok_or_else(|| {
-            "Для завершения ветки процессов необходим явно подтверждённый список целей"
-                .to_string()
+            "Для завершения ветки процессов необходим явно подтверждённый список целей".to_string()
         })?;
 
         let snapshot: Vec<LiveProcSnap> = {
@@ -5969,13 +6590,8 @@ fn kill_process(
                 .collect()
         };
 
-        let validated_targets = validate_tree_kill_batch(
-            &target,
-            &batch,
-            &snapshot,
-            std::process::id(),
-            sidecar_pid,
-        )?;
+        let validated_targets =
+            validate_tree_kill_batch(&target, &batch, &snapshot, std::process::id(), sidecar_pid)?;
 
         let mut handles: Vec<(ProcessTargetIdentity, ScopedHandle)> =
             Vec::with_capacity(validated_targets.len());
@@ -6067,7 +6683,11 @@ fn suspend_process(
         if status < 0 {
             return Err(format!(
                 "{} завершился с NTSTATUS 0x{:08X}",
-                if suspend { "NtSuspendProcess" } else { "NtResumeProcess" },
+                if suspend {
+                    "NtSuspendProcess"
+                } else {
+                    "NtResumeProcess"
+                },
                 status as u32
             ));
         }
@@ -6083,10 +6703,7 @@ fn suspend_process(
 }
 
 #[tauri::command]
-fn resume_process(
-    state: State<'_, AppState>,
-    target: ProcessTargetIdentity,
-) -> Result<(), String> {
+fn resume_process(state: State<'_, AppState>, target: ProcessTargetIdentity) -> Result<(), String> {
     suspend_process(state, target, false)
 }
 
@@ -6164,7 +6781,10 @@ fn query_iphlp_table(mut call: impl FnMut(*mut u8, *mut u32) -> u32) -> Result<V
             size = needed;
             continue;
         }
-        return Err(format!("Не удалось прочитать таблицу сокетов (код {})", code));
+        return Err(format!(
+            "Не удалось прочитать таблицу сокетов (код {})",
+            code
+        ));
     }
     Err("Не удалось выделить буфер таблицы сокетов".to_string())
 }
@@ -6205,12 +6825,24 @@ fn collect_socket_rows() -> Result<Vec<(String, String, String, String, u32)>, S
         let count = read_u32(&tcp4, 0).unwrap_or(0) as usize;
         for index in 0..count {
             let offset = 4 + index * 24;
-            let Some(state) = read_u32(&tcp4, offset) else { break };
-            let Some(local_addr) = read_u32(&tcp4, offset + 4) else { break };
-            let Some(local_port) = read_u32(&tcp4, offset + 8) else { break };
-            let Some(remote_addr) = read_u32(&tcp4, offset + 12) else { break };
-            let Some(remote_port) = read_u32(&tcp4, offset + 16) else { break };
-            let Some(pid) = read_u32(&tcp4, offset + 20) else { break };
+            let Some(state) = read_u32(&tcp4, offset) else {
+                break;
+            };
+            let Some(local_addr) = read_u32(&tcp4, offset + 4) else {
+                break;
+            };
+            let Some(local_port) = read_u32(&tcp4, offset + 8) else {
+                break;
+            };
+            let Some(remote_addr) = read_u32(&tcp4, offset + 12) else {
+                break;
+            };
+            let Some(remote_port) = read_u32(&tcp4, offset + 16) else {
+                break;
+            };
+            let Some(pid) = read_u32(&tcp4, offset + 20) else {
+                break;
+            };
             let local_ip = ipv4_from_dword(local_addr);
             let remote_ip = ipv4_from_dword(remote_addr);
             rows.push((
@@ -6258,12 +6890,22 @@ fn collect_socket_rows() -> Result<Vec<(String, String, String, String, u32)>, S
         let count = read_u32(&udp4, 0).unwrap_or(0) as usize;
         for index in 0..count {
             let offset = 4 + index * 12;
-            let Some(local_addr) = read_u32(&udp4, offset) else { break };
-            let Some(local_port) = read_u32(&udp4, offset + 4) else { break };
-            let Some(pid) = read_u32(&udp4, offset + 8) else { break };
+            let Some(local_addr) = read_u32(&udp4, offset) else {
+                break;
+            };
+            let Some(local_port) = read_u32(&udp4, offset + 4) else {
+                break;
+            };
+            let Some(pid) = read_u32(&udp4, offset + 8) else {
+                break;
+            };
             rows.push((
                 "UDP".to_string(),
-                format_socket(&ipv4_from_dword(local_addr), port_from_net_dword(local_port), false),
+                format_socket(
+                    &ipv4_from_dword(local_addr),
+                    port_from_net_dword(local_port),
+                    false,
+                ),
                 "*:*".to_string(),
                 "—".to_string(),
                 pid,
@@ -6322,7 +6964,9 @@ fn get_drop_session(state: State<'_, AppState>) -> Result<drop_server::DropSessi
 }
 
 #[tauri::command]
-fn get_drop_history(state: State<'_, AppState>) -> Result<Vec<drop_server::DroppedFileItem>, String> {
+fn get_drop_history(
+    state: State<'_, AppState>,
+) -> Result<Vec<drop_server::DroppedFileItem>, String> {
     Ok(state.drop_hub.history())
 }
 
@@ -6347,7 +6991,17 @@ fn save_settings(settings: settings::NexusSettings) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_event_log() -> Vec<settings::NexusEvent> {
+fn get_windows_autostart() -> Result<settings::AutostartStatus, String> {
+    settings::get_windows_autostart()
+}
+
+#[tauri::command]
+fn set_windows_autostart(enabled: bool) -> Result<settings::AutostartStatus, String> {
+    settings::set_windows_autostart(enabled)
+}
+
+#[tauri::command]
+fn get_event_log() -> Result<Vec<settings::NexusEvent>, String> {
     settings::get_event_log()
 }
 
@@ -6357,12 +7011,18 @@ fn clear_event_log() -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_telemetry_history(state: State<'_, AppState>, minutes: u32) -> Vec<telemetry::TelemetrySnapshot> {
+fn get_telemetry_history(
+    state: State<'_, AppState>,
+    minutes: u32,
+) -> Vec<telemetry::TelemetrySnapshot> {
     telemetry::history_since(&state.history_buffer, minutes)
 }
 
 #[tauri::command]
-fn get_diagnostics_verdict(state: State<'_, AppState>, minutes: u32) -> telemetry::DiagnosticsReport {
+fn get_diagnostics_verdict(
+    state: State<'_, AppState>,
+    minutes: u32,
+) -> telemetry::DiagnosticsReport {
     telemetry::diagnose(&state.history_buffer, minutes)
 }
 
@@ -6382,7 +7042,11 @@ fn query_pid_name_and_exe(pid: u32) -> Option<(String, String)> {
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut std::ffi::c_void;
+        fn OpenProcess(
+            desired_access: u32,
+            inherit_handle: i32,
+            process_id: u32,
+        ) -> *mut std::ffi::c_void;
         fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
         fn QueryFullProcessImageNameW(
             process: *mut std::ffi::c_void,
@@ -6421,7 +7085,9 @@ fn query_pid_name_and_exe(_pid: u32) -> Option<(String, String)> {
 }
 
 #[tauri::command]
-async fn get_network_connections(state: State<'_, AppState>) -> Result<Vec<NetworkConnection>, String> {
+async fn get_network_connections(
+    state: State<'_, AppState>,
+) -> Result<Vec<NetworkConnection>, String> {
     let pid_cache_arc = Arc::clone(&state.pid_cache);
     let sys_arc = Arc::clone(&state.sys);
     let icon_cache_arc = Arc::clone(&state.icon_cache);
@@ -6510,8 +7176,7 @@ fn hwnd_to_isize<T: Copy>(hwnd: T) -> isize {
 fn apply_dwm_rounded_corners(hwnd: isize) {
     #[link(name = "dwmapi")]
     unsafe extern "system" {
-        fn DwmSetWindowAttribute(hwnd: isize, attribute: u32, value: *const u32, size: u32)
-            -> i32;
+        fn DwmSetWindowAttribute(hwnd: isize, attribute: u32, value: *const u32, size: u32) -> i32;
     }
 
     const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
@@ -6550,6 +7215,7 @@ fn start_background_services(
             hw_telemetry,
             Arc::clone(&hw_sidecar_child),
             hwmon_watchdog,
+            0,
         );
         if let Ok(mut guard) = sys.lock() {
             guard.refresh_cpu_usage();
@@ -6595,6 +7261,12 @@ fn start_background_services(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     settings::init_settings();
+    let startup_settings = settings::load_settings();
+    let start_in_tray = settings::should_start_in_tray(
+        startup_settings.start_minimized,
+        std::env::args_os().skip(1),
+    );
+
     let sys = Arc::new(Mutex::new(System::new()));
     let networks = Arc::new(Mutex::new(Networks::new()));
     let networks_last_refresh = Arc::new(Mutex::new(None));
@@ -6606,10 +7278,7 @@ pub fn run() {
     let power_timer = Arc::new(power_manager::PowerTimerManager::new());
     let net_optimizer = Arc::new(net_optimizer::NetworkOptimizerManager::new());
     let history_buffer = Arc::new(RwLock::new(VecDeque::new()));
-    telemetry::start_sampler(
-        Arc::clone(&hw_telemetry),
-        Arc::clone(&history_buffer),
-    );
+    telemetry::start_sampler(Arc::clone(&hw_telemetry), Arc::clone(&history_buffer));
 
     start_background_services(
         Arc::clone(&sys),
@@ -6622,13 +7291,14 @@ pub fn run() {
     );
 
     tauri::Builder::default()
+        .manage(ShowMainOnReady(AtomicBool::new(!start_in_tray)))
         .manage(AppState {
             sys,
             networks,
             networks_last_refresh,
             disk_space,
-            ping_cache: Arc::new(Mutex::new((0, String::new(), None, false))),
-            process_last_refresh: Arc::new(Mutex::new(None)),
+            ping_cache: Arc::new(Mutex::new(ExternalPingCache::default())),
+            process_io_sample: Arc::new(Mutex::new(process_io::History::default())),
             pid_cache: Arc::new(Mutex::new(HashMap::new())),
             hw_telemetry,
             hw_sidecar_child,
@@ -6644,31 +7314,25 @@ pub fn run() {
             net_monitor: Arc::new(Mutex::new(net_monitor::NetworkMonitorState::new())),
         })
         .setup(|app| {
-            let launched_from_autostart = std::env::args()
-                .any(|arg| matches!(arg.as_str(), "--autostart" | "--minimized"));
-            let start_minimized =
-                launched_from_autostart && settings::load_settings().start_minimized;
-
-            if let Some(window) = app.get_webview_window("main") {
-                #[cfg(target_os = "windows")]
-                if let Ok(hwnd) = window.hwnd() {
-                    apply_dwm_rounded_corners(hwnd_to_isize(hwnd));
-                }
-                if start_minimized {
-                    let _ = window.hide();
-                } else {
-                    let _ = window.unminimize();
-                    let _ = window.center();
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
+            #[cfg(target_os = "windows")]
+            if let Some(window) = app.get_webview_window("main")
+                && let Ok(hwnd) = window.hwnd()
+            {
+                apply_dwm_rounded_corners(hwnd_to_isize(hwnd));
             }
 
-            let ping_item = tauri::menu::MenuItem::with_id(app, "ping", "Ping: —", false, None::<&str>)?;
-            let title_item = tauri::menu::MenuItem::with_id(app, "title", "NEXUS PC", false, None::<&str>)?;
-            let show_item = tauri::menu::MenuItem::with_id(app, "show", "Открыть NEXUS", true, None::<&str>)?;
-            let quit_item = tauri::menu::MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
-            let menu = tauri::menu::Menu::with_items(app, &[&title_item, &ping_item, &show_item, &quit_item])?;
+            let ping_item =
+                tauri::menu::MenuItem::with_id(app, "ping", "Ping: —", false, None::<&str>)?;
+            let title_item =
+                tauri::menu::MenuItem::with_id(app, "title", "AURORA", false, None::<&str>)?;
+            let show_item =
+                tauri::menu::MenuItem::with_id(app, "show", "Открыть AURORA", true, None::<&str>)?;
+            let quit_item =
+                tauri::menu::MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
+            let menu = tauri::menu::Menu::with_items(
+                app,
+                &[&title_item, &ping_item, &show_item, &quit_item],
+            )?;
             if let Some(state) = app.try_state::<AppState>() {
                 if let Ok(mut slot) = state.tray_ping_item.lock() {
                     *slot = Some(ping_item);
@@ -6677,7 +7341,7 @@ pub fn run() {
             if let Some(icon) = app.default_window_icon() {
                 let _tray = tauri::tray::TrayIconBuilder::with_id("nexus")
                     .icon(icon.clone())
-                    .tooltip("NEXUS PC")
+                    .tooltip("AURORA")
                     .menu(&menu)
                     .show_menu_on_left_click(false)
                     .on_menu_event(|app, event| match event.id.as_ref() {
@@ -6713,7 +7377,9 @@ pub fn run() {
                         let _ = hud.hide();
                     }
                 }
-                let _ = window.hide();
+                if window.hide().is_ok() && window.label() == "main" {
+                    let _ = window.emit_to("main", "aurora-window-visibility", false);
+                }
             }
             tauri::WindowEvent::Destroyed => {
                 if window.label() == "main" {
@@ -6724,6 +7390,7 @@ pub fn run() {
             _ => {}
         })
         .invoke_handler(tauri::generate_handler![
+            main_window_ready,
             get_system_metrics,
             get_power_timer_state,
             schedule_power_timer,
@@ -6738,6 +7405,8 @@ pub fn run() {
             get_available_drives,
             scan_storage,
             scan_drive_storage,
+            get_storage_directory,
+            locate_storage_file,
             cancel_storage_scan,
             get_hardware_telemetry,
             get_hwmon_status,
@@ -6759,6 +7428,7 @@ pub fn run() {
             execute_cleanup,
             get_process_list,
             get_process_details,
+            get_process_labels,
             kill_process,
             suspend_process,
             resume_process,
@@ -6773,6 +7443,8 @@ pub fn run() {
             open_drop_folder,
             get_settings,
             save_settings,
+            get_windows_autostart,
+            set_windows_autostart,
             get_event_log,
             clear_event_log,
             get_telemetry_history,
@@ -6786,6 +7458,7 @@ pub fn run() {
             scripts::save_user_script,
             scripts::delete_user_script,
             scripts::run_user_script,
+            scripts::run_user_script_details,
             archive::archive_get_capabilities,
             archive::archive_get_progress,
             archive::archive_cancel,
@@ -6807,18 +7480,57 @@ mod tests {
         let resolved = find_hwmon_sidecar_exe().expect("nexus-hwmon.exe should be found");
         println!("Resolved sidecar path: {:?}", resolved);
         assert!(resolved.is_absolute(), "Sidecar path must be absolute");
-        assert!(resolved.is_file(), "Resolved sidecar path must point to a file");
+        assert!(
+            resolved.is_file(),
+            "Resolved sidecar path must point to a file"
+        );
         let text = resolved.to_string_lossy();
-        assert!(!text.starts_with(r"\\?\"), "Path should not have verbatim UNC prefix");
-        let parent = resolved.parent().expect("Sidecar must have parent directory");
-        assert!(parent.is_dir(), "Sidecar parent must be an existing directory");
+        assert!(
+            !text.starts_with(r"\\?\"),
+            "Path should not have verbatim UNC prefix"
+        );
+        let parent = resolved
+            .parent()
+            .expect("Sidecar must have parent directory");
+        assert!(
+            parent.is_dir(),
+            "Sidecar parent must be an existing directory"
+        );
     }
 
     #[test]
     fn storage_temp_fallback_includes_nvme_smart_temperatures() {
+        let mock_lhm = vec![StorageTempItem {
+            name: "Samsung SSD 980 PRO".to_string(),
+            temp_c: None,
+            used_percent: None,
+        }];
+        let mock_smart = vec![storage_smart::SmartDiskMetrics {
+            device_id: Some(0),
+            serial_number: "SN-980".to_string(),
+            model: "Samsung SSD 980 PRO".to_string(),
+            firmware: "5B2Q".to_string(),
+            kind: "NVMe M.2".to_string(),
+            health_percent: Some(99),
+            health_label: "Отличное".to_string(),
+            available_spare: Some(100),
+            power_on_hours: Some(500),
+            power_cycles: Some(50),
+            temp_c: Some(42),
+            tbw_tb: Some(5.0),
+            read_tb: Some(6.0),
+        }];
+        let merged = merge_lhm_storage_items(&mock_lhm, &mock_smart, Some(64.5));
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].temp_c, Some(42.0));
+        assert_eq!(merged[0].used_percent, Some(64.5));
+
         let items = build_storage_temp_items(&[]);
         println!("Storage temp items: {:#?}", items);
-        assert!(!items.is_empty(), "Expected at least one storage item");
+        assert!(
+            !items.is_empty(),
+            "Expected at least one volume or storage item"
+        );
     }
 
     #[test]
@@ -6843,12 +7555,11 @@ mod tests {
             (3001, Some(1001), 50, "old.exe".to_string()),
         ];
 
-        // explorer.exe считает прямыми потомками в дереве только собственные дочерние explorer.exe,
-        // а chrome.exe / Antigravity.exe не раздувают дерево explorer.exe
+        // The system branch includes apps directly launched by Explorer.
         let (exp_parent, exp_direct, exp_total) = compute_process_tree_counts(&procs, 6704);
         assert_eq!(exp_parent, None);
-        assert_eq!(exp_direct, 1);
-        assert_eq!(exp_total, 1);
+        assert_eq!(exp_direct, 3);
+        assert_eq!(exp_total, 6);
 
         // chrome.exe сохраняет свой настоящий parent_pid (6704) и своё поддерево (2)
         let (chr_parent, chr_direct, chr_total) = compute_process_tree_counts(&procs, 25936);
@@ -6988,14 +7699,20 @@ mod tests {
             );
             if let Some(p) = sys.process(Pid::from_u32(pid)) {
                 observed_start_time = p.start_time();
-                observed_exe_path = p.exe().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
+                observed_exe_path = p
+                    .exe()
+                    .map(|e| e.to_string_lossy().to_string())
+                    .unwrap_or_default();
                 if observed_start_time > 0 {
                     break;
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        assert!(observed_start_time > 0, "Child start_time must be readable via sysinfo");
+        assert!(
+            observed_start_time > 0,
+            "Child start_time must be readable via sysinfo"
+        );
 
         // Mismatched start_time -> rejected (simulates PID reuse)
         let wrong_time = ProcessTargetIdentity {
@@ -7005,12 +7722,8 @@ mod tests {
             exe_path: Some(observed_exe_path.clone()),
         };
         assert!(
-            open_and_verify_process_target(
-                &wrong_time,
-                win_process_ffi::PROCESS_TERMINATE,
-                None
-            )
-            .is_err(),
+            open_and_verify_process_target(&wrong_time, win_process_ffi::PROCESS_TERMINATE, None)
+                .is_err(),
             "Mismatched start_time must fail anti-PID-reuse verification"
         );
 
@@ -7022,12 +7735,8 @@ mod tests {
             exe_path: None,
         };
         assert!(
-            open_and_verify_process_target(
-                &zero_time,
-                win_process_ffi::PROCESS_TERMINATE,
-                None
-            )
-            .is_err(),
+            open_and_verify_process_target(&zero_time, win_process_ffi::PROCESS_TERMINATE, None)
+                .is_err(),
             "Zero start_time must fail anti-PID-reuse verification"
         );
 
@@ -7039,12 +7748,8 @@ mod tests {
             exe_path: Some(observed_exe_path.clone()),
         };
         assert!(
-            open_and_verify_process_target(
-                &wrong_name,
-                win_process_ffi::PROCESS_TERMINATE,
-                None
-            )
-            .is_err(),
+            open_and_verify_process_target(&wrong_name, win_process_ffi::PROCESS_TERMINATE, None)
+                .is_err(),
             "Mismatched process name must fail verification"
         );
 
@@ -7056,12 +7761,8 @@ mod tests {
             exe_path: Some(r"C:\Temp\evil_fake_ping.exe".to_string()),
         };
         assert!(
-            open_and_verify_process_target(
-                &wrong_exe,
-                win_process_ffi::PROCESS_TERMINATE,
-                None
-            )
-            .is_err(),
+            open_and_verify_process_target(&wrong_exe, win_process_ffi::PROCESS_TERMINATE, None)
+                .is_err(),
             "Mismatched exe_path must fail verification"
         );
 
@@ -7076,15 +7777,15 @@ mod tests {
                 Some(observed_exe_path)
             },
         };
-        let handle = open_and_verify_process_target(
-            &exact,
-            win_process_ffi::PROCESS_TERMINATE,
-            None,
-        )
-        .expect("Exact ProcessTargetIdentity must open a verified handle");
+        let handle =
+            open_and_verify_process_target(&exact, win_process_ffi::PROCESS_TERMINATE, None)
+                .expect("Exact ProcessTargetIdentity must open a verified handle");
         let term_ok = unsafe { win_process_ffi::TerminateProcess(handle.0, 1) };
         drop(handle);
-        assert_ne!(term_ok, 0, "TerminateProcess via verified handle should succeed");
+        assert_ne!(
+            term_ok, 0,
+            "TerminateProcess via verified handle should succeed"
+        );
         if let Some(ref mut ch) = guard.0 {
             let _ = ch.wait();
         }
@@ -7338,7 +8039,12 @@ mod tests {
         std::fs::write(&already_disabled_arg, b"disabled").unwrap();
 
         let allowed = vec![startup_dir];
-        for bad in [&desktop_ini, &double_disabled, &already_disabled_arg, &nonexistent] {
+        for bad in [
+            &desktop_ini,
+            &double_disabled,
+            &already_disabled_arg,
+            &nonexistent,
+        ] {
             let s = bad.to_string_lossy().to_string();
             assert!(
                 toggle_startup_folder_entry_in_dirs(&s, false, &allowed).is_err(),
@@ -7382,7 +8088,10 @@ mod tests {
             .creation_flags(0x0800_0000)
             .status()
             .expect("cmd mklink /J should execute");
-        assert!(mklink_status.success(), "NTFS junction creation must succeed");
+        assert!(
+            mklink_status.success(),
+            "NTFS junction creation must succeed"
+        );
 
         let allowed = vec![startup_dir.clone()];
         let j_str = junction_path.to_string_lossy().to_string();
@@ -7424,7 +8133,10 @@ mod tests {
 
         // Запускаем Сканирование #1 и отменяем его по его собственному scan_id
         let guard1 = coordinator.begin_scan(r"C:\".to_string());
-        assert_eq!(coordinator.active_scan_snapshot(), Some((guard1.scan_id, r"C:\".to_string())));
+        assert_eq!(
+            coordinator.active_scan_snapshot(),
+            Some((guard1.scan_id, r"C:\".to_string()))
+        );
         assert!(coordinator.cancel_scan(Some(guard1.scan_id)));
         assert!(guard1.cancel_token.load(Ordering::SeqCst));
 
@@ -7440,11 +8152,17 @@ mod tests {
             !guard2.cancel_token.load(Ordering::SeqCst),
             "New scan #2 must start with its own fresh non-cancelled token"
         );
-        assert_eq!(coordinator.active_scan_snapshot(), Some((guard2.scan_id, r"D:\".to_string())));
+        assert_eq!(
+            coordinator.active_scan_snapshot(),
+            Some((guard2.scan_id, r"D:\".to_string()))
+        );
 
         // Освобождение guard1 по Drop НЕ должно сбрасывать активное сканирование #2
         drop(guard1);
-        assert_eq!(coordinator.active_scan_snapshot(), Some((guard2.scan_id, r"D:\".to_string())));
+        assert_eq!(
+            coordinator.active_scan_snapshot(),
+            Some((guard2.scan_id, r"D:\".to_string()))
+        );
 
         // Отмена несуществующего scan_id не должна трогать активный guard2
         assert!(!coordinator.cancel_scan(Some(999_999)));
@@ -7474,17 +8192,25 @@ mod tests {
         let clean = tauri::async_runtime::block_on(execute_drive_storage_scan(
             Arc::clone(&coordinator),
             docs_dir.to_string_lossy().to_string(),
+            true,
         ))
         .expect("Clean directory scan must succeed");
         assert!(!clean.is_partial);
         assert_eq!(clean.total_files_count, 2);
         assert_eq!(clean.total_scanned_bytes, 2560);
+        assert_eq!(clean.total_dirs_count, 1);
+        assert_eq!(clean.excluded_count, 0);
+        assert!(clean.diagnostics.unwrap().json_bytes > 0);
         assert!(clean.scan_id >= 1);
         assert_eq!(clean.skipped_dirs_count, 0);
         assert_eq!(coordinator.active_scan_snapshot(), None);
 
         // 2. Прямая проверка фиксации недоступного/исчезнувшего каталога в scan_worker_loop
         let shared = ScanShared {
+            folders: AtomicU64::new(0),
+            excluded: AtomicU64::new(0),
+            profiling: false,
+            timings_ns: std::array::from_fn(|_| AtomicU64::new(0)),
             files: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
             cats: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -7539,9 +8265,15 @@ mod tests {
                         let partial = tauri::async_runtime::block_on(execute_drive_storage_scan(
                             Arc::clone(&coordinator),
                             root.0.to_string_lossy().to_string(),
+                            false,
                         ))
-                        .expect("Parent scan with unreadable subdir should still return partial result");
-                        assert!(partial.is_partial, "Scan must report is_partial when subdir denied");
+                        .expect(
+                            "Parent scan with unreadable subdir should still return partial result",
+                        );
+                        assert!(
+                            partial.is_partial,
+                            "Scan must report is_partial when subdir denied"
+                        );
                         assert!(partial.skipped_dirs_count >= 1);
                         assert!(partial.access_denied_count >= 1);
                         assert!(!partial.skipped_samples.is_empty());
@@ -7612,6 +8344,10 @@ mod tests {
             last_sample_at: None,
             ..HwmonWatchdogState::default()
         };
+        assert_eq!(
+            evaluate_hwmon_watchdog_step(&mut wd_boot_hang, false, None, base),
+            HwmonWatchdogAction::Idle
+        );
         assert_eq!(
             evaluate_hwmon_watchdog_step(
                 &mut wd_boot_hang,
@@ -7710,6 +8446,42 @@ mod tests {
         // Нулевой / микроинтервал не приводит к делению на ноль и Infinity
         let (rx_zero, tx_zero) = compute_throughput_kbps(4096, 4096, Duration::from_millis(2));
         assert_eq!((rx_zero, tx_zero), (0.0, 0.0));
+    }
+
+    #[test]
+    fn stability_reports_missing_rtt_and_needs_two_samples_for_jitter() {
+        let lost = summarize_stability(&[], 30);
+        assert_eq!(lost.loss_percent, 100.0);
+        assert_eq!(
+            (lost.min_ms, lost.avg_ms, lost.max_ms, lost.jitter_ms),
+            (None, None, None, None)
+        );
+
+        let one = summarize_stability(&[21], 30);
+        assert_eq!(one.avg_ms, Some(21.0));
+        assert_eq!(one.jitter_ms, None);
+        let stable = summarize_stability(&[21, 21], 2);
+        assert_eq!(stable.jitter_ms, Some(0.0));
+        let varied = summarize_stability(&[20, 24], 2);
+        assert_eq!(varied.avg_ms, Some(22.0));
+        assert_eq!(varied.jitter_ms, Some(2.0));
+    }
+
+    #[test]
+    fn udp_dns_benchmark_rejects_unrelated_and_truncated_replies() {
+        let query = build_dns_query_packet(0x1234, "google.com");
+        let mut response = query.clone();
+        response[2] = 0x81;
+        response[3] = 0x80;
+        assert!(is_valid_dns_response(&response, &query));
+        assert!(!is_valid_dns_response(&response[..12], &query));
+
+        response[13] = b'x';
+        assert!(!is_valid_dns_response(&response, &query));
+        response[13] = b'G';
+        assert!(is_valid_dns_response(&response, &query));
+        response[2] |= 0x02;
+        assert!(!is_valid_dns_response(&response, &query));
     }
 
     #[test]

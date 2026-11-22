@@ -47,6 +47,9 @@ public sealed class CpuTelemetryDto
     [JsonPropertyName("package_temp_c")]
     public float? PackageTempC { get; set; }
 
+    [JsonPropertyName("package_temp_sensor")]
+    public string? PackageTempSensor { get; set; }
+
     [JsonPropertyName("max_core_temp_c")]
     public float? MaxCoreTempC { get; set; }
 
@@ -575,44 +578,48 @@ internal static class Program
             TimestampMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
         };
 
+        bool cpuSelected = false;
         foreach (var hw in computer.Hardware)
         {
             switch (hw.HardwareType)
             {
                 case HardwareType.Cpu:
                 {
+                    if (cpuSelected) break;
+                    cpuSelected = true;
                     dto.Cpu.Name = hw.Name;
                     var clockValues = new List<float>();
 
                     foreach (var s in GetAllSensorsRecursive(hw))
                     {
-                        string sName = s.Name ?? "";
+                        string sName = s.Name?.Trim() ?? "";
                         string sLower = sName.ToLowerInvariant();
 
                         if (s.SensorType == SensorType.Temperature && IsValidTemp(s.Value))
                         {
-                            if (sLower.Contains("distance")) continue;
+                            if (sLower.Contains("distance") || sLower.Contains("tjmax")) continue;
 
                             float t = s.Value!.Value;
-                            if (sLower.Contains("package") || sLower.Contains("tctl") || sLower.Contains("tdie") || sLower.Contains("average"))
+                            if (ReferenceEquals(s.Hardware, hw) && (sLower is "cpu package" or "package"))
                             {
-                                dto.Cpu.PackageTempC = t;
+                                if (!dto.Cpu.PackageTempC.HasValue)
+                                {
+                                    dto.Cpu.PackageTempC = t;
+                                    dto.Cpu.PackageTempSensor = sName;
+                                }
                             }
-                            else if (sLower.Contains("core") || sLower.Contains("ccd"))
+                            else
                             {
                                 dto.Cpu.CoreTemps.Add(new CoreTempDto
                                 {
                                     Name = sName,
                                     TempC = t
                                 });
-                                if (!dto.Cpu.MaxCoreTempC.HasValue || t > dto.Cpu.MaxCoreTempC.Value)
+                                if ((sLower.StartsWith("cpu core #") || sLower.StartsWith("core #"))
+                                    && (!dto.Cpu.MaxCoreTempC.HasValue || t > dto.Cpu.MaxCoreTempC.Value))
                                 {
                                     dto.Cpu.MaxCoreTempC = t;
                                 }
-                            }
-                            else if (!dto.Cpu.PackageTempC.HasValue)
-                            {
-                                dto.Cpu.PackageTempC = t;
                             }
                         }
                         else if (s.SensorType == SensorType.Clock && IsValidPositive(s.Value))
@@ -638,14 +645,6 @@ internal static class Program
                         }
                     }
 
-                    if (!dto.Cpu.PackageTempC.HasValue && dto.Cpu.MaxCoreTempC.HasValue)
-                    {
-                        dto.Cpu.PackageTempC = dto.Cpu.MaxCoreTempC;
-                    }
-                    if (!dto.Cpu.MaxCoreTempC.HasValue && dto.Cpu.PackageTempC.HasValue)
-                    {
-                        dto.Cpu.MaxCoreTempC = dto.Cpu.PackageTempC;
-                    }
                     if (clockValues.Count > 0)
                     {
                         dto.Cpu.AvgClockMhz = clockValues.Average();

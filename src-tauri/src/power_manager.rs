@@ -214,9 +214,17 @@ mod win_proc_ffi {
         true
     }
 
-    pub fn terminate_pid_with_start(pid: u32, expected_start_time: Option<u64>) -> Result<(), String> {
-        let raw =
-            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, 0, pid) };
+    pub fn terminate_pid_with_start(
+        pid: u32,
+        expected_start_time: Option<u64>,
+    ) -> Result<(), String> {
+        let raw = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                0,
+                pid,
+            )
+        };
         if raw.is_null() {
             if !is_pid_alive_with_start(pid, expected_start_time) {
                 return Ok(());
@@ -387,7 +395,10 @@ impl PowerSystemOps for WindowsPowerOps {
     }
 
     fn cleanup_legacy_tasks(&self) {
-        let _ = Self::run_command("schtasks", &["/Delete", "/TN", LEGACY_SLEEP_TASK_NAME, "/F"]);
+        let _ = Self::run_command(
+            "schtasks",
+            &["/Delete", "/TN", LEGACY_SLEEP_TASK_NAME, "/F"],
+        );
     }
 
     fn execute_immediate(&self, action: &str) -> Result<(), String> {
@@ -419,7 +430,9 @@ impl PowerSystemOps for WindowsPowerOps {
 pub fn default_timer_state_path() -> PathBuf {
     if let Ok(appdata) = std::env::var("APPDATA") {
         if !appdata.trim().is_empty() {
-            return PathBuf::from(appdata).join("nexus").join("power_timer.json");
+            return PathBuf::from(appdata)
+                .join("nexus")
+                .join("power_timer.json");
         }
     }
     PathBuf::from("nexus-data").join("power_timer.json")
@@ -704,7 +717,10 @@ mod tests {
         }
 
         fn abort_shutdown(&self, _strict_missing_ok: bool) -> Result<(), String> {
-            self.calls.lock().unwrap().push("abort_shutdown".to_string());
+            self.calls
+                .lock()
+                .unwrap()
+                .push("abort_shutdown".to_string());
             if *self.fail_abort.lock().unwrap() {
                 return Err("mock abort failure".to_string());
             }
@@ -725,7 +741,11 @@ mod tests {
             self.alive_workers.lock().unwrap().contains(&pid)
         }
 
-        fn terminate_worker(&self, pid: u32, _expected_start_time: Option<u64>) -> Result<(), String> {
+        fn terminate_worker(
+            &self,
+            pid: u32,
+            _expected_start_time: Option<u64>,
+        ) -> Result<(), String> {
             self.alive_workers.lock().unwrap().remove(&pid);
             self.calls
                 .lock()

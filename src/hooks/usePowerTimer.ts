@@ -45,7 +45,23 @@ export function usePowerTimer() {
     return Math.max(0, Math.ceil((timerState.endTime - Date.now()) / 1000));
   });
   const [powerError, setPowerError] = useState<string | null>(null);
+  const [isPowerPending, setIsPowerPending] = useState(false);
+  const actionPending = useRef(false);
   const syncSeqRef = useRef<number>(0);
+
+  const beginAction = useCallback(() => {
+    if (actionPending.current) return false;
+    actionPending.current = true;
+    syncSeqRef.current += 1;
+    setIsPowerPending(true);
+    setPowerError(null);
+    return true;
+  }, []);
+
+  const finishAction = useCallback(() => {
+    actionPending.current = false;
+    setIsPowerPending(false);
+  }, []);
 
   const applyBackendState = useCallback((backend: BackendPowerTimerState | null) => {
     if (backend && backend.remaining_seconds > 0) {
@@ -71,6 +87,7 @@ export function usePowerTimer() {
   }, []);
 
   const syncTimerFromBackend = useCallback(async (): Promise<BackendPowerTimerState | null> => {
+    if (actionPending.current) return null;
     const seq = ++syncSeqRef.current;
     try {
       const backend = await invoke<BackendPowerTimerState | null>("get_power_timer_state");
@@ -130,73 +147,75 @@ export function usePowerTimer() {
 
   const handleStartTimer = useCallback(
     async (minutes: number) => {
-      setPowerError(null);
+      if (actionPending.current) return false;
       if (!Number.isFinite(minutes) || minutes <= 0) {
         setPowerError("Введите корректное время в минутах (больше 0)");
-        return;
+        return false;
       }
+      if (!beginAction()) return false;
 
       const seconds = Math.round(minutes * 60);
       const action: PowerTimerAction =
         timerSleep && !restartMode ? "sleep" : restartMode ? "restart" : "shutdown";
-      const seq = ++syncSeqRef.current;
-
       try {
         const created = await invoke<BackendPowerTimerState>("schedule_power_timer", {
           seconds,
           action,
         });
-        if (syncSeqRef.current !== seq) return;
         applyBackendState(created);
+        return true;
       } catch (err) {
         console.error("Ошибка при запуске таймера:", err);
         setPowerError(String(err));
+        return false;
+      } finally {
+        finishAction();
       }
     },
-    [timerSleep, restartMode, applyBackendState]
+    [timerSleep, restartMode, applyBackendState, beginAction, finishAction]
   );
 
   const handleCancelTimer = useCallback(async (): Promise<boolean> => {
-    setPowerError(null);
-    const seq = ++syncSeqRef.current;
+    if (!beginAction()) return false;
     try {
       await invoke("cancel_power_timer");
-      if (syncSeqRef.current !== seq) return true;
       applyBackendState(null);
       return true;
     } catch (err) {
       console.error("Ошибка при отмене таймера:", err);
       setPowerError(`Не удалось отменить системный таймер: ${String(err)}`);
       return false;
+    } finally {
+      finishAction();
     }
-  }, [applyBackendState]);
+  }, [applyBackendState, beginAction, finishAction]);
 
   const handleImmediateAction = useCallback(
     async (action: PowerImmediateAction) => {
-      setPowerError(null);
+      if (!beginAction()) return;
       try {
         // Правила согласования реализованы на Backend:
         // shutdown/restart/sleep отменяют конфликтующее расписание, lock его сохраняет.
         await invoke("system_power_action", { action });
-        await syncTimerFromBackend();
       } catch (err) {
         setPowerError(String(err));
+      } finally {
+        finishAction();
         await syncTimerFromBackend();
       }
     },
-    [syncTimerFromBackend]
+    [beginAction, finishAction, syncTimerFromBackend]
   );
 
   const handleCustomSubmit = useCallback(
-    (e: FormEvent) => {
+    async (e: FormEvent) => {
       e.preventDefault();
-      const mins = parseFloat(customMinutes);
-      if (!Number.isNaN(mins) && mins > 0) {
-        void handleStartTimer(mins);
-        setCustomMinutes("");
-      } else {
-        setPowerError("Укажите положительное количество минут");
+      const minutes = Number(customMinutes);
+      if (!Number.isFinite(minutes) || minutes < 1 || minutes > 525600) {
+        setPowerError("Укажите время от 1 до 525 600 минут");
+        return;
       }
+      if (await handleStartTimer(minutes)) setCustomMinutes("");
     },
     [customMinutes, handleStartTimer]
   );
@@ -223,6 +242,7 @@ export function usePowerTimer() {
     handleCancelTimer,
     handleImmediateAction,
     syncTimerFromBackend,
+    isPowerPending,
 
     // Совместимые поля для useNexusController / PowerModule
     customMinutes,

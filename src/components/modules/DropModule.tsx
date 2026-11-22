@@ -1,28 +1,10 @@
+import { useWorkspaceState } from "../../hooks/useWorkspaceState";
+import { ModuleHeader } from "../ui/ModuleHeader";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { motion } from "framer-motion";
 import { invoke } from "@tauri-apps/api/core";
-import {
-  AlertTriangle,
-  Archive,
-  Copy,
-  FileText,
-  FolderOpen,
-  Image,
-  Loader2,
-  QrCode,
-  ShieldCheck,
-  Smartphone,
-  Square,
-  Wifi,
-} from "lucide-react";
-import { PageHeader, copyTextToClipboard, formatBytes } from "../../lib/studio";
-
-interface DropTransfer {
-  filename: string;
-  received_bytes: number;
-  total_bytes: number;
-  speed_bps: number;
-}
+import { AlertTriangle, Archive, Check, ChevronDown, Copy, FileText, FolderOpen, Image, Inbox, LaptopMinimal, Loader2, LockKeyholeOpen, Smartphone, Square, Wifi } from "lucide-react";
+import { copyTextToClipboard, formatBytes } from "../../lib/studio";
+import type { NexusController } from "../../hooks/useNexusController";
 
 interface DropSessionInfo {
   is_running: boolean;
@@ -32,7 +14,7 @@ interface DropSessionInfo {
   url: string;
   save_dir: string;
   qr_svg: string;
-  transfer?: DropTransfer | null;
+  transfer?: { filename: string; received_bytes: number; total_bytes: number; speed_bps: number } | null;
   session_files_count?: number;
   session_total_bytes?: number;
   max_file_bytes?: number;
@@ -41,31 +23,21 @@ interface DropSessionInfo {
   limit_reached_reason?: string | null;
 }
 
-interface DroppedFileItem {
+interface DroppedFile {
   id: string;
   filename: string;
   size_bytes: number;
   received_at: string;
-  status: string;
   path: string;
 }
 
-interface DropTextItem {
+interface DroppedText {
   id: string;
   body: string;
   received_at: string;
 }
 
-const idleSession: DropSessionInfo = {
-  is_running: false,
-  local_ip: "",
-  port: 0,
-  token: "",
-  url: "",
-  save_dir: "",
-  qr_svg: "",
-  transfer: null,
-};
+type ServerAction = "start" | "stop";
 
 function fileIcon(name: string) {
   const ext = name.split(".").pop()?.toLowerCase() ?? "";
@@ -74,406 +46,249 @@ function fileIcon(name: string) {
   return FileText;
 }
 
-function formatSpeed(bps: number): string {
-  if (!Number.isFinite(bps) || bps <= 0) return "0 МБ/с";
-  const mb = bps / (1024 * 1024);
-  if (mb >= 0.1) return `${mb.toFixed(1)} МБ/с`;
-  return `${(bps / 1024).toFixed(0)} КБ/с`;
+function TransportSecurity() {
+  return (
+    <details className="nexus-drop-security text-xs" onKeyDown={(event) => {
+      if (event.key === "Escape" && event.currentTarget.open) {
+        event.currentTarget.open = false;
+        event.currentTarget.querySelector("summary")?.focus();
+      }
+    }}>
+      <summary className="flex cursor-pointer list-none items-center gap-1.5 rounded-md border border-amber-300/25 bg-amber-300/5 px-2.5 py-1.5 font-medium text-amber-200 [&::-webkit-details-marker]:hidden">
+        <LockKeyholeOpen size={13} /> Без TLS <ChevronDown size={12} />
+      </summary>
+      <div className="nexus-drop-security__details">
+        <strong>Открытый HTTP в локальной сети</strong>
+        <p className="mt-1.5 leading-relaxed text-[var(--nexus-muted)]">
+          Код доступа ограничивает подключение к сеансу. Файлы и текст передаются без шифрования. Используйте AURORA Drop в доверенной сети.
+        </p>
+      </div>
+    </details>
+  );
 }
 
-export function DropModule() {
-  const [session, setSession] = useState<DropSessionInfo>(idleSession);
-  const [files, setFiles] = useState<DroppedFileItem[]>([]);
-  const [texts, setTexts] = useState<DropTextItem[]>([]);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const [copied, setCopied] = useState("");
-  const inFlightRef = useRef(false);
+function CopyButton({ copied, label, onClick }: { copied: boolean; label: string; onClick: () => void }) {
+  return (
+    <button type="button" onClick={onClick} className="nexus-button shrink-0" title={label} aria-label={label}>
+      {copied ? <Check size={14} /> : <Copy size={14} />}
+    </button>
+  );
+}
 
-  const refresh = useCallback(async () => {
-    if (inFlightRef.current) return;
-    inFlightRef.current = true;
-    try {
-      const nextSession = await invoke<DropSessionInfo>("get_drop_session");
-      const nextFiles = await invoke<DroppedFileItem[]>("get_drop_history");
-      const nextTexts = await invoke<DropTextItem[]>("get_drop_texts");
-      setSession(nextSession);
-      setFiles(nextFiles);
-      setTexts(nextTexts);
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      inFlightRef.current = false;
-    }
+export function DropModule({ c }: { c: NexusController }) {
+  const [session, setSession] = useState<DropSessionInfo | null>(null);
+  const [files, setFiles] = useState<DroppedFile[]>([]);
+  const [texts, setTexts] = useState<DroppedText[]>([]);
+  const [view, setView] = useWorkspaceState<"files" | "texts">("drop.view", "files");
+  const [action, setAction] = useState<ServerAction | null>(null);
+  const [actionError, setActionError] = useState("");
+  const [pollError, setPollError] = useState("");
+  const [copied, setCopied] = useState("");
+  const inFlight = useRef<Promise<void> | null>(null);
+  const actionPending = useRef(false);
+  const copyTimer = useRef<number | undefined>(undefined);
+
+  const refresh = useCallback(() => {
+    if (inFlight.current) return inFlight.current;
+    const pending = Promise.allSettled([
+      invoke<DropSessionInfo>("get_drop_session"),
+      invoke<DroppedFile[]>("get_drop_history"),
+      invoke<DroppedText[]>("get_drop_texts"),
+    ]).then(([current, history, notes]) => {
+      if (current.status === "fulfilled") setSession(current.value);
+      if (history.status === "fulfilled") setFiles(history.value);
+      if (notes.status === "fulfilled") setTexts(notes.value);
+      setPollError([current, history, notes].flatMap((result) => result.status === "rejected" ? [String(result.reason)] : []).join(" · "));
+    }).finally(() => {
+      inFlight.current = null;
+    });
+    inFlight.current = pending;
+    return pending;
   }, []);
 
   useEffect(() => {
-    void refresh();
-    const timer = window.setInterval(() => void refresh(), 1500);
+    if (!c.windowVisible) return;
+    const poll = () => {
+      if (!actionPending.current) void refresh();
+    };
+    poll();
+    const timer = window.setInterval(poll, 1500);
     return () => window.clearInterval(timer);
-  }, [refresh]);
+  }, [refresh, c.windowVisible]);
+  useEffect(() => () => window.clearTimeout(copyTimer.current), []);
 
-  const start = async () => {
-    setBusy(true);
-    setError("");
+  async function changeServer(next: ServerAction) {
+    if (actionPending.current) return;
+    actionPending.current = true;
+    setAction(next);
+    setActionError("");
+    setCopied("");
     try {
-      const next = await invoke<DropSessionInfo>("start_drop_session");
-      setSession(next);
+      await inFlight.current;
+      if (next === "start") {
+        setSession(await invoke<DropSessionInfo>("start_drop_session"));
+      } else {
+        await invoke("stop_drop_session");
+        setSession((last) => last && { ...last, is_running: false, token: "", url: "", qr_svg: "", transfer: null });
+      }
       await refresh();
     } catch (err) {
-      setError(String(err));
+      setActionError(String(err));
     } finally {
-      setBusy(false);
+      actionPending.current = false;
+      setAction(null);
     }
-  };
+  }
 
-  const stop = async () => {
-    setBusy(true);
-    setError("");
+  async function copy(value: string, key: string) {
+    setActionError("");
     try {
-      await invoke("stop_drop_session");
-      await refresh();
+      await copyTextToClipboard(value);
+      setCopied(key);
+      window.clearTimeout(copyTimer.current);
+      copyTimer.current = window.setTimeout(() => setCopied(""), 1400);
     } catch (err) {
-      setError(String(err));
-    } finally {
-      setBusy(false);
+      setActionError(String(err));
     }
-  };
+  }
 
-  const copyValue = async (value: string, key: string) => {
-    await copyTextToClipboard(value);
-    setCopied(key);
-    window.setTimeout(() => setCopied(""), 1400);
-  };
+  function openLocation(path?: string) {
+    setActionError("");
+    const result = path ? invoke("open_item_location", { path }) : invoke("open_drop_folder");
+    void result.catch((err) => setActionError(String(err)));
+  }
 
-  const transfer = session.transfer;
-  const progress =
-    transfer && transfer.total_bytes > 0
-      ? Math.min(100, Math.max(0, (transfer.received_bytes / transfer.total_bytes) * 100))
-      : 0;
+  const online = session?.is_running === true;
+  const status = action === "start" ? "Запуск…" : action === "stop" ? "Остановка…" :
+    online ? "Приём включён" : session ? "Приём выключен" : pollError ? "Статус недоступен" : "Проверка статуса…";
+  const transfer = session?.transfer;
+  const address = session?.url.split("#", 1)[0] || (session?.local_ip ? "http://" + session.local_ip + ":" + session.port : "");
+  const errors = [...new Set([actionError, pollError].filter(Boolean))];
+  const count = view === "files" ? files.length : texts.length;
 
   return (
-    <motion.div
-      key="drop"
-      initial={{ opacity: 0, y: 6 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -4 }}
-      transition={{ duration: 0.16, ease: "easeOut" }}
-      className="w-full space-y-4"
-    >
-      <PageHeader
-        title="NEXUS Drop"
-        description="Локальный обмен файлами и буфером обмена между смартфоном и ПК по сети Wi-Fi без облачных сервисов"
-        badge={
-          session.is_running ? (
-            <span className="inline-flex items-center gap-1.5 rounded-md border border-[#00D5E8]/35 bg-[#00D5E8]/12 px-2.5 py-0.5 font-mono text-xs font-semibold text-[#00D5E8]">
-              <span className="h-1.5 w-1.5 rounded-full bg-[#00D5E8] shadow-[0_0_6px_rgba(0,213,232,0.85)]" />
-              СЕРВЕР АКТИВЕН · :{session.port}
-            </span>
-          ) : busy ? (
-            <span className="inline-flex items-center gap-1.5 rounded-md border border-amber-500/35 bg-amber-500/12 px-2.5 py-0.5 font-mono text-xs font-semibold text-amber-300">
-              <Loader2 size={12} className="animate-spin" />
-              ЗАПУСК СЕРВЕРА…
-            </span>
-          ) : (
-            <span className="inline-flex items-center gap-1.5 rounded-md border border-[#202B38] bg-[#151C26] px-2.5 py-0.5 font-mono text-xs text-[#8292A3]">
-              <span className="h-1.5 w-1.5 rounded-full bg-[#526170]" />
-              СЕРВЕР ОСТАНОВЛЕН
-            </span>
-          )
-        }
-        actions={
-          session.is_running ? (
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() => void stop()}
-              className="cyber-btn-danger inline-flex cursor-pointer items-center gap-2 px-4 py-2 font-mono text-xs font-semibold uppercase tracking-wider text-rose-300 disabled:opacity-50"
-            >
-              <Square size={12} className="fill-current" />
-              Остановить сервер
-            </button>
-          ) : (
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() => void start()}
-              className="cyber-btn inline-flex cursor-pointer items-center gap-2 px-4 py-2 font-mono text-xs font-semibold uppercase tracking-wider text-[#00D5E8] disabled:opacity-50"
-            >
-              {busy ? <Loader2 size={14} className="animate-spin" /> : <Wifi size={14} />}
-              {busy ? "Инициализация…" : "Запустить сервер"}
-            </button>
-          )
-        }
-      />
-
-      {error && (
-        <div className="flex items-center gap-3 rounded-xl border border-rose-500/35 bg-rose-500/12 px-4 py-3 text-xs text-rose-300">
-          <AlertTriangle size={16} className="shrink-0 text-rose-400" />
-          <span>{error}</span>
-        </div>
-      )}
-
-      <div className="flex items-start gap-3 rounded-xl border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-xs text-amber-200">
-        <AlertTriangle size={16} className="mt-0.5 shrink-0 text-amber-400" />
-        <div>
-          <span className="font-semibold text-amber-100">Незашифрованный локальный HTTP:</span>{" "}
-          передача внутри сети Wi-Fi выполняется по открытому HTTP без TLS-шифрования (трафик защищён от случайного подключения 130-битным одноразовым токеном, но не шифруется в канале). Используйте только в доверенной домашней сети.
-        </div>
-      </div>
-
-      {session.limit_reached_reason && (
-        <div className="flex items-center gap-3 rounded-xl border border-amber-500/45 bg-amber-500/15 px-4 py-3 text-xs text-amber-200">
-          <AlertTriangle size={16} className="shrink-0 text-amber-400" />
-          <span>{session.limit_reached_reason}</span>
-        </div>
-      )}
-
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
-        {/* Левая колонка: Терминал подключения */}
-        <div className="tactical-card tactical-brackets flex flex-col justify-between rounded-xl p-5 lg:col-span-6">
-          <div>
-            <div className="flex items-center justify-between border-b border-[#202B38] pb-3">
-              <div>
-                <h3 className="text-sm font-semibold text-[#E5EDF5]">Точка подключения</h3>
-                <p className="text-xs text-[#8292A3]">
-                  {session.is_running
-                    ? "Отсканируйте QR-код камерой смартфона или откройте адрес в браузере"
-                    : "Запустите локальный узел для генерации криптостойкого токена и QR-кода"}
-                </p>
-              </div>
-              <span className="rounded border border-amber-500/35 bg-amber-500/10 px-2 py-0.5 font-mono text-[10px] text-amber-300">
-                LAN // HTTP (без TLS)
-              </span>
-            </div>
-
-            {session.is_running && session.qr_svg ? (
-              <div className="mt-4 flex flex-col items-center gap-5 sm:flex-row sm:items-start">
-                <div className="shrink-0 rounded-xl border border-[#00D5E8]/40 bg-[#0B0E14] p-2.5 shadow-[0_0_20px_rgba(0,213,232,0.12)]">
-                  <div
-                    className="h-44 w-44 rounded-lg bg-white p-2 [&_svg]:h-full [&_svg]:w-full"
-                    dangerouslySetInnerHTML={{ __html: session.qr_svg }}
-                  />
-                </div>
-
-                <div className="min-w-0 flex-1 space-y-3 w-full">
-                  <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] p-3">
-                    <div className="text-[11px] text-[#8292A3]">Локальный адрес узла</div>
-                    <div className="mt-1 flex items-center gap-2">
-                      <code className="min-w-0 flex-1 truncate font-mono text-xs text-[#00D5E8]">
-                        {session.url || `http://${session.local_ip}:${session.port}`}
-                      </code>
-                      <button
-                        type="button"
-                        onClick={() => void copyValue(session.url, "url")}
-                        className="inline-flex shrink-0 cursor-pointer items-center gap-1 rounded border border-[#202B38] bg-[#151C26] px-2 py-1 text-[11px] text-[#E5EDF5] hover:border-[#00D5E8]/40"
-                      >
-                        <Copy size={11} />
-                        {copied === "url" ? "Скопировано" : "Копия"}
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] p-3">
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="min-w-0">
-                        <div className="text-[11px] text-[#8292A3]">Токен доступа сессии (130 бит)</div>
-                        <div className="mt-1 font-mono text-xs font-bold tracking-wider break-all text-[#E5EDF5] sm:text-sm">
-                          {session.token}
-                        </div>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => void copyValue(session.token, "token")}
-                        className="inline-flex shrink-0 cursor-pointer items-center gap-1 rounded border border-[#202B38] bg-[#151C26] px-2.5 py-1.5 text-[11px] text-[#E5EDF5] hover:border-[#00D5E8]/40"
-                      >
-                        <Copy size={11} />
-                        {copied === "token" ? "Скопировано" : "Копировать"}
-                      </button>
-                    </div>
-                  </div>
-
-                  {session.save_dir && (
-                    <div className="truncate font-mono text-[11px] text-[#526170]" title={session.save_dir}>
-                      Каталог приёма: <span className="text-[#8292A3]">{session.save_dir}</span>
-                    </div>
-                  )}
-                </div>
-              </div>
-            ) : (
-              /* Полноценное техническое состояние, когда сервер выключен (без пустых белых блоков) */
-              <div className="mt-4 rounded-xl border border-[#202B38] bg-[#0B0E14] p-5">
-                <div className="flex flex-col items-center gap-4 text-center sm:flex-row sm:text-left">
-                  <div className="flex h-20 w-20 shrink-0 items-center justify-center rounded-xl border border-[#202B38] bg-[#10151D] text-[#00D5E8]">
-                    {busy ? <Loader2 size={28} className="animate-spin" /> : <QrCode size={30} />}
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex flex-wrap items-center justify-center gap-2 sm:justify-start">
-                      <span className="text-sm font-semibold text-[#E5EDF5]">
-                        {busy ? "Запуск локального приёмника…" : "Локальный сервер ожидает запуска"}
-                      </span>
-                      <span className="rounded border border-[#202B38] bg-[#151C26] px-2 py-0.5 font-mono text-[10px] text-[#8292A3]">
-                        OFFLINE
-                      </span>
-                    </div>
-                    <p className="mt-1.5 text-xs leading-relaxed text-[#8292A3]">
-                      При запуске NEXUS Drop поднимает изолированный HTTP-узел в вашей домашней сети Wi-Fi и генерирует одноразовый QR-код для мгновенной отправки фотографий, архивов и текста со смартфона.
-                    </p>
-                    <div className="mt-3 flex flex-wrap justify-center gap-2 sm:justify-start">
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => void start()}
-                        className="cyber-btn inline-flex cursor-pointer items-center gap-2 px-4 py-2 font-mono text-xs font-semibold text-[#00D5E8] disabled:opacity-50"
-                      >
-                        <Wifi size={14} />
-                        Активировать точку приёма
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            )}
-          </div>
-
-          {/* Нижние карточки протокола работы */}
-          <div className="mt-4 grid grid-cols-3 gap-2.5 pt-2">
-            <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] p-2.5">
-              <div className="font-mono text-[10px] text-[#00D5E8]">ШАГ 01</div>
-              <div className="mt-0.5 text-xs font-medium text-[#E5EDF5]">Одна сеть Wi-Fi</div>
-              <div className="mt-0.5 text-[11px] text-[#8292A3]">Смартфон и ПК в одной LAN</div>
-            </div>
-            <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] p-2.5">
-              <div className="font-mono text-[10px] text-[#00D5E8]">ШАГ 02</div>
-              <div className="mt-0.5 text-xs font-medium text-[#E5EDF5]">Камера / QR</div>
-              <div className="mt-0.5 text-[11px] text-[#8292A3]">Токен в #fragment и X-Nexus-Token</div>
-            </div>
-            <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] p-2.5">
-              <div className="font-mono text-[10px] text-[#00D5E8]">ШАГ 03</div>
-              <div className="mt-0.5 text-xs font-medium text-[#E5EDF5]">Контролируемый приём</div>
-              <div className="mt-0.5 text-[11px] text-[#8292A3]">До 200 МБ/файл · 1 ГБ / 50 файлов</div>
-            </div>
-          </div>
-        </div>
-
-        {/* Правая колонка: Журнал принятых файлов и текста */}
-        <div className="tactical-card tactical-brackets flex min-h-[360px] flex-col rounded-xl lg:col-span-6">
-          <div className="flex items-center justify-between gap-2 border-b border-[#202B38] px-5 py-3.5">
-            <div className="flex items-center gap-2">
-              <ShieldCheck size={15} className="text-[#00D5E8]" />
-              <h3 className="text-sm font-semibold text-[#E5EDF5]">Журнал принятых данных</h3>
-              <span className="rounded border border-[#202B38] bg-[#0B0E14] px-2 py-0.5 font-mono text-[10px] text-[#8292A3]">
-                {session.is_running
-                  ? `${session.session_files_count ?? 0}/${session.max_session_files ?? 50} файл. · ${formatBytes(session.session_total_bytes ?? 0)}`
-                  : `${files.length} файл.`}
-              </span>
-            </div>
-            <button
-              type="button"
-              onClick={() => void invoke("open_drop_folder").catch((err) => setError(String(err)))}
-              className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-[#202B38] bg-[#0B0E14] px-3 py-1.5 text-xs font-medium text-[#E5EDF5] transition-colors hover:border-[#00D5E8]/40"
-            >
-              <FolderOpen size={13} className="text-[#00D5E8]" />
-              Папка приёма
-            </button>
-          </div>
-
-          {transfer && (
-            <div className="border-b border-[#202B38] bg-[#0B0E14] px-5 py-3">
-              <div className="mb-1.5 flex items-center justify-between gap-2 text-xs">
-                <span className="truncate font-medium text-[#E5EDF5]">
-                  Приём: {transfer.filename || "Входящий поток"}
-                </span>
-                <span className="shrink-0 font-mono font-semibold text-[#00D5E8]">
-                  {formatSpeed(transfer.speed_bps)}
-                </span>
-              </div>
-              <div className="h-1.5 overflow-hidden rounded-full bg-[#151C26]">
-                <div
-                  className="h-full rounded-full bg-gradient-to-r from-[#00D5E8] to-[#36AFC0] transition-all"
-                  style={{ width: `${progress}%` }}
-                />
-              </div>
-            </div>
-          )}
-
-          {files.length === 0 ? (
-            <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 py-12 text-center">
-              <div className="flex h-11 w-11 items-center justify-center rounded-xl border border-[#202B38] bg-[#0B0E14] text-[#526170]">
-                <Smartphone size={20} />
-              </div>
-              <div className="text-sm font-medium text-[#E5EDF5]">Список принятых файлов пуст</div>
-              <p className="max-w-xs text-xs text-[#8292A3]">
-                Отправленные со смартфона файлы и заметки автоматически появятся в этом списке.
+    <div className="avs-module avs-drop space-y-4">
+      <ModuleHeader module="drop" title="AURORA Drop" description="Принимайте файлы и текст со смартфона в той же локальной сети." />
+      {errors.length > 0 && <div role="alert" className="nexus-message nexus-message--error"><AlertTriangle size={16} /> <div className="break-words">{errors.join(" · ")}</div></div>}
+      <div className="nexus-drop-layout">
+        <section className="nexus-panel avs-drop-receiver min-w-0" data-online={online}>
+          <header className="flex flex-wrap items-start justify-between gap-3 border-b border-[var(--nexus-line)] px-4 py-3.5">
+            <div>
+              <h3 className="text-sm font-semibold">Точка подключения</h3>
+              <p className="mt-1 flex items-center gap-2 text-xs text-[var(--nexus-muted)]" role="status">
+                {action ? <Loader2 size={12} className="animate-spin" /> : <span className={online ? "nexus-dot nexus-dot--active" : "nexus-dot"} />}
+                {status}{online && session.port > 0 ? " · порт " + session.port : ""}
               </p>
             </div>
-          ) : (
-            <div className="divide-y divide-[#202B38]/60 overflow-y-auto">
-              {files.map((file) => {
-                const Icon = fileIcon(file.filename);
-                return (
-                  <div
-                    key={file.id}
-                    className="flex items-center gap-3 px-5 py-3 transition-colors hover:bg-[#151C26]/50"
-                  >
-                    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[#202B38] bg-[#0B0E14] text-[#00D5E8]">
-                      <Icon size={15} />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="truncate text-sm font-medium text-[#E5EDF5]">{file.filename}</div>
-                      <div className="mt-0.5 flex items-center gap-2 text-[11px] text-[#8292A3]">
-                        <span className="font-mono font-semibold text-[#00D5E8]">
-                          {formatBytes(file.size_bytes)}
-                        </span>
-                        <span>·</span>
-                        <span className="font-mono">{file.received_at}</span>
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      disabled={!file.path}
-                      onClick={() =>
-                        void invoke("open_item_location", { path: file.path }).catch((err) =>
-                          setError(String(err))
-                        )
-                      }
-                      className="shrink-0 cursor-pointer rounded-lg border border-[#202B38] bg-[#0B0E14] px-2.5 py-1.5 text-xs font-medium text-[#8292A3] transition-colors hover:border-[#00D5E8]/40 hover:text-[#E5EDF5] disabled:opacity-40"
-                    >
-                      В проводнике
-                    </button>
-                  </div>
-                );
-              })}
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="nexus-eyebrow">LAN // HTTP</span>
+              <TransportSecurity />
             </div>
-          )}
-
-          {texts.length > 0 && (
-            <div className="border-t border-[#202B38] bg-[#0B0E14]/60 px-5 py-3.5">
-              <div className="mb-2 text-xs font-medium text-[#8292A3]">Принятые текстовые заметки и ссылки</div>
-              <div className="space-y-2">
-                {texts.map((item) => (
-                  <div
-                    key={item.id}
-                    className="flex items-start gap-2 rounded-lg border border-[#202B38] bg-[#10151D] px-3 py-2"
-                  >
-                    <div className="min-w-0 flex-1">
-                      <div className="font-mono text-[10px] text-[#526170]">{item.received_at}</div>
-                      <div className="mt-0.5 text-xs break-all text-[#E5EDF5]">{item.body}</div>
+          </header>
+          {online ? (
+            <div className="space-y-4 p-4">
+              <div className="nexus-drop-pairing">
+                {session.qr_svg && <div role="img" aria-label="QR-код адреса с кодом доступа" className="nexus-drop-qr" dangerouslySetInnerHTML={{ __html: session.qr_svg }} />}
+                <div className="min-w-0 space-y-3">
+                  <p className="text-sm leading-relaxed text-[var(--nexus-muted)]">
+                    {session.qr_svg ? "Отсканируйте QR-код смартфоном или скопируйте ссылку для браузера." : "Скопируйте ссылку и откройте её в браузере смартфона."}
+                  </p>
+                  {address && <div>
+                    <div className="mb-1 text-xs text-[var(--nexus-muted)]">Локальный адрес</div>
+                    <div className="nexus-drop-value">
+                      <code className="min-w-0 flex-1 select-text break-all text-xs text-[var(--nexus-accent)]">{address}</code>
+                      {session.url && <CopyButton copied={copied === "url"} label="Копировать ссылку с кодом доступа" onClick={() => void copy(session.url, "url")} />}
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => void copyValue(item.body, item.id)}
-                      className="shrink-0 cursor-pointer rounded border border-[#202B38] bg-[#151C26] px-2 py-1 text-[11px] text-[#00D5E8]"
-                    >
-                      {copied === item.id ? "Скопировано" : "Копия"}
-                    </button>
-                  </div>
-                ))}
+                  </div>}
+                  {session.token && <div>
+                    <div className="mb-1 text-xs text-[var(--nexus-muted)]">Код доступа сеанса</div>
+                    <div className="nexus-drop-value">
+                      <code className="min-w-0 flex-1 select-text break-all text-xs">{session.token}</code>
+                      <CopyButton copied={copied === "token"} label="Копировать код доступа" onClick={() => void copy(session.token, "token")} />
+                    </div>
+                  </div>}
+                </div>
               </div>
+              <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[var(--nexus-line)] pt-3">
+                <button type="button" className="nexus-button nexus-button--danger" disabled={action !== null} onClick={() => void changeServer("stop")}>
+                  {action === "stop" ? <Loader2 size={14} className="animate-spin" /> : <Square size={13} />} Остановить приём
+                </button>
+                {!!session.max_file_bytes && !!session.max_session_bytes && <span className="text-xs text-[var(--nexus-muted)]">{formatBytes(session.max_file_bytes)} на файл · {formatBytes(session.max_session_bytes)} за сеанс</span>}
+              </div>
+              {session.limit_reached_reason && <div role="status" className="nexus-message nexus-message--warning"><AlertTriangle size={16} /> {session.limit_reached_reason}</div>}
+            </div>
+          ) : (
+            <div className="avs-drop-station">
+              <div className="avs-drop-devices" aria-hidden="true"><LaptopMinimal size={43} strokeWidth={1.35} /><i /><Smartphone size={30} strokeWidth={1.5} /></div>
+              <h4>Подключите смартфон</h4>
+              <p className="max-w-sm text-sm leading-relaxed text-[var(--nexus-muted)]">Включите приём, чтобы получить ссылку и QR-код для отправки со смартфона.</p>
+                <button className="nexus-button nexus-button--primary" type="button" disabled={!session || action !== null} onClick={() => void changeServer("start")}>
+                  {action === "start" ? <Loader2 size={15} className="animate-spin" /> : <Wifi size={15} />} Включить приём
+                </button>
             </div>
           )}
-        </div>
+        </section>
+
+        <section className="nexus-panel avs-drop-history min-w-0">
+          <header className="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--nexus-line)] px-4 py-3">
+            <div>
+              <h3 className="text-sm font-semibold">Журнал приёма</h3>
+              {online && typeof session.session_files_count === "number" && typeof session.max_session_files === "number" && <p className="mt-1 text-xs tabular-nums text-[var(--nexus-muted)]">
+                За сеанс {session.session_files_count} из {session.max_session_files} файлов
+                {typeof session.session_total_bytes === "number" ? " · " + formatBytes(session.session_total_bytes) : ""}
+              </p>}
+            </div>
+            <button type="button" className="nexus-button" onClick={() => openLocation()}><FolderOpen size={14} /> Папка приёма</button>
+          </header>
+          {transfer && <div className="space-y-2 border-b border-[var(--nexus-line)] px-4 py-3">
+            <div className="flex items-center justify-between gap-2 text-xs">
+              <span className="min-w-0 truncate" title={transfer.filename}>Приём · {transfer.filename || "Файл"}</span>
+              <span className="shrink-0 font-mono text-[var(--nexus-accent)]">{formatBytes(transfer.speed_bps)}/с</span>
+            </div>
+            {transfer.total_bytes > 0 && <progress className="nexus-progress" aria-label="Получено байт" value={Math.min(transfer.received_bytes, transfer.total_bytes)} max={transfer.total_bytes} />}
+          </div>}
+          <div role="group" aria-label="Тип принятых данных" className="avs-workspace-tabs mx-3 mt-3">
+            <button type="button" aria-pressed={view === "files"} onClick={() => setView("files")}>Файлы <span>{files.length}</span></button>
+            <button type="button" aria-pressed={view === "texts"} onClick={() => setView("texts")}>Текст <span>{texts.length}</span></button>
+          </div>
+          <div className="nexus-drop-log">
+            {!session || !count ? (
+              <div className="nexus-empty">
+                <Inbox size={22} />
+                <strong>{!session ? pollError ? "Журнал недоступен" : "Получаем журнал…" : view === "files" ? "Файлов пока нет" : "Текстовых заметок пока нет"}</strong>
+                {session && <span>{online ? "Отправьте данные со страницы AURORA Drop на смартфоне." : "Включите приём, чтобы подключить смартфон."}</span>}
+              </div>
+            ) : view === "files" ? (
+              <ul className="divide-y divide-[var(--nexus-line)]">
+                {files.map((file) => {
+                  const Icon = fileIcon(file.filename);
+                  return <li key={file.id} className="flex items-center gap-3 px-4 py-2.5">
+                    <Icon size={17} className="shrink-0 text-[var(--nexus-accent)]" />
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-sm font-medium" title={file.filename}>{file.filename}</div>
+                      <div className="mt-0.5 text-xs tabular-nums text-[var(--nexus-muted)]">{formatBytes(file.size_bytes)} · {file.received_at}</div>
+                    </div>
+                    <button className="nexus-button shrink-0" type="button" title="Показать файл в Проводнике" aria-label={"Показать в Проводнике " + file.filename} disabled={!file.path} onClick={() => openLocation(file.path)}><FolderOpen size={14} /></button>
+                  </li>;
+                })}
+              </ul>
+            ) : (
+              <ul className="divide-y divide-[var(--nexus-line)]">
+                {texts.map((item) => <li key={item.id} className="flex items-start gap-3 px-4 py-2.5">
+                  <FileText size={16} className="mt-1 shrink-0 text-[var(--nexus-accent)]" />
+                  <div className="min-w-0 flex-1">
+                    <div className="select-text whitespace-pre-wrap [overflow-wrap:anywhere] text-sm">{item.body}</div>
+                    <div className="mt-1 text-xs tabular-nums text-[var(--nexus-muted)]">{item.received_at}</div>
+                  </div>
+                  <CopyButton copied={copied === item.id} label="Копировать текст" onClick={() => void copy(item.body, item.id)} />
+                </li>)}
+              </ul>
+            )}
+          </div>
+          {session?.save_dir && <div className="truncate border-t border-[var(--nexus-line)] px-4 py-2.5 text-xs text-[var(--nexus-muted)]" title={session.save_dir}>{session.save_dir}</div>}
+        </section>
       </div>
-    </motion.div>
+      <div className="sr-only" role="status">{copied ? "Скопировано" : ""}</div>
+    </div>
   );
 }

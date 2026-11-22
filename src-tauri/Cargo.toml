@@ -1,8 +1,8 @@
 [package]
-name = "nexus"
-version = "0.2.2"
-description = "A Tauri App"
-authors = ["you"]
+name = "aurora"
+version = "2.0.0"
+description = "AURORA Windows System Suite"
+authors = ["Gervex"]
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -23,7 +23,8 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sysinfo = "0.33"
-winreg = "0.52"
+winreg = { version = "0.52", features = ["transactions"] }
+tempfile = "3"
 jwalk = "0.8"
 rayon = "1"
 png = "0.18"
@@ -39,7 +40,10 @@ windows = { version = "0.62", features = [
   "Win32_NetworkManagement_IpHelper",
   "Win32_NetworkManagement_Ndis",
   "Win32_Networking_WinSock",
+  "Win32_Security",
+  "Win32_Storage_FileSystem",
   "Win32_System_Performance",
+  "Win32_System_Threading",
 ] }
 
 

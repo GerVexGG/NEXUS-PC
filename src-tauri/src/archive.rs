@@ -1,6 +1,6 @@
 use crc32fast::Hasher;
-use flate2::write::DeflateEncoder;
 use flate2::Compression;
+use flate2::write::DeflateEncoder;
 use jwalk::WalkDir;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -225,15 +225,17 @@ pub fn find_rar_executable() -> Option<PathBuf> {
 
     #[cfg(target_os = "windows")]
     {
-        use winreg::enums::*;
         use winreg::RegKey;
+        use winreg::enums::*;
 
         let roots = [
             RegKey::predef(HKEY_LOCAL_MACHINE),
             RegKey::predef(HKEY_CURRENT_USER),
         ];
         for root in roots {
-            if let Ok(key) = root.open_subkey(r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\WinRAR.exe") {
+            if let Ok(key) =
+                root.open_subkey(r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\WinRAR.exe")
+            {
                 if let Ok(path_str) = key.get_value::<String, _>("") {
                     let trimmed = path_str.trim().trim_matches('"');
                     if !trimmed.is_empty() {
@@ -472,7 +474,11 @@ mod win_dialogs {
             nMaxFileTitle: 0,
             lpstrInitialDir: std::ptr::null(),
             lpstrTitle: title.as_ptr(),
-            Flags: OFN_EXPLORER | OFN_ALLOWMULTISELECT | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+            Flags: OFN_EXPLORER
+                | OFN_ALLOWMULTISELECT
+                | OFN_FILEMUSTEXIST
+                | OFN_PATHMUSTEXIST
+                | OFN_NOCHANGEDIR,
             nFileOffset: 0,
             nFileExtension: 0,
             lpstrDefExt: std::ptr::null(),
@@ -605,7 +611,10 @@ fn sanitize_archive_name(raw_name: &str, ext: &str) -> Result<String, String> {
         return Err("Укажите имя архива".to_string());
     }
     let invalid_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
-    if trimmed.chars().any(|c| invalid_chars.contains(&c) || c.is_control()) {
+    if trimmed
+        .chars()
+        .any(|c| invalid_chars.contains(&c) || c.is_control())
+    {
         return Err("Имя архива содержит недопустимые символы".to_string());
     }
     let lower = trimmed.to_ascii_lowercase();
@@ -754,7 +763,8 @@ fn collect_zip_entries_with_limits(
         let root_name = allocate_unique_root_name(&raw_name, &mut used_roots);
 
         if src.is_file() {
-            let meta = fs::metadata(src).map_err(|e| format!("Ошибка чтения {}: {e}", src.display()))?;
+            let meta =
+                fs::metadata(src).map_err(|e| format!("Ошибка чтения {}: {e}", src.display()))?;
             let (dos_time, dos_date) = system_time_to_dos_datetime(meta.modified().ok());
             let sz = meta.len();
             total_bytes = total_bytes
@@ -955,7 +965,10 @@ fn create_zip_archive(
 
             let name_bytes = item.archive_name.as_bytes().to_vec();
             if name_bytes.len() > u16::MAX as usize {
-                return Err(format!("Слишком длинное имя в архиве: {}", item.archive_name));
+                return Err(format!(
+                    "Слишком длинное имя в архиве: {}",
+                    item.archive_name
+                ));
             }
             let local_pos = writer
                 .stream_position()
@@ -969,19 +982,39 @@ fn create_zip_archive(
             let method: u16 = if use_deflate { 8 } else { 0 };
 
             // Local file header (30 bytes)
-            writer.write_all(&0x04034b50u32.to_le_bytes()).map_err(|e| e.to_string())?;
-            writer.write_all(&20u16.to_le_bytes()).map_err(|e| e.to_string())?;
-            writer.write_all(&0x0800u16.to_le_bytes()).map_err(|e| e.to_string())?; // UTF-8 flag
-            writer.write_all(&method.to_le_bytes()).map_err(|e| e.to_string())?;
-            writer.write_all(&item.dos_time.to_le_bytes()).map_err(|e| e.to_string())?;
-            writer.write_all(&item.dos_date.to_le_bytes()).map_err(|e| e.to_string())?;
-            writer.write_all(&0u32.to_le_bytes()).map_err(|e| e.to_string())?; // CRC placeholder
-            writer.write_all(&0u32.to_le_bytes()).map_err(|e| e.to_string())?; // comp placeholder
-            writer.write_all(&0u32.to_le_bytes()).map_err(|e| e.to_string())?; // uncomp placeholder
+            writer
+                .write_all(&0x04034b50u32.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            writer
+                .write_all(&20u16.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            writer
+                .write_all(&0x0800u16.to_le_bytes())
+                .map_err(|e| e.to_string())?; // UTF-8 flag
+            writer
+                .write_all(&method.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            writer
+                .write_all(&item.dos_time.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            writer
+                .write_all(&item.dos_date.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            writer
+                .write_all(&0u32.to_le_bytes())
+                .map_err(|e| e.to_string())?; // CRC placeholder
+            writer
+                .write_all(&0u32.to_le_bytes())
+                .map_err(|e| e.to_string())?; // comp placeholder
+            writer
+                .write_all(&0u32.to_le_bytes())
+                .map_err(|e| e.to_string())?; // uncomp placeholder
             writer
                 .write_all(&(name_bytes.len() as u16).to_le_bytes())
                 .map_err(|e| e.to_string())?;
-            writer.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;
+            writer
+                .write_all(&0u16.to_le_bytes())
+                .map_err(|e| e.to_string())?;
             writer.write_all(&name_bytes).map_err(|e| e.to_string())?;
 
             let mut crc_value = 0u32;
@@ -996,8 +1029,12 @@ fn create_zip_archive(
                 let data_start = writer
                     .stream_position()
                     .map_err(|e| format!("Ошибка потока ZIP: {e}"))?;
-                let src_file = File::open(&item.disk_path)
-                    .map_err(|e| format!("Не удалось прочитать файл {}: {e}", item.disk_path.display()))?;
+                let src_file = File::open(&item.disk_path).map_err(|e| {
+                    format!(
+                        "Не удалось прочитать файл {}: {e}",
+                        item.disk_path.display()
+                    )
+                })?;
                 let mut reader = BufReader::with_capacity(64 * 1024, src_file);
                 let mut hasher = Hasher::new();
 
@@ -1007,9 +1044,9 @@ fn create_zip_archive(
                         if cancel.load(Ordering::SeqCst) {
                             return Err("Создание архива отменено пользователем".to_string());
                         }
-                        let n = reader
-                            .read(&mut buf)
-                            .map_err(|e| format!("Ошибка чтения {}: {e}", item.disk_path.display()))?;
+                        let n = reader.read(&mut buf).map_err(|e| {
+                            format!("Ошибка чтения {}: {e}", item.disk_path.display())
+                        })?;
                         if n == 0 {
                             break;
                         }
@@ -1029,21 +1066,22 @@ fn create_zip_archive(
                             p.processed_bytes = processed_bytes;
                             if total_bytes > 0 {
                                 p.percent = ((processed_bytes as f64 / total_bytes as f64) * 100.0)
-                                    .clamp(0.0, 99.5) as f32;
+                                    .clamp(0.0, 99.5)
+                                    as f32;
                             }
                         });
                     }
-                    encoder
-                        .finish()
-                        .map_err(|e| format!("Ошибка завершения deflate для {}: {e}", item.archive_name))?;
+                    encoder.finish().map_err(|e| {
+                        format!("Ошибка завершения deflate для {}: {e}", item.archive_name)
+                    })?;
                 } else {
                     loop {
                         if cancel.load(Ordering::SeqCst) {
                             return Err("Создание архива отменено пользователем".to_string());
                         }
-                        let n = reader
-                            .read(&mut buf)
-                            .map_err(|e| format!("Ошибка чтения {}: {e}", item.disk_path.display()))?;
+                        let n = reader.read(&mut buf).map_err(|e| {
+                            format!("Ошибка чтения {}: {e}", item.disk_path.display())
+                        })?;
                         if n == 0 {
                             break;
                         }
@@ -1063,7 +1101,8 @@ fn create_zip_archive(
                             p.processed_bytes = processed_bytes;
                             if total_bytes > 0 {
                                 p.percent = ((processed_bytes as f64 / total_bytes as f64) * 100.0)
-                                    .clamp(0.0, 99.5) as f32;
+                                    .clamp(0.0, 99.5)
+                                    as f32;
                             }
                         });
                     }
@@ -1075,7 +1114,9 @@ fn create_zip_archive(
                 comp_size_u64 = data_end.saturating_sub(data_start);
                 crc_value = hasher.finalize();
 
-                if comp_size_u64 > MAX_ZIP_SINGLE_FILE_BYTES || uncomp_size_u64 > MAX_ZIP_SINGLE_FILE_BYTES {
+                if comp_size_u64 > MAX_ZIP_SINGLE_FILE_BYTES
+                    || uncomp_size_u64 > MAX_ZIP_SINGLE_FILE_BYTES
+                {
                     return Err(format!(
                         "Файл {} превышает 4 ГБ (лимит стандартного ZIP)",
                         item.archive_name
@@ -1086,14 +1127,18 @@ fn create_zip_archive(
                 writer
                     .seek(SeekFrom::Start(local_pos + 14))
                     .map_err(|e| e.to_string())?;
-                writer.write_all(&crc_value.to_le_bytes()).map_err(|e| e.to_string())?;
+                writer
+                    .write_all(&crc_value.to_le_bytes())
+                    .map_err(|e| e.to_string())?;
                 writer
                     .write_all(&(comp_size_u64 as u32).to_le_bytes())
                     .map_err(|e| e.to_string())?;
                 writer
                     .write_all(&(uncomp_size_u64 as u32).to_le_bytes())
                     .map_err(|e| e.to_string())?;
-                writer.seek(SeekFrom::Start(data_end)).map_err(|e| e.to_string())?;
+                writer
+                    .seek(SeekFrom::Start(data_end))
+                    .map_err(|e| e.to_string())?;
 
                 processed_files += 1;
                 set_progress(|p| {
@@ -1131,28 +1176,60 @@ fn create_zip_archive(
 
         for rec in &central_records {
             let ext_attr: u32 = if rec.is_dir { 0x10 } else { 0x20 };
-            writer.write_all(&0x02014b50u32.to_le_bytes()).map_err(|e| e.to_string())?;
-            writer.write_all(&20u16.to_le_bytes()).map_err(|e| e.to_string())?;
-            writer.write_all(&20u16.to_le_bytes()).map_err(|e| e.to_string())?;
-            writer.write_all(&0x0800u16.to_le_bytes()).map_err(|e| e.to_string())?;
-            writer.write_all(&rec.method.to_le_bytes()).map_err(|e| e.to_string())?;
-            writer.write_all(&rec.dos_time.to_le_bytes()).map_err(|e| e.to_string())?;
-            writer.write_all(&rec.dos_date.to_le_bytes()).map_err(|e| e.to_string())?;
-            writer.write_all(&rec.crc32.to_le_bytes()).map_err(|e| e.to_string())?;
-            writer.write_all(&rec.comp_size.to_le_bytes()).map_err(|e| e.to_string())?;
-            writer.write_all(&rec.uncomp_size.to_le_bytes()).map_err(|e| e.to_string())?;
+            writer
+                .write_all(&0x02014b50u32.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            writer
+                .write_all(&20u16.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            writer
+                .write_all(&20u16.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            writer
+                .write_all(&0x0800u16.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            writer
+                .write_all(&rec.method.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            writer
+                .write_all(&rec.dos_time.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            writer
+                .write_all(&rec.dos_date.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            writer
+                .write_all(&rec.crc32.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            writer
+                .write_all(&rec.comp_size.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            writer
+                .write_all(&rec.uncomp_size.to_le_bytes())
+                .map_err(|e| e.to_string())?;
             writer
                 .write_all(&(rec.name_bytes.len() as u16).to_le_bytes())
                 .map_err(|e| e.to_string())?;
-            writer.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;
-            writer.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;
-            writer.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;
-            writer.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;
-            writer.write_all(&ext_attr.to_le_bytes()).map_err(|e| e.to_string())?;
+            writer
+                .write_all(&0u16.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            writer
+                .write_all(&0u16.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            writer
+                .write_all(&0u16.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            writer
+                .write_all(&0u16.to_le_bytes())
+                .map_err(|e| e.to_string())?;
+            writer
+                .write_all(&ext_attr.to_le_bytes())
+                .map_err(|e| e.to_string())?;
             writer
                 .write_all(&rec.local_header_offset.to_le_bytes())
                 .map_err(|e| e.to_string())?;
-            writer.write_all(&rec.name_bytes).map_err(|e| e.to_string())?;
+            writer
+                .write_all(&rec.name_bytes)
+                .map_err(|e| e.to_string())?;
         }
 
         let cd_end_u64 = writer
@@ -1165,18 +1242,34 @@ fn create_zip_archive(
         let cd_size = cd_size_u64 as u32;
         let count = central_records.len() as u16;
 
-        writer.write_all(&0x06054b50u32.to_le_bytes()).map_err(|e| e.to_string())?;
-        writer.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;
-        writer.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;
-        writer.write_all(&count.to_le_bytes()).map_err(|e| e.to_string())?;
-        writer.write_all(&count.to_le_bytes()).map_err(|e| e.to_string())?;
-        writer.write_all(&cd_size.to_le_bytes()).map_err(|e| e.to_string())?;
+        writer
+            .write_all(&0x06054b50u32.to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        writer
+            .write_all(&0u16.to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        writer
+            .write_all(&0u16.to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        writer
+            .write_all(&count.to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        writer
+            .write_all(&count.to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        writer
+            .write_all(&cd_size.to_le_bytes())
+            .map_err(|e| e.to_string())?;
         writer
             .write_all(&(cd_offset_u64 as u32).to_le_bytes())
             .map_err(|e| e.to_string())?;
-        writer.write_all(&0u16.to_le_bytes()).map_err(|e| e.to_string())?;
+        writer
+            .write_all(&0u16.to_le_bytes())
+            .map_err(|e| e.to_string())?;
 
-        writer.flush().map_err(|e| format!("Ошибка сброса буфера ZIP: {e}"))?;
+        writer
+            .flush()
+            .map_err(|e| format!("Ошибка сброса буфера ZIP: {e}"))?;
         drop(writer);
 
         if cancel.load(Ordering::SeqCst) {
@@ -1524,9 +1617,15 @@ mod tests {
             .rposition(|w| w == b"PK\x05\x06")
             .expect("EOCD signature missing");
         let total_entries = u16::from_le_bytes([raw[eocd_pos + 10], raw[eocd_pos + 11]]) as usize;
-        let cd_size = u32::from_le_bytes(raw[eocd_pos + 12..eocd_pos + 16].try_into().unwrap()) as usize;
-        let cd_offset = u32::from_le_bytes(raw[eocd_pos + 16..eocd_pos + 20].try_into().unwrap()) as usize;
-        assert_eq!(cd_offset + cd_size, eocd_pos, "Central Directory bounds mismatch EOCD");
+        let cd_size =
+            u32::from_le_bytes(raw[eocd_pos + 12..eocd_pos + 16].try_into().unwrap()) as usize;
+        let cd_offset =
+            u32::from_le_bytes(raw[eocd_pos + 16..eocd_pos + 20].try_into().unwrap()) as usize;
+        assert_eq!(
+            cd_offset + cd_size,
+            eocd_pos,
+            "Central Directory bounds mismatch EOCD"
+        );
 
         let mut entries = Vec::new();
         let mut cursor = cd_offset;
@@ -1535,19 +1634,28 @@ mod tests {
             let flags = u16::from_le_bytes([raw[cursor + 8], raw[cursor + 9]]);
             let method = u16::from_le_bytes([raw[cursor + 10], raw[cursor + 11]]);
             let crc32 = u32::from_le_bytes(raw[cursor + 16..cursor + 20].try_into().unwrap());
-            let comp_size = u32::from_le_bytes(raw[cursor + 20..cursor + 24].try_into().unwrap()) as usize;
-            let uncomp_size = u32::from_le_bytes(raw[cursor + 24..cursor + 28].try_into().unwrap()) as usize;
+            let comp_size =
+                u32::from_le_bytes(raw[cursor + 20..cursor + 24].try_into().unwrap()) as usize;
+            let uncomp_size =
+                u32::from_le_bytes(raw[cursor + 24..cursor + 28].try_into().unwrap()) as usize;
             let name_len = u16::from_le_bytes([raw[cursor + 28], raw[cursor + 29]]) as usize;
             let extra_len = u16::from_le_bytes([raw[cursor + 30], raw[cursor + 31]]) as usize;
             let comment_len = u16::from_le_bytes([raw[cursor + 32], raw[cursor + 33]]) as usize;
-            let local_off = u32::from_le_bytes(raw[cursor + 42..cursor + 46].try_into().unwrap()) as usize;
+            let local_off =
+                u32::from_le_bytes(raw[cursor + 42..cursor + 46].try_into().unwrap()) as usize;
             let name = String::from_utf8(raw[cursor + 46..cursor + 46 + name_len].to_vec())
                 .expect("UTF-8 filename in ZIP");
             cursor += 46 + name_len + extra_len + comment_len;
 
-            assert_eq!(&raw[local_off..local_off + 4], b"PK\x03\x04", "Local header sig");
-            let l_name_len = u16::from_le_bytes([raw[local_off + 26], raw[local_off + 27]]) as usize;
-            let l_extra_len = u16::from_le_bytes([raw[local_off + 28], raw[local_off + 29]]) as usize;
+            assert_eq!(
+                &raw[local_off..local_off + 4],
+                b"PK\x03\x04",
+                "Local header sig"
+            );
+            let l_name_len =
+                u16::from_le_bytes([raw[local_off + 26], raw[local_off + 27]]) as usize;
+            let l_extra_len =
+                u16::from_le_bytes([raw[local_off + 28], raw[local_off + 29]]) as usize;
             let data_start = local_off + 30 + l_name_len + l_extra_len;
             let comp_slice = &raw[data_start..data_start + comp_size];
 
@@ -1561,7 +1669,11 @@ mod tests {
                 }
                 other => panic!("unexpected compression method {other}"),
             };
-            assert_eq!(uncomp.len(), uncomp_size, "uncompressed size mismatch for {name}");
+            assert_eq!(
+                uncomp.len(),
+                uncomp_size,
+                "uncompressed size mismatch for {name}"
+            );
             let actual_crc = crc32fast::hash(&uncomp);
             assert_eq!(actual_crc, crc32, "CRC32 mismatch for {name}");
 
@@ -1613,7 +1725,10 @@ mod tests {
         assert!(result.size_bytes > 0);
         // Исходные файлы остались нетронутыми
         assert_eq!(fs::read(&file1).unwrap(), b"hello nexus zip world 12345");
-        assert_eq!(fs::read(&file2).unwrap(), br#"{"nexus":true,"mode":"cyber"}"#);
+        assert_eq!(
+            fs::read(&file2).unwrap(),
+            br#"{"nexus":true,"mode":"cyber"}"#
+        );
 
         let parsed = parse_and_verify_zip(&zip_path);
         let names: Vec<&str> = parsed.iter().map(|e| e.name.as_str()).collect();
@@ -1677,7 +1792,11 @@ mod tests {
             payload_a
         );
         assert_eq!(
-            parsed.iter().find(|e| e.name == "отчёт_2.txt").unwrap().data,
+            parsed
+                .iter()
+                .find(|e| e.name == "отчёт_2.txt")
+                .unwrap()
+                .data,
             payload_b
         );
 
@@ -1688,16 +1807,18 @@ mod tests {
     fn zip_prechecks_limits_and_cancels_during_directory_traversal() {
         let _guard = TEST_ARCHIVE_SERIALIZE.lock().unwrap();
         // Проверка граничных значений 32-битного ZIP
-        assert!(validate_zip_entry_budget(
-            1,
-            MAX_ZIP_SINGLE_FILE_BYTES,
-            MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES,
-            "max.bin",
-            MAX_ZIP_ENTRIES,
-            MAX_ZIP_SINGLE_FILE_BYTES,
-            MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES
-        )
-        .is_ok());
+        assert!(
+            validate_zip_entry_budget(
+                1,
+                MAX_ZIP_SINGLE_FILE_BYTES,
+                MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES,
+                "max.bin",
+                MAX_ZIP_ENTRIES,
+                MAX_ZIP_SINGLE_FILE_BYTES,
+                MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES
+            )
+            .is_ok()
+        );
 
         let too_big_file = validate_zip_entry_budget(
             1,
@@ -1762,7 +1883,9 @@ mod tests {
 
         // Проверка защиты от параллельной операции архивации
         let g1 = ArchiveOperationGuard::try_acquire().expect("first acquire works");
-        let second_err = ArchiveOperationGuard::try_acquire().err().expect("second must reject");
+        let second_err = ArchiveOperationGuard::try_acquire()
+            .err()
+            .expect("second must reject");
         assert!(second_err.contains("текущей операции"));
         drop(g1);
         assert!(ArchiveOperationGuard::try_acquire().is_ok());
@@ -1830,9 +1953,74 @@ mod tests {
         let rar_path = PathBuf::from(&result.archive_path);
         assert!(rar_path.is_file());
         let mut head = [0u8; 6];
-        File::open(&rar_path).unwrap().read_exact(&mut head).unwrap();
+        File::open(&rar_path)
+            .unwrap()
+            .read_exact(&mut head)
+            .unwrap();
         // Настоящая сигнатура RAR4/RAR5: "Rar!\x1A\x07"
         assert_eq!(&head, b"Rar!\x1a\x07");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn zip_cleanup_removes_temp_file_and_preserves_existing_archive_on_mid_write_cancel_or_error() {
+        let _guard = TEST_ARCHIVE_SERIALIZE.lock().unwrap();
+        let root = make_temp_test_dir("cleanup_cancel");
+        let src_dir = root.join("src");
+        let out_dir = root.join("out");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&out_dir).unwrap();
+
+        let existing_zip = out_dir.join("backup.zip");
+        fs::write(&existing_zip, b"ORIGINAL_VALID_ARCHIVE").unwrap();
+
+        let payload_file = src_dir.join("blob.bin");
+        fs::write(&payload_file, vec![0xABu8; 2 * 1024 * 1024]).unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_trigger = Arc::clone(&cancel);
+        let worker_src = vec![src_dir.clone()];
+        let worker_out = existing_zip.clone();
+
+        let handle = std::thread::spawn(move || {
+            create_zip_archive(&worker_src, &worker_out, "max", &cancel)
+        });
+        std::thread::sleep(Duration::from_millis(5));
+        cancel_trigger.store(true, Ordering::SeqCst);
+
+        let res = handle.join().unwrap();
+        assert!(
+            res.is_err(),
+            "Aborted archive must return an Err even when started cleanly"
+        );
+        // Ни одного временного файла .nexus_tmp_* не должно остаться в каталоге назначения
+        let leftovers: Vec<_> = fs::read_dir(&out_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("nexus_tmp_"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "Expected zero temp archive files left behind, found {leftovers:?}"
+        );
+        // Существовавший ранее архив не повреждён и не затёрт
+        assert_eq!(fs::read(&existing_zip).unwrap(), b"ORIGINAL_VALID_ARCHIVE");
+
+        // Ошибка отсутствующего источника также возвращает понятную ошибку и не создаёт мусор
+        let err = create_archive_sync(
+            ArchiveCreateRequest {
+                format: "zip".to_string(),
+                sources: vec![src_dir.join("missing.bin").to_string_lossy().to_string()],
+                destination_dir: out_dir.to_string_lossy().to_string(),
+                archive_name: "broken".to_string(),
+                compression_level: "normal".to_string(),
+            },
+            None,
+        )
+        .expect_err("Missing source file must fail cleanly");
+        assert!(err.contains("не найден"));
+        assert!(!out_dir.join("broken.zip").exists());
 
         let _ = fs::remove_dir_all(&root);
     }

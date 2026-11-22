@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { motion } from "framer-motion";
+import { evaluateZipLimits } from "../../lib/metricsFormatters";
 import {
   AlertTriangle,
   Archive,
@@ -80,9 +80,10 @@ export function ArchiveCreatorModal({
   onClose: () => void;
 }) {
   const [capabilities, setCapabilities] = useState<ArchiverCapabilities | null>(null);
+  const [capabilityError, setCapabilityError] = useState("");
   const [format, setFormat] = useState<ArchiveFormat>("zip");
   const [sources, setSources] = useState<ArchiveSourceItem[]>([]);
-  const [archiveName, setArchiveName] = useState<string>("nexus_archive");
+  const [archiveName, setArchiveName] = useState<string>("aurora_archive");
   const [destDir, setDestDir] = useState<string>("");
   const [compression, setCompression] = useState<CompressionLevel>("normal");
 
@@ -91,27 +92,51 @@ export function ArchiveCreatorModal({
   const [progress, setProgress] = useState<ArchiveProgressState | null>(null);
   const [result, setResult] = useState<ArchiveCreateResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
+  const titleId = useId();
 
   useEffect(() => {
     if (!open) return;
+    const dialog = dialogRef.current;
+    const trigger = document.activeElement;
+    dialog?.showModal();
+    closeRef.current?.focus();
+    return () => {
+      dialog?.close();
+      if (trigger instanceof HTMLElement && trigger.isConnected) trigger.focus({ preventScroll: true });
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    let active = true;
+    setCapabilities(null);
+    setCapabilityError("");
     setError(null);
     void invoke<ArchiverCapabilities>("archive_get_capabilities")
       .then((caps) => {
+        if (!active) return;
         setCapabilities(caps);
         setDestDir((prev) => (prev.trim() ? prev : caps.default_output_dir));
       })
-      .catch((err) => setError(String(err)));
+      .catch((err) => { if (active) setCapabilityError(String(err)); });
+    return () => { active = false; };
   }, [open]);
 
   useEffect(() => {
     if (!open || !creating) return;
     let active = true;
+    let pending = false;
     const poll = () => {
+      if (pending) return;
+      pending = true;
       void invoke<ArchiveProgressState>("archive_get_progress")
         .then((p) => {
-          if (active) setProgress(p);
+          if (active && p.running) setProgress(p);
         })
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => { pending = false; });
     };
     poll();
     const timer = window.setInterval(poll, 160);
@@ -135,14 +160,12 @@ export function ArchiveCreatorModal({
     return { bytes, files, oversizedSingle };
   }, [sources]);
 
-  const zipLimitReason =
-    format === "zip"
-      ? totalStats.oversizedSingle || totalStats.bytes > 0xffffffff
-        ? "Суммарный объём или размер файла превышает лимит классического ZIP (4 ГБ). Выберите формат RAR или разделите файлы."
-        : totalStats.files + sources.length > 65535
-        ? "Число объектов превышает лимит классического ZIP (65 535 записей). Выберите формат RAR."
-        : null
-      : null;
+  const zipLimitReason = evaluateZipLimits(
+    format,
+    totalStats.bytes,
+    totalStats.files + sources.length,
+    totalStats.oversizedSingle
+  );
 
   if (!open) return null;
 
@@ -230,7 +253,7 @@ export function ArchiveCreatorModal({
       setError(zipLimitReason);
       return;
     }
-    if (format === "rar" && capabilities && !capabilities.rar_available) {
+    if (format === "rar" && !capabilities?.rar_available) {
       setError(
         "Архиватор WinRAR (Rar.exe / WinRAR.exe) не обнаружен в системе. Выберите формат ZIP или установите WinRAR."
       );
@@ -262,46 +285,46 @@ export function ArchiveCreatorModal({
   const handleCancelArchive = async () => {
     try {
       await invoke("archive_cancel");
-    } catch {
-      /* отменено */
+    } catch (err) {
+      setError(String(err));
     }
   };
 
   const rarMissing = format === "rar" && capabilities !== null && !capabilities.rar_available;
   const normalizedExtName = (() => {
-    const clean = archiveName.trim().replace(/\.(zip|rar)$/i, "") || "nexus_archive";
+    const clean = archiveName.trim().replace(/\.(zip|rar)$/i, "") || "aurora_archive";
     return `${clean}.${format}`;
   })();
 
   return (
-    <div
-      onClick={() => {
+    <dialog
+      ref={dialogRef}
+      aria-labelledby={titleId}
+      onCancel={(event) => {
+        event.preventDefault();
         if (!creating) onClose();
       }}
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-xs"
+      onClick={(event) => {
+        if (!creating && event.target === event.currentTarget) onClose();
+      }}
+      className="nexus-panel avs-archive fixed inset-0 m-auto w-[calc(100%_-_2rem)] max-w-3xl overflow-hidden p-0 text-[var(--nexus-text)] shadow-2xl backdrop:bg-black/70"
     >
-      <motion.div
-        initial={{ opacity: 0, scale: 0.97, y: 8 }}
-        animate={{ opacity: 1, scale: 1, y: 0 }}
-        exit={{ opacity: 0, scale: 0.97, y: 6 }}
-        transition={{ duration: 0.16, ease: "easeOut" }}
-        onClick={(e) => e.stopPropagation()}
-        className="tactical-card tactical-brackets flex max-h-[90vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl shadow-[0_24px_64px_rgba(0,0,0,0.85)]"
-      >
+      <div className="flex max-h-[90vh] min-h-0 flex-col overflow-hidden">
         {/* Заголовок */}
-        <div className="flex items-center justify-between gap-3 border-b border-[#202B38] bg-[#0B0E14] px-5 py-3.5">
+        <div className="avs-archive-head flex items-center justify-between gap-3 border-b border-[#202B38] px-5 py-3.5">
           <div className="flex items-center gap-2.5">
             <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-[#00D5E8]/35 bg-[#00D5E8]/10 text-[#00D5E8]">
               <FolderArchive size={16} />
             </div>
             <div>
-              <h2 className="text-sm font-semibold text-[#E5EDF5]">Создать архив</h2>
+              <h2 id={titleId} className="text-base font-semibold">Создать архив</h2>
               <p className="text-[11px] text-[#8292A3]">
                 Упаковка выбранных файлов и папок в ZIP или RAR без изменения исходников
               </p>
             </div>
           </div>
           <button
+            ref={closeRef}
             type="button"
             disabled={creating}
             aria-label="Закрыть окно создания архива"
@@ -319,6 +342,7 @@ export function ArchiveCreatorModal({
             <button
               type="button"
               disabled={creating}
+              aria-pressed={format === "zip"}
               onClick={() => {
                 setFormat("zip");
                 setError(null);
@@ -346,6 +370,7 @@ export function ArchiveCreatorModal({
             <button
               type="button"
               disabled={creating}
+              aria-pressed={format === "rar"}
               onClick={() => {
                 setFormat("rar");
                 setError(null);
@@ -374,11 +399,12 @@ export function ArchiveCreatorModal({
                     : "border-amber-500/35 bg-amber-500/12 text-amber-300"
                 }`}
               >
-                {capabilities?.rar_available ? "WINRAR" : "НЕ НАЙДЕН"}
+                {!capabilities ? (capabilityError ? "НЕТ ДАННЫХ" : "ПРОВЕРКА…") : capabilities.rar_available ? "WINRAR" : "НЕ НАЙДЕН"}
               </span>
             </button>
           </div>
 
+          {capabilityError && <p className="nexus-message nexus-message--error" role="alert">Не удалось проверить доступность архиватора. {capabilityError}</p>}
           {rarMissing && (
             <div className="flex items-start gap-2.5 rounded-xl border border-amber-500/35 bg-amber-500/10 px-3.5 py-2.5 text-xs text-amber-200">
               <AlertTriangle size={15} className="mt-0.5 shrink-0 text-amber-400" />
@@ -501,7 +527,7 @@ export function ArchiveCreatorModal({
                   disabled={creating}
                   value={archiveName}
                   onChange={(e) => setArchiveName(e.target.value)}
-                  placeholder="nexus_archive"
+                  placeholder="aurora_archive"
                   className="min-w-0 flex-1 bg-transparent px-3 py-2 text-xs font-medium text-[#E5EDF5] outline-none placeholder:text-[#526170]"
                 />
                 <span className="border-l border-[#202B38] bg-[#10151D] px-2.5 py-2 font-mono text-[11px] text-[#00D5E8]">
@@ -578,30 +604,22 @@ export function ArchiveCreatorModal({
                   <Loader2 size={14} className="animate-spin text-[#00D5E8]" />
                   {progress?.current_item || "Упаковка архива…"}
                 </span>
-                <span className="font-mono font-semibold text-[#00D5E8]">
-                  {(progress?.percent ?? 0).toFixed(0)}%
-                </span>
+                {progress && <span className="font-mono font-semibold text-[#00D5E8]">{progress.percent.toFixed(0)}%</span>}
               </div>
-              <div className="h-2 w-full overflow-hidden rounded-full bg-[#10151D]">
-                <div
-                  className="h-full rounded-full bg-gradient-to-r from-[#00D5E8] to-[#36AFC0] transition-all duration-150"
-                  style={{ width: `${Math.min(100, Math.max(2, progress?.percent ?? 5))}%` }}
-                />
-              </div>
-              <div className="flex justify-between font-mono text-[10px] text-[#8292A3]">
+              {progress && <progress className="nexus-progress" aria-label="Прогресс упаковки" value={Math.min(100, Math.max(0, progress.percent))} max={100} />}
+              {progress && <div className="flex justify-between font-mono text-[10px] text-[#8292A3]">
                 <span>
-                  Файлы: {progress?.processed_files ?? 0} / {progress?.total_files ?? totalStats.files}
+                  Файлы: {progress.processed_files} / {progress.total_files}
                 </span>
                 <span>
-                  {formatSize(progress?.processed_bytes ?? 0)} /{" "}
-                  {formatSize(progress?.total_bytes ?? totalStats.bytes)}
+                  {formatSize(progress.processed_bytes)} / {formatSize(progress.total_bytes)}
                 </span>
-              </div>
+              </div>}
             </div>
           )}
 
           {error && (
-            <div className="rounded-xl border border-rose-500/35 bg-rose-500/12 px-3.5 py-2.5 text-xs text-rose-300">
+            <div role="alert" className="nexus-message nexus-message--error">
               {error}
             </div>
           )}
@@ -623,7 +641,7 @@ export function ArchiveCreatorModal({
               </div>
               <button
                 type="button"
-                onClick={() => void invoke("open_item_location", { path: result.archive_path })}
+                onClick={() => void invoke("open_item_location", { path: result.archive_path }).catch((err) => setError(String(err)))}
                 className="inline-flex shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border border-[#00D5E8]/40 bg-[#0B0E14] px-3 py-1.5 font-medium text-[#00D5E8] hover:bg-[#10151D]"
               >
                 <FolderOpen size={13} />
@@ -639,7 +657,7 @@ export function ArchiveCreatorModal({
             <button
               type="button"
               onClick={() => void handleCancelArchive()}
-              className="cyber-btn-danger cursor-pointer px-4 py-2 text-xs font-semibold text-rose-300"
+              className="nexus-button nexus-button--danger"
             >
               Отменить
             </button>
@@ -648,15 +666,15 @@ export function ArchiveCreatorModal({
               <button
                 type="button"
                 onClick={onClose}
-                className="cursor-pointer rounded-lg border border-[#202B38] bg-[#10151D] px-4 py-2 text-xs font-medium text-[#8292A3] hover:text-[#E5EDF5]"
+                className="nexus-button"
               >
                 Закрыть
               </button>
               <button
                 type="button"
-                disabled={sources.length === 0 || rarMissing || zipLimitReason !== null}
+                disabled={sources.length === 0 || (format === "rar" && !capabilities?.rar_available) || zipLimitReason !== null}
                 onClick={() => void handleCreateArchive()}
-                className="cyber-btn inline-flex cursor-pointer items-center gap-2 px-5 py-2 font-mono text-xs font-semibold uppercase tracking-wider text-[#00D5E8] disabled:cursor-not-allowed disabled:opacity-45"
+                className="nexus-button nexus-button--primary"
               >
                 <FolderArchive size={14} />
                 Создать архив
@@ -664,7 +682,7 @@ export function ArchiveCreatorModal({
             </>
           )}
         </div>
-      </motion.div>
-    </div>
+      </div>
+    </dialog>
   );
 }

@@ -114,7 +114,7 @@ export function NumericInput({
 
   return (
     <div
-      className={`group/num inline-flex w-full items-center overflow-hidden rounded-lg border border-[#202B38] bg-[#0B0E14] transition-colors focus-within:border-[#00D5E8]/60 focus-within:shadow-[0_0_0_1px_rgba(0,213,232,0.18)] ${
+      className={`nexus-numeric group/num inline-flex w-full items-center overflow-hidden rounded-lg border border-[#202B38] bg-[#0B0E14] transition-colors focus-within:border-[#00D5E8]/60 focus-within:shadow-[0_0_0_1px_rgba(0,213,232,0.18)] ${
         disabled ? "cursor-not-allowed opacity-55" : ""
       } ${className}`}
     >

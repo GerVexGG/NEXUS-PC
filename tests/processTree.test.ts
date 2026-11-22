@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildProcessTree, getProcessIdentityKey } from "../src/lib/processTree.ts";
+import { buildProcessTree, compareProcessItems, getProcessIdentityKey, matchesProcessQuery, processAncestorKeys, toProcessTargetIdentity } from "../src/lib/processTree.ts";
 import type { ProcessItem } from "../src/lib/studio.tsx";
+import { emptyProcessSnapshot, reconcileProcesses } from "../src/lib/processSnapshot.ts";
 
 function makeProc(
   overrides: Partial<ProcessItem> & Pick<ProcessItem, "pid" | "name">
@@ -23,23 +24,62 @@ function makeProc(
   };
 }
 
+test("polling updates live metrics without replacing ranked rows or open branches", () => {
+  const root = makeProc({ pid: 35, name: "explorer.exe", start_time: 100, cpu_usage: 2 });
+  const app = makeProc({ pid: 36, name: "app.exe", start_time: 101, parent_pid: root.pid });
+  const other = makeProc({ pid: 40, name: "other.exe", start_time: 205, cpu_usage: 7 });
+  const first = reconcileProcesses(emptyProcessSnapshot, [root, app, other], 1, 1000);
+  const expanded = new Set([root.pid]);
+  const rows = (snapshot: typeof first) => buildProcessTree(snapshot.topology, "cpu", true, "", expanded, undefined, "ppid").rows;
+  assert.deepEqual(rows(first).map(row => [row.process.pid, row.depth]), [[40, 0], [35, 0], [36, 1]]);
+  const second = reconcileProcesses(first, [
+    { ...root, cpu_usage: 95, memory_mb: 300 }, app, { ...other, cpu_usage: 0 },
+  ], 1, 2000);
+  assert.equal(second.topology, first.topology);
+  assert.equal(second.live.get(getProcessIdentityKey(root))?.cpu_usage, 95);
+  assert.equal(second.live.get(getProcessIdentityKey(root))?.memory_mb, 300);
+  assert.deepEqual(rows(second).map(row => row.process.pid), [40, 35, 36]);
+  const resorted = reconcileProcesses(second, [...second.live.values()], 2, 2500);
+  assert.deepEqual(rows(resorted).map(row => row.process.pid), [35, 36, 40]);
+});
+
+test("departed selections expire, reused PIDs receive a new key and cannot adopt older children", () => {
+  const original = makeProc({ pid: 88, name: "original.exe", start_time: 100 });
+  const child = makeProc({ pid: 89, name: "child.exe", parent_pid: 88, start_time: 101 });
+  const first = reconcileProcesses(emptyProcessSnapshot, [original, child], 1, 1000);
+  const key = getProcessIdentityKey(original);
+  const exit = reconcileProcesses(first, [child], 1, 2000);
+  assert.equal(exit.live.has(key), false);
+  assert.equal(exit.departed.has(key), true);
+  assert.equal(exit.topology, first.topology);
+  const replacement = { ...original, start_time: 102 };
+  const next = reconcileProcesses(exit, [replacement, child], 1, 3000);
+  assert.equal(next.topology.some(row => getProcessIdentityKey(row) === key), false);
+  assert.equal(next.added.has(getProcessIdentityKey(replacement)), true);
+  const tree = buildProcessTree(next.topology, "pid", false, "", new Set([88]), undefined, "ppid");
+  assert.deepEqual(tree.rows.map(row => [row.process.pid, row.depth]), [[88, 0], [89, 0]]);
+  const reconnected = reconcileProcesses(next, [replacement, { ...child, parent_pid: null }], 1, 4000);
+  assert.notEqual(reconnected.topology, next.topology);
+  assert.equal(reconnected.live.get(getProcessIdentityKey(child))?.parent_pid, null);
+});
+
 test("apps launched from explorer.exe (chrome, Antigravity) promote to top-level roots while preserving real subtrees", () => {
   const explorer = makeProc({ pid: 6704, name: "explorer.exe", parent_pid: 500, start_time: 100, cpu_usage: 0.4, memory_mb: 90 });
   const explorerSub = makeProc({ pid: 6705, name: "explorer.exe", parent_pid: 6704, start_time: 150, cpu_usage: 0.1, memory_mb: 45 });
   // chrome.exe и Antigravity.exe стартовали из оболочки explorer.exe (PPID=6704),
   // но в дереве процессов (как в System Informer) должны быть самостоятельными корнями:
-  const chrome = makeProc({ pid: 102, name: "chrome.exe", parent_pid: 6704, start_time: 300, cpu_usage: 3.0, memory_mb: 350 });
+  const chrome = makeProc({ pid: 102, name: "chrome.exe", parent_pid: 6704, start_time: 300, has_main_window: true, cpu_usage: 3.0, memory_mb: 350 });
   const chromeGpu = makeProc({ pid: 201, name: "chrome.exe", parent_pid: 102, start_time: 301, cpu_usage: 4.5, memory_mb: 500 });
   const chromeTab1 = makeProc({ pid: 202, name: "chrome.exe", parent_pid: 102, start_time: 302, cpu_usage: 1.5, memory_mb: 400 });
   const chromeSub = makeProc({ pid: 301, name: "crashpad_handler.exe", parent_pid: 201, start_time: 304, cpu_usage: 0.0, memory_mb: 12 });
 
-  const antigravity = makeProc({ pid: 103, name: "Antigravity.exe", parent_pid: 6704, start_time: 400, cpu_usage: 2.0, memory_mb: 300 });
+  const antigravity = makeProc({ pid: 103, name: "Antigravity.exe", parent_pid: 6704, start_time: 400, has_main_window: true, cpu_usage: 2.0, memory_mb: 300 });
   const agWorker1 = makeProc({ pid: 204, name: "Antigravity.exe", parent_pid: 103, start_time: 401, cpu_usage: 1.0, memory_mb: 200 });
   const agNode = makeProc({ pid: 205, name: "node.exe", parent_pid: 204, start_time: 402, cpu_usage: 2.0, memory_mb: 150 });
 
   const all = [explorer, explorerSub, chrome, chromeGpu, chromeTab1, chromeSub, antigravity, agWorker1, agNode];
 
-  const collapsed = buildProcessTree(all, "memory", true, "", new Set());
+  const collapsed = buildProcessTree(all, "memory", true, "", new Set(), undefined, "applications");
   assert.equal(collapsed.rootCount, 3, "explorer.exe, chrome.exe, and Antigravity.exe should be 3 separate root processes");
   assert.deepEqual(
     collapsed.rows.map((r) => r.process.name),
@@ -147,7 +187,7 @@ test("breaks cycles cleanly without infinite recursion or double counting CPU/RA
   assert.equal(res.statsByPid.get(702)?.subtreeMemoryMb, 200);
 });
 
-test("subtreeTargets matches displayed NEXUS branch in leaves-first order and excludes shell-promoted apps", () => {
+test("confirmed targets use real PPIDs even when the application appears as a separate root", () => {
   const explorer = makeProc({ pid: 6704, name: "explorer.exe", parent_pid: 500, start_time: 100 });
   const explorerSub = makeProc({ pid: 6705, name: "explorer.exe", parent_pid: 6704, start_time: 150 });
   const chrome = makeProc({ pid: 25936, name: "chrome.exe", parent_pid: 6704, start_time: 300 });
@@ -156,7 +196,7 @@ test("subtreeTargets matches displayed NEXUS branch in leaves-first order and ex
 
   const tree = buildProcessTree([explorer, explorerSub, chrome, chromeTab, crashpad], "pid", false, "", new Set());
   const explorerTargets = tree.statsByPid.get(6704)!.subtreeTargets.map((t) => t.pid);
-  assert.deepEqual(explorerTargets, [6705, 6704]);
+  assert.deepEqual(explorerTargets, [6705, 25938, 25937, 25936, 6704]);
 
   const chromeTargets = tree.statsByPid.get(25936)!.subtreeTargets.map((t) => t.pid);
   assert.deepEqual(chromeTargets, [25938, 25937, 25936]);
@@ -164,4 +204,81 @@ test("subtreeTargets matches displayed NEXUS branch in leaves-first order and ex
   const keyOld = getProcessIdentityKey(chromeTab);
   const keyReused = getProcessIdentityKey(makeProc({ pid: 25937, name: "notepad.exe", start_time: 9999 }));
   assert.notEqual(keyOld, keyReused, "Identity key must distinguish reused PIDs");
+});
+
+test("search filtering preserves ancestor chain for matching descendants and sets matchedSelf", () => {
+  const launcher = makeProc({ pid: 100, name: "steam.exe", start_time: 100 });
+  const helper = makeProc({ pid: 101, name: "steamwebhelper.exe", parent_pid: 100, start_time: 110 });
+  const unrelated = makeProc({ pid: 200, name: "notepad.exe", start_time: 120 });
+
+  const filtered = buildProcessTree([launcher, helper, unrelated], "pid", false, "webhelper", new Set());
+  assert.equal(filtered.rootCount, 1);
+  assert.equal(filtered.matchedCount, 1);
+  assert.deepEqual(
+    filtered.rows.map((r) => ({ pid: r.process.pid, matchedSelf: r.matchedSelf, depth: r.depth })),
+    [
+      { pid: 100, matchedSelf: false, depth: 0 },
+      { pid: 101, matchedSelf: true, depth: 1 },
+    ]
+  );
+
+  const identWithEmptyPath = toProcessTargetIdentity({
+    pid: 101,
+    start_time: 110,
+    name: "steamwebhelper.exe",
+    exe_path: "",
+  });
+  assert.deepEqual(identWithEmptyPath, {
+    pid: 101,
+    start_time: 110,
+    name: "steamwebhelper.exe",
+    exe_path: undefined,
+  });
+});
+
+test("filters affect visible rows without shortening a branch approved for termination", () => {
+  const root = makeProc({ pid: 13, name: "root.exe" });
+  const visible = makeProc({ pid: 23, name: "match.exe", parent_pid: 13 });
+  const hidden = makeProc({ pid: 123, name: "worker.exe", parent_pid: 13 });
+  for (const filtered of [
+    buildProcessTree([root, visible, hidden], "pid", false, "match", new Set()),
+    buildProcessTree([root, visible, hidden], "pid", false, "", new Set(), (process) => process.pid === 23),
+  ]) {
+    assert.deepEqual(filtered.rows.map(({ process }) => process.pid), [13, 23]);
+    assert.deepEqual(filtered.statsByPid.get(13)?.subtreeTargets.map(({ pid }) => pid), [23, 123, 13]);
+    assert.equal(filtered.statsByPid.get(13)?.totalDescendants, 2);
+  }
+});
+
+test("runtime sort does not elevate a process with a missing start timestamp", () => {
+  const unknown = makeProc({ pid: 10, name: "unknown.exe", start_time: 0, run_time_sec: 1_795_000_000 });
+  const observed = makeProc({ pid: 20, name: "observed.exe", run_time_sec: 30 });
+  assert.ok(compareProcessItems(unknown, observed, "runtime", true) > 0);
+});
+
+test("Application projection keeps Windows helpers attached and does not alter real selection identities", () => {
+  const shell = makeProc({ pid: 41, name: "explorer.exe", start_time: 10 });
+  const app = makeProc({ pid: 42, name: "app.exe", parent_pid: 41, start_time: 11, has_main_window: true });
+  const child = makeProc({ pid: 43, name: "app-worker.exe", parent_pid: 42, start_time: 12 });
+  const helper = makeProc({ pid: 44, name: "dllhost.exe", parent_pid: 41, start_time: 15 });
+  const all = [shell, app, child, helper];
+  const opened = new Set([41, 42]);
+  const show = (mode: "applications" | "ppid") => buildProcessTree(all, "pid", false, "", opened, undefined, mode)
+    .rows.map(({ process, depth }) => [getProcessIdentityKey(process), depth]);
+  assert.deepEqual(show("applications"), [[getProcessIdentityKey(shell), 0], [getProcessIdentityKey(helper), 1],
+    [getProcessIdentityKey(app), 0], [getProcessIdentityKey(child), 1]]);
+  assert.deepEqual(show("ppid"), [[getProcessIdentityKey(shell), 0], [getProcessIdentityKey(app), 1],
+    [getProcessIdentityKey(child), 2], [getProcessIdentityKey(helper), 1]]);
+  assert.deepEqual(processAncestorKeys(all, child), [getProcessIdentityKey(app), getProcessIdentityKey(shell)]);
+  assert.deepEqual(processAncestorKeys([shell, { ...app, start_time: 99 }, child], child), []);
+});
+
+test("metadata search preserves parent context and treats inaccessible metadata as missing", () => {
+  const parent = makeProc({ pid: 51, name: "parent.exe" });
+  const child = makeProc({ pid: 52, name: "a.exe", parent_pid: parent.pid, description: null });
+  assert.equal(matchesProcessQuery(child, "office"), false);
+  assert.equal(matchesProcessQuery({ ...child, description: "Office Viewer" }, "office"), true);
+  const lookup = (process: ProcessItem) => process.pid === child.pid ? "Office Viewer" : null;
+  const mode = buildProcessTree([parent, child], "path", false, "office", new Set(), p => p.pid === child.pid, "ppid", lookup);
+  assert.deepEqual(mode.rows.map(row => [row.process.pid, row.depth, row.matchedSelf]), [[51, 0, false], [52, 1, true]]);
 });

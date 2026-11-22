@@ -1,11 +1,14 @@
 {
-  "name": "nexus",
+  "name": "aurora",
   "private": true,
-  "version": "0.2.2",
+  "version": "2.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:sidecar": "dotnet publish hwmon-sidecar/nexus-hwmon.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o hwmon-sidecar/bin/publish && node -e \"require('node:fs').copyFileSync('hwmon-sidecar/bin/publish/aurora-hwmon.exe', 'src-tauri/nexus-hwmon.exe')\"",
+    "build:all": "npm run build:sidecar && npm run build",
+    "test": "node --test tests/*.test.ts",
     "preview": "vite preview",
     "tauri": "tauri"
   },

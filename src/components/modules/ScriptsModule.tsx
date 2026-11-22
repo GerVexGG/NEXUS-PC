@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useState, type KeyboardEvent } from "react";
+import { ModuleHeader } from "../ui/ModuleHeader";
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -16,8 +17,9 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { PageHeader, copyTextToClipboard } from "../../lib/studio";
+import { copyTextToClipboard } from "../../lib/studio";
 import { ArchiveCreatorModal } from "../modals/ArchiveCreatorModal";
+import { UtilityConfirmDialog } from "../ui/UtilityConfirmDialog";
 
 export type ScriptKind = "powershell" | "cmd" | "vbs" | "text";
 
@@ -55,7 +57,7 @@ const SCRIPT_TYPES: {
     label: "VBScript",
     badge: "VBS",
     badgeClass: "border-indigo-500/40 bg-indigo-500/12 text-indigo-300",
-    placeholder: 'WScript.Echo "NEXUS VBScript Engine Ready"',
+    placeholder: 'WScript.Echo "Готово"',
   },
   {
     id: "text",
@@ -88,6 +90,30 @@ function generateUuid(): string {
   return `script-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
 }
 
+type LibraryAction =
+  | { kind: "select" | "delete"; script: UserScript }
+  | { kind: "create" };
+
+interface ScriptRunResult {
+  output: string;
+  exit_code: number | null;
+  timed_out: boolean;
+  skipped: boolean;
+}
+
+function runStatus(result: ScriptRunResult | null, running: boolean) {
+  const neutral = "border-[#46616b] bg-[#14212c] text-[#b9d8df]";
+  const warning = "border-rose-400/40 bg-rose-400/10 text-rose-200";
+  if (running) return { label: "Выполнение", className: neutral };
+  if (result?.skipped) return { label: "Запуск недоступен", className: neutral };
+  if (result?.timed_out) return { label: "Таймаут", className: warning };
+  if (result?.exit_code === 0) {
+    return { label: "Завершено · код 0", className: "border-emerald-400/35 bg-emerald-400/10 text-emerald-200" };
+  }
+  const label = result?.exit_code == null ? "Ошибка" : `Ошибка · код ${result.exit_code}`;
+  return { label, className: warning };
+}
+
 export function ScriptsModule() {
   const [scripts, setScripts] = useState<UserScript[]>([]);
   const [selectedId, setSelectedId] = useState<string>("");
@@ -102,11 +128,17 @@ export function ScriptsModule() {
   const [saving, setSaving] = useState<boolean>(false);
   const [running, setRunning] = useState<boolean>(false);
   const [copied, setCopied] = useState<boolean>(false);
+  const [outputCopied, setOutputCopied] = useState(false);
   const [savedToast, setSavedToast] = useState<boolean>(false);
+  const [deleting, setDeleting] = useState(false);
 
-  const [consoleOutput, setConsoleOutput] = useState<string | null>(null);
+  const [consoleResult, setConsoleResult] = useState<ScriptRunResult | null>(null);
+  const [executionTitle, setExecutionTitle] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [archiveOpen, setArchiveOpen] = useState<boolean>(false);
+  const [confirmation, setConfirmation] = useState<LibraryAction | null>(null);
+  const operation = useRef(false);
+  const busy = loading || saving || running || deleting;
 
   const selectScript = useCallback((script: UserScript) => {
     setSelectedId(script.id);
@@ -114,18 +146,22 @@ export function ScriptsModule() {
     setScriptType((script.script_type as ScriptKind) || "powershell");
     setContent(script.content);
     setDirty(false);
+    setSavedToast(false);
+    setCopied(false);
     setError(null);
   }, []);
 
   const loadScripts = useCallback(
-    async (preferId?: string) => {
+    async () => {
+      if (operation.current) return;
+      operation.current = true;
       setLoading(true);
+      setError(null);
       try {
         const list = await invoke<UserScript[]>("get_user_scripts");
         setScripts(list);
         if (list.length > 0) {
-          const target = (preferId && list.find((s) => s.id === preferId)) || list[0];
-          selectScript(target);
+          selectScript(list[0]);
         } else {
           const fresh: UserScript = {
             id: generateUuid(),
@@ -140,6 +176,7 @@ export function ScriptsModule() {
       } catch (err) {
         setError(String(err));
       } finally {
+        operation.current = false;
         setLoading(false);
       }
     },
@@ -158,13 +195,11 @@ export function ScriptsModule() {
       content: "",
       updated_at: Math.floor(Date.now() / 1000),
     };
-    setScripts((prev) => [fresh, ...prev]);
     selectScript(fresh);
     setDirty(true);
-    setConsoleOutput(null);
   };
 
-  const handleSave = useCallback(async (): Promise<string | null> => {
+  const saveSelectedScript = useCallback(async (): Promise<string | null> => {
     if (!selectedId) return null;
     setSaving(true);
     setError(null);
@@ -177,11 +212,10 @@ export function ScriptsModule() {
     };
     try {
       await invoke("save_user_script", { script: updated });
-      const refreshed = await invoke<UserScript[]>("get_user_scripts");
-      setScripts(refreshed);
       setDirty(false);
       setSavedToast(true);
-      window.setTimeout(() => setSavedToast(false), 1800);
+      setTitle(updated.title);
+      setScripts((prev) => [updated, ...prev.filter((script) => script.id !== updated.id)]);
       return updated.id;
     } catch (err) {
       setError(String(err));
@@ -191,7 +225,20 @@ export function ScriptsModule() {
     }
   }, [selectedId, title, scriptType, content]);
 
+  const handleSave = useCallback(async () => {
+    if (operation.current || !selectedId) return;
+    operation.current = true;
+    try {
+      await saveSelectedScript();
+    } finally {
+      operation.current = false;
+    }
+  }, [selectedId, saveSelectedScript]);
+
   const handleDelete = async (id: string) => {
+    if (operation.current) return;
+    operation.current = true;
+    setDeleting(true);
     setError(null);
     try {
       await invoke("delete_user_script", { id });
@@ -206,36 +253,64 @@ export function ScriptsModule() {
       }
     } catch (err) {
       setError(String(err));
+    } finally {
+      operation.current = false;
+      setDeleting(false);
     }
   };
 
-  const handleCopyContent = async () => {
-    await copyTextToClipboard(content);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1600);
+  const copy = async (text: string, onCopied: (copied: boolean) => void) => {
+    try {
+      await copyTextToClipboard(text);
+      onCopied(true);
+    } catch (err) {
+      onCopied(false);
+      setError(String(err));
+    }
   };
 
   const handleRun = async () => {
-    if (!selectedId) return;
+    if (!selectedId || scriptType === "text" || operation.current) return;
+    operation.current = true;
     setError(null);
-    let targetId: string | null = selectedId;
-    if (dirty || !scripts.some((s) => s.id === selectedId)) {
-      targetId = await handleSave();
-      if (!targetId) return;
-    }
     setRunning(true);
-    setConsoleOutput("Исполнение сценария…");
+    setConsoleResult(null);
+    setOutputCopied(false);
+    setExecutionTitle(title.trim() || "Без названия");
     try {
-      const result = await invoke<string>("run_user_script", {
+      const targetId = dirty || !scripts.some((s) => s.id === selectedId)
+        ? await saveSelectedScript()
+        : selectedId;
+      if (!targetId) return;
+      const result = await invoke<ScriptRunResult>("run_user_script_details", {
         id: targetId,
         asAdmin,
       });
-      setConsoleOutput(result);
+      setConsoleResult(result);
     } catch (err) {
-      setConsoleOutput(`[ОШИБКА]\n${String(err)}`);
+      setConsoleResult({ output: String(err), exit_code: null, timed_out: false, skipped: false });
     } finally {
+      operation.current = false;
       setRunning(false);
     }
+  };
+
+  const applyLibraryAction = (action: LibraryAction) => {
+    if (action.kind === "create") handleCreateNew();
+    else if (action.kind === "select") selectScript(action.script);
+    else void handleDelete(action.script.id);
+  };
+
+  const requestLibraryAction = (action: LibraryAction) => {
+    if (busy || operation.current || (action.kind === "select" && action.script.id === selectedId)) return;
+    if (dirty || action.kind === "delete") setConfirmation(action);
+    else applyLibraryAction(action);
+  };
+
+  const markDirty = () => {
+    setDirty(true);
+    setSavedToast(false);
+    setCopied(false);
   };
 
   const handleEditorKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -244,14 +319,14 @@ export function ScriptsModule() {
       void handleSave();
       return;
     }
-    if (event.key === "Tab") {
+    if (event.key === "Tab" && !event.shiftKey && !busy) {
       event.preventDefault();
       const target = event.currentTarget;
       const start = target.selectionStart;
       const end = target.selectionEnd;
       const next = `${content.slice(0, start)}  ${content.slice(end)}`;
       setContent(next);
-      setDirty(true);
+      markDirty();
       requestAnimationFrame(() => {
         target.selectionStart = start + 2;
         target.selectionEnd = start + 2;
@@ -280,9 +355,9 @@ export function ScriptsModule() {
         animate={{ opacity: 1, y: 0 }}
         exit={{ opacity: 0, y: -4 }}
         transition={{ duration: 0.16, ease: "easeOut" }}
-        className="w-full space-y-4"
+        className="avs-module avs-scripts w-full space-y-4"
       >
-        <PageHeader
+        <ModuleHeader module="scripts"
           title="Скрипты и автоматизация"
           description="Локальная библиотека, редактор и выполнение сценариев PowerShell, Batch и VBScript"
           actions={
@@ -290,15 +365,16 @@ export function ScriptsModule() {
               <button
                 type="button"
                 onClick={() => setArchiveOpen(true)}
-                className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-[#202B38] bg-[#10151D] px-3.5 py-2 font-mono text-xs font-semibold uppercase tracking-wider text-[#E5EDF5] transition-colors hover:border-[#00D5E8]/45 hover:text-[#00D5E8]"
+                className="nexus-button"
               >
                 <FolderArchive size={14} className="text-[#00D5E8]" />
                 Создать архив
               </button>
               <button
                 type="button"
-                onClick={handleCreateNew}
-                className="cyber-btn inline-flex cursor-pointer items-center gap-2 px-4 py-2 font-mono text-xs font-semibold uppercase tracking-wider text-[#00D5E8]"
+                onClick={() => requestLibraryAction({ kind: "create" })}
+                disabled={busy || !selectedId}
+                className="nexus-button nexus-button--primary"
               >
                 <Plus size={14} />
                 Новый скрипт
@@ -308,14 +384,15 @@ export function ScriptsModule() {
         />
 
       {error && (
-        <div className="rounded-xl border border-rose-500/35 bg-rose-500/12 px-4 py-2.5 text-xs text-rose-300">
+        <div role="alert" className="rounded-xl border border-rose-500/35 bg-rose-500/12 px-4 py-2.5 text-sm text-rose-300">
           {error}
         </div>
       )}
 
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
+      <div className="avs-script-workbench">
         {/* Левая колонка: Библиотека скриптов */}
-        <div className="tactical-card tactical-brackets flex flex-col rounded-xl p-4 lg:col-span-4">
+        <section aria-label="Библиотека скриптов" className="nexus-panel flex min-w-0 flex-col p-4">
+          <h3 className="mb-3 text-sm font-semibold text-[#E5EDF5]">Библиотека <span className="ml-1 tabular-nums text-[#a0adbb]">{scripts.length}</span></h3>
           <div className="relative mb-3">
             <Search
               size={14}
@@ -326,11 +403,12 @@ export function ScriptsModule() {
               value={search}
               onChange={(event) => setSearch(event.target.value)}
               placeholder="Поиск по библиотеке…"
+              aria-label="Поиск по библиотеке скриптов"
               className="w-full rounded-lg border border-[#202B38] bg-[#0B0E14] py-2 pl-9 pr-3 text-xs text-[#E5EDF5] outline-none placeholder:text-[#526170] focus:border-[#00D5E8]/50"
             />
           </div>
 
-          <div className="max-h-[calc(100vh-280px)] min-h-[340px] flex-1 space-y-2 overflow-y-auto pr-1">
+          <div className="max-h-[min(42vh,24rem)] min-h-24 flex-1 divide-y divide-[#242e3b] overflow-y-auto min-[860px]:max-h-[calc(100vh-275px)]">
             {loading ? (
               <div className="flex items-center justify-center gap-2 py-12 font-mono text-xs text-[#8292A3]">
                 <Loader2 size={14} className="animate-spin text-[#00D5E8]" />
@@ -339,7 +417,12 @@ export function ScriptsModule() {
             ) : filteredScripts.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-12 text-center">
                 <FileCode size={24} className="mb-2 text-[#526170]" />
-                <div className="text-xs text-[#8292A3]">Скрипты не найдены</div>
+                <div className="text-sm text-[#a0adbb]">
+                  {search.trim() ? "Нет совпадений" : !selectedId ? "Библиотека недоступна" : "Сохранённых скриптов пока нет"}
+                </div>
+                {!selectedId && !search.trim() && (
+                  <button type="button" className="nexus-button mt-2" onClick={() => void loadScripts()}>Повторить загрузку</button>
+                )}
               </div>
             ) : (
               filteredScripts.map((item) => {
@@ -348,39 +431,43 @@ export function ScriptsModule() {
                 return (
                   <div
                     key={item.id}
-                    onClick={() => selectScript(item)}
-                    className={`group relative flex cursor-pointer items-start justify-between gap-2 rounded-lg border p-3 transition-all ${
+                    className={`group relative flex items-center justify-between gap-1 rounded-md transition-colors ${
                       active
-                        ? "border-[#00D5E8]/45 bg-[#00D5E8]/10"
-                        : "border-[#202B38] bg-[#0B0E14] hover:border-[#202B38] hover:bg-[#151C26]"
+                        ? "bg-[#00D5E8]/10"
+                        : "hover:bg-[#151C26]"
                     }`}
                   >
                     {active && (
                       <span className="absolute inset-y-1.5 left-0 w-[3px] rounded-r bg-[#00D5E8]" />
                     )}
-                    <div className="min-w-0 flex-1 pl-1">
+                    <button
+                      type="button"
+                      disabled={busy}
+                      aria-pressed={active}
+                      onClick={() => requestLibraryAction({ kind: "select", script: item })}
+                      className="min-w-0 flex-1 cursor-pointer py-2.5 pl-3 text-left disabled:cursor-wait"
+                    >
                       <div className="flex items-center gap-2">
                         <span
                           className={`shrink-0 rounded border px-1.5 py-0.5 font-mono text-[10px] font-semibold ${meta.badgeClass}`}
                         >
                           {meta.badge}
                         </span>
-                        <span className="truncate text-sm font-medium text-[#E5EDF5]">
+                        <span className="truncate text-sm font-medium text-[#E5EDF5]" title={item.title}>
                           {item.title}
                         </span>
                       </div>
-                      <div className="mt-1.5 flex items-center justify-between font-mono text-[10px] text-[#526170]">
-                        <span>Изменён: {formatUpdatedDate(item.updated_at)}</span>
+                      <div className="mt-1 text-xs text-[#a0adbb]">
+                        <span>{formatUpdatedDate(item.updated_at)}</span>
                       </div>
-                    </div>
+                    </button>
                     <button
                       type="button"
                       title="Удалить скрипт"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void handleDelete(item.id);
-                      }}
-                      className="cursor-pointer rounded p-1 text-[#526170] opacity-0 transition-opacity hover:bg-rose-500/15 hover:text-rose-300 group-hover:opacity-100"
+                      aria-label={`Удалить скрипт: ${item.title}`}
+                      disabled={busy}
+                      onClick={() => requestLibraryAction({ kind: "delete", script: item })}
+                      className="mr-1 cursor-pointer rounded p-2 text-[#a0adbb] hover:bg-rose-500/15 hover:text-rose-300 disabled:opacity-45"
                     >
                       <Trash2 size={13} />
                     </button>
@@ -389,22 +476,23 @@ export function ScriptsModule() {
               })
             )}
           </div>
-        </div>
+        </section>
 
         {/* Правая колонка: Редактор и Консоль */}
-        <div className="flex flex-col gap-4 lg:col-span-8">
-          <div className="tactical-card tactical-brackets flex flex-col gap-3.5 rounded-xl p-4">
+        <div className="flex min-w-0 flex-col gap-4">
+          <fieldset disabled={busy || !selectedId} aria-label="Редактор сценария" className="nexus-panel flex min-w-0 flex-col gap-3.5 p-4">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
               <div className="min-w-0 flex-1">
-                <label className="mb-1 block text-xs font-medium text-[#8292A3]">
+                <label htmlFor="nexus-script-title" className="mb-1 block text-xs font-medium text-[#a0adbb]">
                   Название сценария
                 </label>
                 <input
                   type="text"
+                  id="nexus-script-title"
                   value={title}
                   onChange={(event) => {
                     setTitle(event.target.value);
-                    setDirty(true);
+                    markDirty();
                   }}
                   placeholder="Введите название сценария…"
                   className="w-full rounded-lg border border-[#202B38] bg-[#0B0E14] px-3 py-2 text-sm font-medium text-[#E5EDF5] outline-none placeholder:text-[#526170] focus:border-[#00D5E8]/50"
@@ -412,19 +500,20 @@ export function ScriptsModule() {
               </div>
 
               <div>
-                <label className="mb-1 block text-xs font-medium text-[#8292A3]">
+                <p className="mb-1 block text-xs font-medium text-[#a0adbb]">
                   Интерпретатор
-                </label>
-                <div className="flex flex-wrap gap-1.5">
+                </p>
+                <div role="group" aria-label="Интерпретатор" className="flex flex-wrap gap-1.5">
                   {SCRIPT_TYPES.map((t) => {
                     const active = scriptType === t.id;
                     return (
                       <button
                         key={t.id}
                         type="button"
+                        aria-pressed={active}
                         onClick={() => {
                           setScriptType(t.id);
-                          setDirty(true);
+                          markDirty();
                         }}
                         className={`cursor-pointer rounded-lg border px-2.5 py-2 font-mono text-xs font-semibold transition-colors ${
                           active
@@ -441,35 +530,38 @@ export function ScriptsModule() {
             </div>
 
             <div>
-              <div className="mb-1.5 flex items-center justify-between font-mono text-[11px] text-[#8292A3]">
+              <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2 text-xs text-[#a0adbb]">
                 <span className="flex items-center gap-1.5">
                   <Terminal size={12} className="text-[#00D5E8]" />
                   {currentTypeMeta.label}
                   {dirty && <span className="text-amber-300">· Изменено</span>}
                   {savedToast && <span className="text-[#00D5E8]">· Сохранено</span>}
                 </span>
-                <span className="text-[#526170]">Tab — отступ · Ctrl+S — сохранить</span>
+                <span className="font-mono">{content.length ? content.split("\n").length : 0} стр.</span>
               </div>
 
               <textarea
                 value={content}
+                aria-label="Код сценария"
+                wrap="off"
                 onChange={(event) => {
                   setContent(event.target.value);
-                  setDirty(true);
+                  markDirty();
                 }}
                 onKeyDown={handleEditorKeyDown}
                 spellCheck={false}
                 placeholder={currentTypeMeta.placeholder}
-                className="h-64 w-full resize-y rounded-xl border border-[#202B38] bg-[#07080B] p-3.5 font-mono text-sm leading-relaxed text-[#E5EDF5] outline-none placeholder:text-[#526170] focus:border-[#00D5E8]/50 xl:h-80"
+                className="h-64 w-full resize-y overflow-auto rounded-lg border border-[#202B38] bg-[#090e14] p-3.5 font-mono text-sm leading-relaxed text-[#E5EDF5] outline-none placeholder:text-[#77879a] focus:border-[#00D5E8]/50 xl:h-80"
               />
+              <div className="avs-editor-foot"><span>Tab — отступ · Shift+Tab — выход</span><span>Ctrl+S — сохранить</span></div>
             </div>
 
             <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[#202B38] pt-3">
               <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
-                  onClick={() => void handleCopyContent()}
-                  className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-[#202B38] bg-[#0B0E14] px-3 py-2 text-xs font-medium text-[#E5EDF5] transition-colors hover:border-[#00D5E8]/40"
+                  onClick={() => void copy(content, setCopied)}
+                  className="nexus-button"
                 >
                   {copied ? (
                     <Check size={14} className="text-[#00D5E8]" />
@@ -483,7 +575,7 @@ export function ScriptsModule() {
                   type="button"
                   disabled={saving}
                   onClick={() => void handleSave()}
-                  className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-[#202B38] bg-[#0B0E14] px-3 py-2 text-xs font-medium text-[#E5EDF5] transition-colors hover:border-[#00D5E8]/40 disabled:opacity-60"
+                  className="nexus-button"
                 >
                   {saving ? (
                     <Loader2 size={14} className="animate-spin text-[#00D5E8]" />
@@ -514,7 +606,7 @@ export function ScriptsModule() {
                   type="button"
                   disabled={running || scriptType === "text"}
                   onClick={() => void handleRun()}
-                  className="cyber-btn inline-flex cursor-pointer items-center gap-2 px-5 py-2 font-mono text-xs font-semibold uppercase tracking-wider text-[#00D5E8] disabled:opacity-45"
+                  className="nexus-button nexus-button--primary"
                 >
                   {running ? (
                     <Loader2 size={14} className="animate-spin" />
@@ -525,73 +617,72 @@ export function ScriptsModule() {
                 </button>
               </div>
             </div>
-          </div>
+          </fieldset>
 
-          {consoleOutput !== null && (() => {
-            const isTimeout = consoleOutput.includes("[TIMEOUT]");
-            const exitMatch = consoleOutput.match(/Код выхода:\s*(-?\d+)/) ?? consoleOutput.match(/\[EXIT CODE\s+(-?\d+)\]/);
-            const exitCode = exitMatch ? Number(exitMatch[1]) : null;
-            const isError =
-              isTimeout ||
-              consoleOutput.startsWith("[ОШИБКА]") ||
-              consoleOutput.includes("[ОШИБКА ·") ||
-              (exitCode !== null && exitCode !== 0);
-            const statusLabel = running
-              ? "ВЫПОЛНЕНИЕ…"
-              : isTimeout
-              ? "ТАЙМАУТ (60с)"
-              : isError
-              ? exitCode !== null
-                ? `ОШИБКА · КОД ${exitCode}`
-                : "ОШИБКА"
-              : exitCode === 0
-              ? "ЗАВЕРШЕНО · КОД 0"
-              : consoleOutput.includes("[INFO]")
-              ? "ИНФО"
-              : "ВЫПОЛНЕНО";
-            const statusBadgeClass = running
-              ? "border-[#00D5E8]/35 bg-[#00D5E8]/10 text-[#00D5E8]"
-              : isTimeout || isError
-              ? "border-rose-500/35 bg-rose-500/12 text-rose-300"
-              : "border-emerald-500/35 bg-emerald-500/12 text-emerald-300";
+        </div>
+
+          {(consoleResult !== null || running) && (() => {
+            const status = runStatus(consoleResult, running);
             return (
-              <div className="tactical-card tactical-brackets overflow-hidden rounded-xl">
-                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#202B38] bg-[#0B0E14] px-4 py-2.5">
-                  <div className="flex items-center gap-2.5">
-                    <span className="font-mono text-xs font-semibold text-[#00D5E8]">
-                      ВЫВОД ТЕРМИНАЛА (STDOUT / STDERR)
-                    </span>
-                    <span className={`rounded border px-2 py-0.5 font-mono text-[10px] font-semibold ${statusBadgeClass}`}>
-                      {statusLabel}
+              <section aria-label="Консоль сценария" className="nexus-panel avs-script-console min-w-0 overflow-hidden">
+                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#202B38] px-4 py-2.5">
+                  <div className="flex min-w-0 flex-wrap items-center gap-2.5">
+                    <h3 className="text-sm font-semibold text-[#E5EDF5]">Консоль</h3>
+                    <span className="min-w-0 truncate text-sm text-[#a0adbb]" title={executionTitle}>{executionTitle}</span>
+                    <span role="status" className={`rounded border px-2 py-0.5 text-xs font-semibold ${status.className}`}>
+                      {status.label}
                     </span>
                   </div>
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
-                      onClick={() => void copyTextToClipboard(consoleOutput)}
-                      className="cursor-pointer rounded border border-[#202B38] bg-[#10151D] px-2 py-0.5 font-mono text-[10px] text-[#8292A3] hover:border-[#00D5E8]/40 hover:text-[#00D5E8]"
+                      disabled={consoleResult === null}
+                      onClick={() => consoleResult !== null && void copy(consoleResult.output, setOutputCopied)}
+                      className="nexus-button"
                     >
-                      Копировать вывод
+                      {outputCopied ? "Скопировано" : "Копировать вывод"}
                     </button>
                     <button
                       type="button"
-                      onClick={() => setConsoleOutput(null)}
-                      className="cursor-pointer rounded p-1 text-[#8292A3] hover:text-[#E5EDF5]"
+                      disabled={running}
+                      aria-label="Скрыть консоль"
+                      onClick={() => setConsoleResult(null)}
+                      className="nexus-button"
                     >
                       <X size={13} />
                     </button>
                   </div>
                 </div>
-                <pre className="max-h-60 overflow-auto bg-[#07080B] p-4 font-mono text-xs leading-relaxed whitespace-pre-wrap text-[#E5EDF5]">
-                  {consoleOutput}
-                </pre>
-              </div>
+                {consoleResult !== null ? (
+                  <pre tabIndex={0} aria-label="Вывод стандартных потоков" className="max-h-[45vh] overflow-auto bg-[#090e14] p-4 font-mono text-sm leading-relaxed whitespace-pre text-[#E5EDF5]">
+                    {consoleResult.output || "Скрипт не вернул вывод."}
+                  </pre>
+                ) : (
+                  <p className="px-4 py-3 text-sm text-[#a0adbb]">{saving ? "Сохраняем изменения перед запуском." : "Ожидаем вывод сценария."}</p>
+                )}
+              </section>
             );
           })()}
-        </div>
       </div>
     </motion.div>
 
+      {confirmation && (
+        <UtilityConfirmDialog
+          title={confirmation.kind === "delete" ? "Удалить сохранённый скрипт?" : "Отбросить несохранённые изменения?"}
+          confirmLabel={confirmation.kind === "delete" ? "Удалить скрипт" : "Отбросить изменения"}
+          onCancel={() => setConfirmation(null)}
+          onConfirm={() => {
+            applyLibraryAction(confirmation);
+            setConfirmation(null);
+          }}
+        >
+          {confirmation.kind === "delete" ? (
+            <p>Сценарий «{confirmation.script.title}» будет удалён из библиотеки.</p>
+          ) : (
+            <p>Вернитесь в редактор и сохраните сценарий «{title.trim() || "Без названия"}», чтобы продолжить работу над ним позже.</p>
+          )}
+        </UtilityConfirmDialog>
+      )}
       <AnimatePresence>
         {archiveOpen && (
           <ArchiveCreatorModal open={archiveOpen} onClose={() => setArchiveOpen(false)} />

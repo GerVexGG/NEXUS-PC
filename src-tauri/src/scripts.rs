@@ -22,6 +22,16 @@ pub struct UserScript {
     pub script_type: String,
     pub content: String,
     pub updated_at: u64,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Serialize)]
+pub struct ScriptRunResult {
+    output: String,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    skipped: bool,
 }
 
 static SCRIPTS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -33,32 +43,15 @@ fn now_epoch_sec() -> u64 {
         .unwrap_or(0)
 }
 
-fn nexus_dir() -> PathBuf {
-    if let Ok(appdata) = std::env::var("APPDATA") {
-        if !appdata.is_empty() {
-            return PathBuf::from(appdata).join("nexus");
-        }
-    }
-    PathBuf::from("nexus-data")
-}
-
-fn scripts_path() -> PathBuf {
-    nexus_dir().join("scripts.json")
-}
-
-fn ensure_dir() -> Result<(), String> {
-    fs::create_dir_all(nexus_dir())
-        .map_err(|err| format!("Не удалось создать директорию скриптов: {err}"))
-}
-
-fn normalize_type(script_type: &str) -> String {
-    match script_type.trim().to_ascii_lowercase().as_str() {
-        "powershell" | "ps1" => "powershell".to_string(),
-        "cmd" | "bat" | "batch" => "cmd".to_string(),
-        "vbs" | "vbscript" => "vbs".to_string(),
-        "text" | "txt" => "text".to_string(),
-        _ => "powershell".to_string(),
-    }
+fn normalize_type(script_type: &str) -> Result<String, String> {
+    let kind = match script_type.trim().to_ascii_lowercase().as_str() {
+        "powershell" | "ps1" => "powershell",
+        "cmd" | "bat" | "batch" => "cmd",
+        "vbs" | "vbscript" => "vbs",
+        "text" | "txt" => "text",
+        _ => return Err(format!("Неподдерживаемый тип скрипта: {script_type}")),
+    };
+    Ok(kind.to_string())
 }
 
 fn default_starter_scripts() -> Vec<UserScript> {
@@ -70,6 +63,7 @@ fn default_starter_scripts() -> Vec<UserScript> {
             script_type: "powershell".to_string(),
             content: "$os = Get-CimInstance Win32_OperatingSystem\n$up = (Get-Date) - $os.LastBootUpTime\nWrite-Output \"OS: $($os.Caption) ($($os.Version))\"\nWrite-Output (\"Uptime: {0}d {1}h {2}m\" -f $up.Days, $up.Hours, $up.Minutes)\nGet-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 5 Name, Id, @{N='RAM_MB';E={[math]::Round($_.WorkingSet64/1MB,1)}} | Format-Table -AutoSize".to_string(),
             updated_at: ts,
+            extra: Default::default(),
         },
         UserScript {
             id: "preset-cmd-netreset".to_string(),
@@ -77,58 +71,66 @@ fn default_starter_scripts() -> Vec<UserScript> {
             script_type: "cmd".to_string(),
             content: "@echo off\nipconfig /flushdns\necho.\nnetstat -e".to_string(),
             updated_at: ts.saturating_sub(60),
+            extra: Default::default(),
         },
     ]
+}
+
+fn read_scripts_file(path: &Path) -> Result<Option<Vec<UserScript>>, String> {
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("Ошибка чтения файла scripts.json: {err}")),
+    };
+    if raw.trim().is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    serde_json::from_str(raw.trim_start_matches('\u{feff}'))
+        .map(Some)
+        .map_err(|err| format!("Повреждённый файл scripts.json оставлен без изменений: {err}"))
 }
 
 fn read_scripts_sync() -> Result<Vec<UserScript>, String> {
     let _guard = SCRIPTS_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let path = scripts_path();
-    if !path.exists() {
-        let starters = default_starter_scripts();
-        let _ = write_scripts_unlocked(&starters);
-        return Ok(starters);
-    }
-    let raw = fs::read_to_string(&path)
-        .map_err(|err| format!("Ошибка чтения файла scripts.json: {err}"))?;
-    if raw.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut scripts: Vec<UserScript> = serde_json::from_str(&raw)
-        .map_err(|err| format!("Ошибка разбора JSON в scripts.json: {err}"))?;
+    let path = crate::profile::file("scripts.json")?;
+    let mut scripts = match read_scripts_file(&path)? {
+        Some(scripts) => scripts,
+        None => {
+            let starters = default_starter_scripts();
+            write_scripts_unlocked(&path, &starters)?;
+            starters
+        }
+    };
     scripts.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     Ok(scripts)
 }
 
-fn write_scripts_unlocked(scripts: &[UserScript]) -> Result<(), String> {
-    ensure_dir()?;
+fn write_scripts_unlocked(path: &Path, scripts: &[UserScript]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("Не удалось создать директорию скриптов: {err}"))?;
+    }
     let json = serde_json::to_string_pretty(scripts)
         .map_err(|err| format!("Ошибка сериализации скриптов: {err}"))?;
-    let path = scripts_path();
     let tmp_path = path.with_extension("json.tmp");
     fs::write(&tmp_path, json).map_err(|err| format!("Ошибка записи scripts.json.tmp: {err}"))?;
-    fs::rename(&tmp_path, &path).or_else(|_| {
-        fs::copy(&tmp_path, &path)
-            .map(|_| {
-                let _ = fs::remove_file(&tmp_path);
-            })
-            .map_err(|err| format!("Ошибка сохранения scripts.json: {err}"))
+    fs::rename(&tmp_path, path).map_err(|err| {
+        let _ = fs::remove_file(&tmp_path);
+        format!("Ошибка сохранения scripts.json: {err}")
     })
 }
 
-fn save_script_sync(mut script: UserScript) -> Result<(), String> {
+fn save_script_sync(script: UserScript) -> Result<(), String> {
     let _guard = SCRIPTS_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let path = scripts_path();
-    let mut list: Vec<UserScript> = if path.exists() {
-        let raw = fs::read_to_string(&path).unwrap_or_default();
-        serde_json::from_str(&raw).unwrap_or_default()
-    } else {
-        default_starter_scripts()
-    };
+    save_script_unlocked(&crate::profile::file("scripts.json")?, script)
+}
+
+fn save_script_unlocked(path: &Path, mut script: UserScript) -> Result<(), String> {
+    let mut list = read_scripts_file(path)?.unwrap_or_else(default_starter_scripts);
 
     if script.id.trim().is_empty() {
         script.id = format!("script-{}", now_epoch_sec());
@@ -136,32 +138,34 @@ fn save_script_sync(mut script: UserScript) -> Result<(), String> {
     if script.title.trim().is_empty() {
         script.title = "Без названия".to_string();
     }
-    script.script_type = normalize_type(&script.script_type);
+    script.script_type = normalize_type(&script.script_type)?;
     script.updated_at = now_epoch_sec();
 
     if let Some(existing) = list.iter_mut().find(|item| item.id == script.id) {
+        // The editor submits only the fields it understands.
+        script.extra = std::mem::take(&mut existing.extra);
         *existing = script;
     } else {
         list.push(script);
     }
 
     list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    write_scripts_unlocked(&list)
+    write_scripts_unlocked(path, &list)
 }
 
 fn delete_script_sync(id: &str) -> Result<(), String> {
     let _guard = SCRIPTS_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let path = scripts_path();
-    if !path.exists() {
+    delete_script_unlocked(&crate::profile::file("scripts.json")?, id)
+}
+
+fn delete_script_unlocked(path: &Path, id: &str) -> Result<(), String> {
+    let Some(mut list) = read_scripts_file(path)? else {
         return Ok(());
-    }
-    let raw = fs::read_to_string(&path)
-        .map_err(|err| format!("Ошибка чтения scripts.json: {err}"))?;
-    let mut list: Vec<UserScript> = serde_json::from_str(&raw).unwrap_or_default();
+    };
     list.retain(|item| item.id != id);
-    write_scripts_unlocked(&list)
+    write_scripts_unlocked(path, &list)
 }
 
 struct TempFilesGuard(Vec<PathBuf>);
@@ -454,9 +458,7 @@ fn format_captured_result(
                 combined.push_str("\n\n");
             }
             if elevated_label {
-                combined.push_str(&format!(
-                    "[ОШИБКА · Администратор · Код выхода: {code}]"
-                ));
+                combined.push_str(&format!("[ОШИБКА · Администратор · Код выхода: {code}]"));
             } else {
                 combined.push_str(&format!("[ОШИБКА · Код выхода: {code}]"));
             }
@@ -472,16 +474,38 @@ fn format_captured_result(
     }
 }
 
-fn run_script_sync(id: &str, as_admin: bool) -> Result<String, String> {
+fn to_run_result(
+    kind: &str,
+    captured: &CapturedProcessResult,
+    elevated_label: bool,
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> ScriptRunResult {
+    ScriptRunResult {
+        output: format_captured_result(kind, captured, elevated_label, timeout, max_output_bytes),
+        exit_code: captured.exit_code.filter(|_| !captured.timed_out),
+        timed_out: captured.timed_out,
+        skipped: false,
+    }
+}
+
+fn run_script_sync(id: &str, as_admin: bool) -> Result<ScriptRunResult, String> {
     let scripts = read_scripts_sync()?;
     let script = scripts
         .into_iter()
         .find(|item| item.id == id)
         .ok_or_else(|| "Скрипт не найден. Сохраните скрипт перед запуском.".to_string())?;
 
-    let kind = normalize_type(&script.script_type);
+    let kind = normalize_type(&script.script_type)?;
     if kind == "text" {
-        return Ok("[INFO] Текстовая заметка (TXT) не предназначена для выполнения интерпретатором.".to_string());
+        return Ok(ScriptRunResult {
+            output:
+                "[INFO] Текстовая заметка (TXT) не предназначена для выполнения интерпретатором."
+                    .to_string(),
+            exit_code: None,
+            timed_out: false,
+            skipped: true,
+        });
     }
     if script.content.trim().is_empty() {
         return Err("Тело скрипта пусто".to_string());
@@ -522,7 +546,7 @@ fn run_script_sync(id: &str, as_admin: bool) -> Result<String, String> {
         DEFAULT_SCRIPT_TIMEOUT,
         MAX_SCRIPT_OUTPUT_BYTES,
     )?;
-    Ok(format_captured_result(
+    Ok(to_run_result(
         &kind,
         &res,
         as_admin && crate::check_is_elevated_admin(),
@@ -576,17 +600,16 @@ fn build_elevated_wrapper_body(
     let timeout_ms = timeout.as_millis().clamp(1000, i32::MAX as u128) as i32;
 
     let (exe_literal, args_expr) = match kind {
-        "cmd" => (
-            "cmd.exe",
-            format!("('/d /c \"' + '{script_sq}' + '\"')"),
-        ),
+        "cmd" => ("cmd.exe", format!("('/d /c \"' + '{script_sq}' + '\"')")),
         "vbs" => (
             "cscript.exe",
             format!("('//NoLogo //U \"' + '{script_sq}' + '\"')"),
         ),
         _ => (
             "powershell.exe",
-            format!("('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"' + '{script_sq}' + '\"')"),
+            format!(
+                "('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"' + '{script_sq}' + '\"')"
+            ),
         ),
     };
 
@@ -647,7 +670,7 @@ fn run_elevated_via_powershell(
     content: &str,
     timeout: Duration,
     max_output_bytes: usize,
-) -> Result<String, String> {
+) -> Result<ScriptRunResult, String> {
     let _ = fs::create_dir_all(temp_dir);
     let mut guard = TempFilesGuard::new();
 
@@ -689,18 +712,28 @@ fn run_elevated_via_powershell(
 
     // Внешний таймаут slightly > внутреннего (даёт wrapper время завершить дочернее дерево и записать exit.code)
     let launcher_timeout = timeout.saturating_add(Duration::from_secs(30));
-    let launcher_res =
-        run_command_with_timeout_and_limit(cmd, launcher_timeout, max_output_bytes, "UAC PowerShell")
-            .map_err(|e| format!("Не удалось запросить права Администратора (UAC): {e}"))?;
+    let launcher_res = run_command_with_timeout_and_limit(
+        cmd,
+        launcher_timeout,
+        max_output_bytes,
+        "UAC PowerShell",
+    )
+    .map_err(|e| format!("Не удалось запросить права Администратора (UAC): {e}"))?;
 
     let exit_marker = fs::read_to_string(&exit_code_file).unwrap_or_default();
     let exit_trimmed = exit_marker.trim();
     let (stdout, stdout_truncated) = read_file_capped(&out_log, max_output_bytes);
     let (stderr, stderr_truncated) = read_file_capped(&err_log, max_output_bytes);
 
-    if exit_trimmed.is_empty() && launcher_res.exit_code != Some(0) && stdout.is_empty() && stderr.is_empty() {
+    if exit_trimmed.is_empty()
+        && launcher_res.exit_code != Some(0)
+        && stdout.is_empty()
+        && stderr.is_empty()
+    {
         if launcher_res.timed_out {
-            return Err("Превышено время ожидания запуска с правами Администратора (UAC).".to_string());
+            return Err(
+                "Превышено время ожидания запуска с правами Администратора (UAC).".to_string(),
+            );
         }
         let msg = decode_output_bytes("powershell", &launcher_res.stderr);
         let msg_trimmed = msg.trim();
@@ -714,10 +747,8 @@ fn run_elevated_via_powershell(
     let inner_timed_out = exit_trimmed.eq_ignore_ascii_case("TIMEOUT") || launcher_res.timed_out;
     let inner_exit_code = if inner_timed_out {
         None
-    } else if !exit_trimmed.is_empty() {
-        exit_trimmed.parse::<i32>().ok()
     } else {
-        launcher_res.exit_code
+        exit_trimmed.parse::<i32>().ok()
     };
 
     let captured = CapturedProcessResult {
@@ -729,7 +760,7 @@ fn run_elevated_via_powershell(
         stderr_truncated,
     };
 
-    Ok(format_captured_result(
+    Ok(to_run_result(
         kind,
         &captured,
         true,
@@ -761,6 +792,16 @@ pub async fn delete_user_script(id: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn run_user_script(id: String, as_admin: bool) -> Result<String, String> {
+    run_user_script_details(id, as_admin)
+        .await
+        .map(|result| result.output)
+}
+
+#[tauri::command]
+pub async fn run_user_script_details(
+    id: String,
+    as_admin: bool,
+) -> Result<ScriptRunResult, String> {
     tauri::async_runtime::spawn_blocking(move || run_script_sync(&id, as_admin))
         .await
         .map_err(|err| format!("Ошибка потока выполнения скрипта: {err}"))?
@@ -782,6 +823,65 @@ mod tests {
     }
 
     #[test]
+    fn script_mutations_preserve_malformed_library() {
+        let mut files = TempFilesGuard::new();
+        let path = files.track(test_temp_dir("invalid_library").with_extension("json"));
+        let original = br#"[{"id":"keep-me""#;
+        fs::write(&path, original).expect("write invalid library");
+        let script = default_starter_scripts().remove(0);
+        assert!(save_script_unlocked(&path, script).is_err());
+        assert!(delete_script_unlocked(&path, "keep-me").is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn script_mutations_update_existing_library() {
+        let mut files = TempFilesGuard::new();
+        let path = files.track(test_temp_dir("existing_library").with_extension("json"));
+        let mut starters = default_starter_scripts();
+        starters[0].extra.insert("revision".into(), 42.into());
+        write_scripts_unlocked(&path, &starters).expect("write a new library");
+        let mut edited = starters.remove(0);
+        edited.extra.clear();
+        edited.title = "Edited title".to_string();
+        save_script_unlocked(&path, edited.clone()).expect("replace the existing file");
+        delete_script_unlocked(&path, &starters[0].id).expect("remove the other script");
+        let remaining = read_scripts_file(&path).unwrap().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, edited.id);
+        assert_eq!(remaining[0].title, edited.title);
+        assert_eq!(remaining[0].extra["revision"], 42);
+        assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn script_result_metadata_does_not_depend_on_output_text() {
+        let dir = test_temp_dir("metadata");
+        let captured = execute_script_content_with_limits(
+            &dir,
+            "markers",
+            "cmd",
+            "@echo off\r\necho [TIMEOUT] printed intentionally\r\nexit /b 0",
+            Duration::from_secs(10),
+            MAX_SCRIPT_OUTPUT_BYTES,
+        )
+        .expect("run a script that prints a timeout marker");
+        let result = to_run_result(
+            "cmd",
+            &captured,
+            false,
+            Duration::from_secs(10),
+            MAX_SCRIPT_OUTPUT_BYTES,
+        );
+        assert!(result.output.contains("[TIMEOUT]"));
+        assert_eq!(result.exit_code, Some(0));
+        assert!(!result.timed_out);
+        assert!(!result.skipped);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
     fn script_reports_nonzero_exit_code_and_never_fakes_admin_ok() {
         let dir = test_temp_dir("exitcode");
         let res = execute_script_content_with_limits(
@@ -796,10 +896,25 @@ mod tests {
         assert_eq!(res.exit_code, Some(5));
         assert!(!res.timed_out);
 
-        let text = format_captured_result(&"cmd", &res, true, Duration::from_secs(10), MAX_SCRIPT_OUTPUT_BYTES);
-        assert!(text.contains("Код выхода: 5"), "Expected exit code 5 in output: {text}");
-        assert!(!text.contains("[ADMIN OK]"), "Nonzero script must never emit [ADMIN OK]: {text}");
-        assert!(!dir.join("nonzero.cmd").exists(), "Temp script file must be cleaned up");
+        let text = format_captured_result(
+            &"cmd",
+            &res,
+            true,
+            Duration::from_secs(10),
+            MAX_SCRIPT_OUTPUT_BYTES,
+        );
+        assert!(
+            text.contains("Код выхода: 5"),
+            "Expected exit code 5 in output: {text}"
+        );
+        assert!(
+            !text.contains("[ADMIN OK]"),
+            "Nonzero script must never emit [ADMIN OK]: {text}"
+        );
+        assert!(
+            !dir.join("nonzero.cmd").exists(),
+            "Temp script file must be cleaned up"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -838,13 +953,25 @@ mod tests {
             MAX_SCRIPT_OUTPUT_BYTES,
         )
         .expect("timed-out execution returns CapturedProcessResult");
-        assert!(started.elapsed() < Duration::from_secs(5), "Hung script must be killed promptly");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "Hung script must be killed promptly"
+        );
         assert!(res.timed_out);
         assert_eq!(res.exit_code, None);
 
-        let text = format_captured_result("powershell", &res, false, Duration::from_millis(350), MAX_SCRIPT_OUTPUT_BYTES);
+        let text = format_captured_result(
+            "powershell",
+            &res,
+            false,
+            Duration::from_millis(350),
+            MAX_SCRIPT_OUTPUT_BYTES,
+        );
         assert!(text.contains("[TIMEOUT]"));
-        assert!(!dir.join("hang.ps1").exists(), "Temp file must be deleted on timeout");
+        assert!(
+            !dir.join("hang.ps1").exists(),
+            "Temp file must be deleted on timeout"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -857,7 +984,11 @@ mod tests {
         let out_log = guard.track(dir.join("inner_out.log"));
         let err_log = guard.track(dir.join("inner_err.log"));
         let exit_code_file = guard.track(dir.join("inner_exit.code"));
-        fs::write(&script, b"@echo off\r\necho elevated_check\r\nexit /b 7\r\n").unwrap();
+        fs::write(
+            &script,
+            b"@echo off\r\necho elevated_check\r\nexit /b 7\r\n",
+        )
+        .unwrap();
 
         let wrapper_body = build_elevated_wrapper_body(
             "cmd",

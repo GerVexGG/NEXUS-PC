@@ -1,5 +1,22 @@
-import { useEffect, useRef, memo, type ReactNode, type MouseEvent } from "react";
+import type { RttSample } from "./latencyHistory";
+import type { ReactNode, MouseEvent } from "react";
 import { motion, type Variants } from "framer-motion";
+import { getLoadBarStyles } from "./metricsFormatters";
+export {
+  HISTORY_LENGTH,
+  type HistoryPoint,
+  createInitialHistory,
+  formatCountdown,
+  formatSpeedParts,
+  formatRate,
+  formatUptime,
+  getPingHudStyle,
+  formatBytes,
+  getTempBadgeStyle,
+  getLoadBarStyles,
+  evaluateZipLimits,
+  parseScriptConsoleStatus,
+} from "./metricsFormatters";
 
 export interface Metrics {
   cpu_usage: number;
@@ -14,6 +31,7 @@ export interface Metrics {
   net_tx_kbps: number;
   net_ping_ms: number;
   net_ping_method?: string;
+  net_ping_sample?: RttSample | null;
 }
 
 export interface DriveVolumeInfo {
@@ -61,6 +79,20 @@ export interface ScanResult {
   skipped_files_count?: number;
   is_partial?: boolean;
   skipped_samples?: string[];
+  total_dirs_count?: number;
+  excluded_count?: number;
+  diagnostics?: {
+    elapsed_ms: number;
+    enumeration_worker_ms: number;
+    metadata_worker_ms: number;
+    counting_worker_ms: number;
+    aggregation_worker_ms: number;
+    tree_worker_ms: number;
+    finalize_ms: number;
+    serialization_sample_ms: number;
+    json_bytes: number;
+  };
+  ipc_roundtrip_ms?: number;
 }
 
 export interface TreemapRect {
@@ -80,6 +112,7 @@ export interface CoreTemp {
 export interface CpuTelemetry {
   name: string;
   package_temp_c: number | null;
+  package_temp_sensor?: string | null;
   max_core_temp_c: number | null;
   avg_clock_mhz: number | null;
   power_watts: number | null;
@@ -170,6 +203,7 @@ export interface NetworkHealthProbe {
   external_reachable: boolean;
   external_ping_ms: number | null;
   external_method: string;
+  external_route?: string | null;
 }
 
 export interface NetworkOptimizerStatus {
@@ -272,7 +306,7 @@ export interface TelemetrySnapshot {
   timestamp: number;
   cpu_usage: number;
   cpu_temp: number | null;
-  gpu_usage: number;
+  gpu_usage: number | null;
   gpu_temp: number | null;
   ram_used_percent: number;
   top_process_name: string;
@@ -317,6 +351,7 @@ export interface CleanupReport {
 }
 
 export interface ProcessItem {
+  has_main_window?: boolean;
   pid: number;
   parent_pid: number | null;
   name: string;
@@ -325,12 +360,16 @@ export interface ProcessItem {
   memory_mb: number;
   disk_read_bytes_sec: number;
   disk_write_bytes_sec: number;
+  disk_status?: "ready" | "pending" | "unavailable" | "error";
+  disk_error_code?: number;
   run_time_sec: number;
   start_time: number;
   thread_count: number;
   handle_count: number;
   status: string;
   icon_base64: string | null;
+  owner?: string | null;
+  description?: string | null;
 }
 
 export interface ProcessTargetIdentity {
@@ -385,7 +424,11 @@ export type ProcessSortKey =
   | "disk"
   | "runtime"
   | "threads"
-  | "handles";
+  | "handles"
+  | "owner"
+  | "description"
+  | "path"
+  | "status";
 
 export interface ProcessContextMenuState {
   x: number;
@@ -395,43 +438,24 @@ export interface ProcessContextMenuState {
 
 export const PROCESS_REFRESH_MS = 1500;
 
-export function formatRate(bytesPerSec: number): string {
-  if (!Number.isFinite(bytesPerSec) || bytesPerSec <= 0) return "0";
-  if (bytesPerSec >= 1024 * 1024) return `${(bytesPerSec / 1024 / 1024).toFixed(1)} MB/s`;
-  if (bytesPerSec >= 1024) return `${(bytesPerSec / 1024).toFixed(0)} KB/s`;
-  return `${bytesPerSec} B/s`;
-}
-
-export function formatUptime(totalSec: number): string {
-  if (!Number.isFinite(totalSec) || totalSec <= 0) return "—";
-  const d = Math.floor(totalSec / 86400);
-  const h = Math.floor((totalSec % 86400) / 3600);
-  const m = Math.floor((totalSec % 3600) / 60);
-  const s = Math.floor(totalSec % 60);
-  if (d > 0) return `${d}д ${h}ч`;
-  if (h > 0) return `${h}ч ${m.toString().padStart(2, "0")}м`;
-  return `${m}м ${s.toString().padStart(2, "0")}с`;
-}
-
 export async function copyTextToClipboard(text: string): Promise<void> {
   try {
     await navigator.clipboard.writeText(text);
   } catch {
+    const previous = document.activeElement;
     const area = document.createElement("textarea");
     area.value = text;
     area.style.position = "fixed";
     area.style.opacity = "0";
     document.body.appendChild(area);
-    area.select();
-    document.execCommand("copy");
-    document.body.removeChild(area);
+    try {
+      area.select();
+      if (!document.execCommand("copy")) throw new Error("Не удалось скопировать текст в буфер обмена");
+    } finally {
+      area.remove();
+      if (previous instanceof HTMLElement) previous.focus({ preventScroll: true });
+    }
   }
-}
-
-export interface HistoryPoint {
-  timestamp: string;
-  cpu: number;
-  ram: number;
 }
 
 export type PowerTimerAction = "shutdown" | "restart" | "sleep";
@@ -458,7 +482,6 @@ export interface StoredTimerState {
 
 export const TIMER_STORAGE_KEY = "nexus_power_timer";
 export const PRESET_MINUTES = [15, 30, 45, 60];
-export const HISTORY_LENGTH = 60;
 
 export const TREEMAP_PALETTE = [
   "from-[#00D5E8]/28 to-[#0B0E14]/90 border-[#00D5E8]/40 hover:border-[#00D5E8]/80 text-[#E5EDF5]",
@@ -497,142 +520,6 @@ export const cardItemVariants: Variants = {
     },
   },
 };
-
-export function createInitialHistory(): HistoryPoint[] {
-  const now = Date.now();
-  return Array.from({ length: HISTORY_LENGTH }, (_, idx) => {
-    const t = new Date(now - (HISTORY_LENGTH - 1 - idx) * 1000);
-    return {
-      timestamp: t.toLocaleTimeString("ru-RU", {
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-      }),
-      cpu: 0,
-      ram: 0,
-    };
-  });
-}
-
-export function formatCountdown(seconds: number): string {
-  const safeSeconds = Math.max(0, Math.floor(seconds));
-  const hrs = Math.floor(safeSeconds / 3600);
-  const mins = Math.floor((safeSeconds % 3600) / 60);
-  const secs = safeSeconds % 60;
-
-  const pad = (n: number) => n.toString().padStart(2, "0");
-  if (hrs > 0) {
-    return `${pad(hrs)}:${pad(mins)}:${pad(secs)}`;
-  }
-  return `${pad(mins)}:${pad(secs)}`;
-}
-
-export function formatSpeedParts(kbps: number): { value: string; unit: string } {
-  if (!Number.isFinite(kbps) || kbps <= 0) {
-    return { value: "0.0", unit: "KB/S" };
-  }
-  if (kbps >= 1024) {
-    return { value: (kbps / 1024).toFixed(2), unit: "MB/S" };
-  }
-  return { value: kbps.toFixed(1), unit: "KB/S" };
-}
-
-export function getPingHudStyle(pingMs: number): {
-  valueText: string;
-  statusLabel: string;
-  colorClass: string;
-  badgeClass: string;
-  dotClass: string;
-  barPercent: number;
-} {
-  if (!Number.isFinite(pingMs) || pingMs <= 0 || pingMs >= 999) {
-    return {
-      valueText: "—",
-      statusLabel: "НЕТ СВЯЗИ",
-      colorClass: "text-[#8292A3]",
-      badgeClass: "bg-[#151C26] text-[#8292A3] border-[#202B38]",
-      dotClass: "bg-[#526170]",
-      barPercent: 0,
-    };
-  }
-  if (pingMs <= 80) {
-    return {
-      valueText: `${pingMs}`,
-      statusLabel: pingMs <= 40 ? "ОТЛИЧНО" : "НОРМА",
-      colorClass: "text-[#00D5E8]",
-      badgeClass: "bg-[#00D5E8]/10 text-[#00D5E8] border-[#00D5E8]/30",
-      dotClass: "bg-[#00D5E8]",
-      barPercent: Math.max(12, Math.min(100, (1 - pingMs / 150) * 100)),
-    };
-  }
-  if (pingMs <= 120) {
-    return {
-      valueText: `${pingMs}`,
-      statusLabel: "СРЕДНЕ",
-      colorClass: "text-amber-400",
-      badgeClass: "bg-amber-500/12 text-amber-300 border-amber-500/35",
-      dotClass: "bg-amber-400",
-      barPercent: Math.max(20, Math.min(100, (1 - pingMs / 160) * 100)),
-    };
-  }
-  return {
-    valueText: `${pingMs}`,
-    statusLabel: "ВЫСОКИЙ ПИНГ",
-    colorClass: "text-rose-400",
-    badgeClass: "bg-rose-500/12 text-rose-300 border-rose-500/35",
-    dotClass: "bg-rose-500",
-    barPercent: 100,
-  };
-}
-
-export function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return "0 Б";
-  const gb = bytes / (1024 * 1024 * 1024);
-  if (gb >= 1) return `${gb.toFixed(2)} ГБ`;
-  const mb = bytes / (1024 * 1024);
-  if (mb >= 1) return `${mb.toFixed(1)} МБ`;
-  const kb = bytes / 1024;
-  if (kb >= 1) return `${kb.toFixed(0)} КБ`;
-  return `${bytes} Б`;
-}
-
-export function getTempBadgeStyle(tempC: number | null | undefined): {
-  badgeClass: string;
-  textClass: string;
-  barClass: string;
-  label: string;
-} {
-  if (tempC === null || tempC === undefined || !Number.isFinite(tempC)) {
-    return {
-      badgeClass: "bg-[#151C26] text-[#8292A3] border-[#202B38]",
-      textClass: "text-[#8292A3]",
-      barClass: "bg-[#202B38]",
-      label: "Недоступно",
-    };
-  }
-  if (tempC > 80) {
-    return {
-      badgeClass: "bg-rose-500/12 text-rose-300 border-rose-500/35",
-      textClass: "text-rose-400",
-      barClass: "bg-gradient-to-r from-rose-500 to-red-400",
-      label: "КРИТИЧНО",
-    };
-  }
-  if (tempC >= 65) {
-    return {
-      badgeClass: "bg-amber-500/12 text-amber-300 border-amber-500/35",
-      textClass: "text-amber-400",
-      barClass: "bg-gradient-to-r from-amber-500 to-yellow-400",
-      label: "НАГРЕВ",
-    };
-  }
-  return {
-    badgeClass: "bg-[#00D5E8]/10 text-[#00D5E8] border-[#00D5E8]/30",
-    textClass: "text-[#00D5E8]",
-    barClass: "bg-gradient-to-r from-[#00D5E8] to-[#36AFC0]",
-    label: "НОРМА",
-  };
-}
 
 export function getCategoryStyle(category: string): {
   barClass: string;
@@ -743,42 +630,6 @@ export function computeTreemapRects(nodes: FolderNode[]): TreemapRect[] {
   return results;
 }
 
-export function getLoadBarStyles(
-  percentage: number,
-  defaultTheme: "emerald" | "cyan" = "cyan"
-): { barClass: string; badgeTextClass: string; activeSegmentClass: string } {
-  if (percentage > 90) {
-    return {
-      barClass:
-        "bg-gradient-to-r from-rose-500 to-red-400 shadow-[0_0_10px_rgba(244,63,94,0.45)]",
-      badgeTextClass: "text-rose-400",
-      activeSegmentClass: "bg-rose-400",
-    };
-  }
-  if (percentage > 70) {
-    return {
-      barClass:
-        "bg-gradient-to-r from-amber-500 to-yellow-400 shadow-[0_0_10px_rgba(245,158,11,0.4)]",
-      badgeTextClass: "text-amber-400",
-      activeSegmentClass: "bg-amber-400",
-    };
-  }
-  if (defaultTheme === "cyan") {
-    return {
-      barClass:
-        "bg-gradient-to-r from-[#00D5E8] to-[#36AFC0] shadow-[0_0_10px_rgba(0,213,232,0.35)]",
-      badgeTextClass: "text-[#00D5E8]",
-      activeSegmentClass: "bg-[#00D5E8]",
-    };
-  }
-  return {
-    barClass:
-      "bg-gradient-to-r from-[#36AFC0] to-[#00D5E8] shadow-[0_0_10px_rgba(54,175,192,0.35)]",
-    badgeTextClass: "text-[#36AFC0]",
-    activeSegmentClass: "bg-[#36AFC0]",
-  };
-}
-
 export function SegmentedHudBar({
   percentage,
   theme = "cyan",
@@ -823,24 +674,24 @@ export interface PageHeaderProps {
 
 export function PageHeader({ title, description, badge, actions }: PageHeaderProps) {
   return (
-    <div className="flex flex-col gap-3 border-b border-[#202B38] pb-3.5 sm:flex-row sm:items-center sm:justify-between">
+    <header className="nexus-page-header">
       <div className="min-w-0">
         <div className="flex flex-wrap items-center gap-2.5">
-          <h2 className="text-[22px] font-semibold tracking-tight text-[#E5EDF5]">
+          <h2 className="text-2xl font-semibold leading-tight tracking-tight">
             {title}
           </h2>
           {badge}
         </div>
-        <p className="mt-0.5 text-[13px] leading-relaxed text-[#8292A3]">
+        <p className="mt-1 text-[13px] leading-relaxed text-[var(--nexus-muted)]">
           {description}
         </p>
       </div>
       {actions && (
-        <div className="flex shrink-0 flex-wrap items-center gap-2.5">
+        <div className="nexus-page-actions">
           {actions}
         </div>
       )}
-    </div>
+    </header>
   );
 }
 
@@ -898,360 +749,3 @@ export function SpotlightCard({
     </motion.div>
   );
 }
-
-function smoothSeriesPath(
-  coords: { x: number; y: number }[],
-  baseline: number
-): { line: string; area: string } {
-  if (coords.length === 0) return { line: "", area: "" };
-
-  const fmt = (n: number) => n.toFixed(2);
-  let line = `M ${fmt(coords[0].x)} ${fmt(coords[0].y)}`;
-
-  for (let i = 0; i < coords.length - 1; i++) {
-    const p0 = coords[Math.max(0, i - 1)];
-    const p1 = coords[i];
-    const p2 = coords[i + 1];
-    const p3 = coords[Math.min(coords.length - 1, i + 2)];
-    const cp1x = p1.x + (p2.x - p0.x) / 6;
-    const cp1y = p1.y + (p2.y - p0.y) / 6;
-    const cp2x = p2.x - (p3.x - p1.x) / 6;
-    const cp2y = p2.y - (p3.y - p1.y) / 6;
-    line += ` C ${fmt(cp1x)} ${fmt(cp1y)} ${fmt(cp2x)} ${fmt(cp2y)} ${fmt(p2.x)} ${fmt(p2.y)}`;
-  }
-
-  const firstX = fmt(coords[0].x);
-  const lastX = fmt(coords[coords.length - 1].x);
-  const area = `${line} L ${lastX} ${fmt(baseline)} L ${firstX} ${fmt(baseline)} Z`;
-  return { line, area };
-}
-
-function nearestSeries(
-  history: HistoryPoint[],
-  relX: number,
-  relY: number,
-  widthPx: number,
-  heightPx: number,
-  plotWidth: number,
-  plotHeight: number,
-  maxPoints: number
-): { idx: number; series: "cpu" | "ram"; x: number; y: number } | null {
-  if (history.length === 0 || widthPx <= 0 || heightPx <= 0) return null;
-  const slot = Math.round(relX * (maxPoints - 1));
-  const center = Math.max(0, Math.min(history.length - 1, slot));
-  const mouseX = relX * widthPx;
-  const mouseY = relY * heightPx;
-  let best: { idx: number; series: "cpu" | "ram"; x: number; y: number; dist: number } | null = null;
-
-  for (let idx = Math.max(0, center - 2); idx <= Math.min(history.length - 1, center + 2); idx++) {
-    const point = history[idx];
-    const x = (idx / Math.max(1, maxPoints - 1)) * plotWidth;
-    const xPx = (x / plotWidth) * widthPx;
-    const samples: Array<{ series: "cpu" | "ram"; value: number }> = [
-      { series: "cpu", value: point.cpu },
-      { series: "ram", value: point.ram },
-    ];
-    for (const sample of samples) {
-      const clamped = Math.min(100, Math.max(0, sample.value));
-      const y = plotHeight - (clamped / 100) * (plotHeight - 16) - 8;
-      const yPx = (y / plotHeight) * heightPx;
-      const dist = Math.hypot(mouseX - xPx, mouseY - yPx);
-      if (!best || dist < best.dist) {
-        best = { idx, series: sample.series, x, y, dist };
-      }
-    }
-  }
-
-  if (!best || best.dist > 22) return null;
-  return best;
-}
-
-export const LoadHistoryChart = memo(function LoadHistoryChart({
-  history,
-}: {
-  history: HistoryPoint[];
-}) {
-  const width = 600;
-  const height = 180;
-  const maxPoints = HISTORY_LENGTH;
-  const plotRef = useRef<HTMLDivElement>(null);
-  const hoverRef = useRef<{ relX: number; relY: number } | null>(null);
-  const dotRef = useRef<HTMLDivElement>(null);
-  const badgeRef = useRef<HTMLDivElement>(null);
-  const tipRef = useRef<HTMLSpanElement>(null);
-
-  const getCoord = (idx: number, val: number) => {
-    const x = (idx / Math.max(1, maxPoints - 1)) * width;
-    const clampedVal = Math.min(100, Math.max(0, val));
-    const y = height - (clampedVal / 100) * (height - 16) - 8;
-    return { x, y };
-  };
-
-  const buildPaths = (key: "cpu" | "ram") => {
-    const coords = history.map((pt, idx) => getCoord(idx, pt[key]));
-    return smoothSeriesPath(coords, height);
-  };
-
-  const cpuPaths = buildPaths("cpu");
-  const ramPaths = buildPaths("ram");
-  const activePoint = history[history.length - 1];
-  const lastIndex = history.length - 1;
-  const cpuBeacon = activePoint ? getCoord(lastIndex, activePoint.cpu) : null;
-  const ramBeacon = activePoint ? getCoord(lastIndex, activePoint.ram) : null;
-
-  const paintHover = (relX: number, relY: number) => {
-    const plot = plotRef.current;
-    const rect = plot?.getBoundingClientRect();
-    const hit =
-      rect &&
-      nearestSeries(history, relX, relY, rect.width, rect.height, width, height, maxPoints);
-    if (!hit || !dotRef.current || !badgeRef.current || !tipRef.current) {
-      if (dotRef.current) dotRef.current.style.opacity = "0";
-      if (badgeRef.current) badgeRef.current.style.opacity = "0";
-      return;
-    }
-    const point = history[hit.idx];
-    const value = hit.series === "cpu" ? point.cpu : point.ram;
-    const xPct = (hit.x / width) * 100;
-    const yPct = (hit.y / height) * 100;
-    dotRef.current.style.opacity = "1";
-    dotRef.current.style.left = `${xPct}%`;
-    dotRef.current.style.top = `${yPct}%`;
-    dotRef.current.style.background = hit.series === "cpu" ? "#00D5E8" : "#6366F1";
-    dotRef.current.style.boxShadow =
-      hit.series === "cpu"
-        ? "0 0 8px rgba(0, 213, 232, 0.85)"
-        : "0 0 8px rgba(99, 102, 241, 0.8)";
-    badgeRef.current.style.opacity = "1";
-    badgeRef.current.style.left = `${Math.min(84, Math.max(16, xPct))}%`;
-    tipRef.current.textContent = `${point.timestamp}  ${hit.series === "cpu" ? "CPU" : "RAM"} ${value.toFixed(1)}%`;
-    tipRef.current.style.color = hit.series === "cpu" ? "#00D5E8" : "#A5B4FC";
-  };
-
-  const hideHover = () => {
-    hoverRef.current = null;
-    if (dotRef.current) dotRef.current.style.opacity = "0";
-    if (badgeRef.current) badgeRef.current.style.opacity = "0";
-  };
-
-  const moveHover = (clientX: number, clientY: number, rect: DOMRect) => {
-    if (history.length === 0 || rect.width <= 0 || rect.height <= 0) return;
-    const relX = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-    const relY = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
-    hoverRef.current = { relX, relY };
-    paintHover(relX, relY);
-  };
-
-  useEffect(() => {
-    const hover = hoverRef.current;
-    if (!hover) return;
-    paintHover(hover.relX, hover.relY);
-  }, [history, maxPoints]);
-
-  return (
-    <SpotlightCard
-      variants={cardItemVariants}
-      spotlightColor="rgba(0, 213, 232, 0.08)"
-      className="p-4 sm:p-5"
-    >
-      <div className="space-y-4">
-        <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
-          <div>
-            <div className="flex items-center gap-2.5">
-              <h3 className="text-[15px] font-semibold tracking-tight text-[#E5EDF5]">
-                Динамика нагрузки системы
-              </h3>
-              <span className="rounded border border-[#202B38] bg-[#151C26] px-2 py-0.5 font-mono text-[11px] font-medium text-[#8292A3]">
-                60 сек
-              </span>
-            </div>
-            <p className="mt-0.5 text-xs text-[#8292A3]">
-              Интервал опроса 1 сек · Срез: <span className="font-mono text-[#E5EDF5]">{activePoint?.timestamp ?? "—"}</span>
-            </p>
-          </div>
-
-          <div className="flex items-center gap-4 rounded-lg border border-[#202B38] bg-[#0B0E14] px-3.5 py-2 text-xs">
-            <div className="flex items-center gap-2">
-              <span className="h-2 w-2 rounded-full bg-[#00D5E8] shadow-[0_0_8px_rgba(0,213,232,0.75)]"></span>
-              <span className="text-[#8292A3]">CPU</span>
-              <span className="w-12 text-right font-mono font-semibold text-[#00D5E8]">
-                {activePoint ? `${activePoint.cpu.toFixed(1)}%` : "0.0%"}
-              </span>
-            </div>
-            <div className="h-3.5 w-px bg-[#202B38]" />
-            <div className="flex items-center gap-2">
-              <span className="h-2 w-2 rounded-full bg-indigo-400 shadow-[0_0_8px_rgba(99,102,241,0.7)]"></span>
-              <span className="text-[#8292A3]">RAM</span>
-              <span className="w-12 text-right font-mono font-semibold text-indigo-300">
-                {activePoint ? `${activePoint.ram.toFixed(1)}%` : "0.0%"}
-              </span>
-            </div>
-          </div>
-        </div>
-
-        <div>
-          <div
-            ref={plotRef}
-            className="relative h-[220px] w-full select-none xl:h-[260px] 2xl:h-[320px]"
-            onMouseMove={(e) => moveHover(e.clientX, e.clientY, e.currentTarget.getBoundingClientRect())}
-            onMouseLeave={hideHover}
-          >
-            <div className="pointer-events-none absolute inset-y-0 left-2.5 z-10 flex flex-col justify-between py-2 font-mono text-[11px] text-[#526170]">
-              <span>100%</span>
-              <span>75%</span>
-              <span>50%</span>
-              <span>25%</span>
-              <span>0%</span>
-            </div>
-
-            <div
-              ref={dotRef}
-              className="pointer-events-none absolute z-10 h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full opacity-0"
-            />
-            <div
-              ref={badgeRef}
-              className="pointer-events-none absolute top-2.5 z-20 -translate-x-1/2 whitespace-nowrap rounded-lg border border-[#202B38] bg-[#151C26] px-2.5 py-1 font-mono text-xs opacity-0 shadow-lg"
-            >
-              <span ref={tipRef} className="font-semibold" />
-            </div>
-
-            <svg
-              viewBox={`0 0 ${width} ${height}`}
-              preserveAspectRatio="none"
-              className="pointer-events-none h-full w-full transform-gpu overflow-visible rounded-xl border border-[#202B38] bg-[#0B0E14]"
-            >
-              <defs>
-                <linearGradient id="cpuStroke" x1="0" y1="0" x2={width} y2="0" gradientUnits="userSpaceOnUse">
-                  <stop offset="0%" stopColor="#00D5E8" />
-                  <stop offset="100%" stopColor="#36AFC0" />
-                </linearGradient>
-                <linearGradient id="ramStroke" x1="0" y1="0" x2={width} y2="0" gradientUnits="userSpaceOnUse">
-                  <stop offset="0%" stopColor="#818CF8" />
-                  <stop offset="100%" stopColor="#38BDF8" />
-                </linearGradient>
-                <linearGradient id="cpuGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#00D5E8" stopOpacity="0.28" />
-                  <stop offset="60%" stopColor="#36AFC0" stopOpacity="0.1" />
-                  <stop offset="100%" stopColor="#36AFC0" stopOpacity="0" />
-                </linearGradient>
-                <linearGradient id="ramGrad" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="#818CF8" stopOpacity="0.2" />
-                  <stop offset="100%" stopColor="#38BDF8" stopOpacity="0" />
-                </linearGradient>
-              </defs>
-
-              {[0.2, 0.4, 0.6, 0.8].map((ratio) => (
-                <line
-                  key={`v-${ratio}`}
-                  x1={width * ratio}
-                  y1={0}
-                  x2={width * ratio}
-                  y2={height}
-                  stroke="#202B38"
-                  strokeOpacity="0.55"
-                  strokeDasharray="2 4"
-                  strokeWidth="1"
-                />
-              ))}
-
-              {[0.25, 0.5, 0.75].map((ratio) => (
-                <line
-                  key={ratio}
-                  x1={0}
-                  y1={height * ratio}
-                  x2={width}
-                  y2={height * ratio}
-                  stroke="#202B38"
-                  strokeOpacity="0.75"
-                  strokeDasharray="4 4"
-                  strokeWidth="1"
-                />
-              ))}
-
-              <path d={ramPaths.area} fill="url(#ramGrad)" />
-              <path
-                d={ramPaths.line}
-                fill="none"
-                stroke="url(#ramStroke)"
-                strokeWidth="4"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                opacity="0.24"
-                vectorEffect="non-scaling-stroke"
-              />
-              <path
-                d={ramPaths.line}
-                fill="none"
-                stroke="url(#ramStroke)"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                vectorEffect="non-scaling-stroke"
-                style={{
-                  filter: "drop-shadow(0 0 6px rgba(129, 140, 248, 0.35))",
-                }}
-              />
-
-              <path d={cpuPaths.area} fill="url(#cpuGrad)" />
-              <path
-                d={cpuPaths.line}
-                fill="none"
-                stroke="url(#cpuStroke)"
-                strokeWidth="4"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                opacity="0.28"
-                vectorEffect="non-scaling-stroke"
-              />
-              <path
-                d={cpuPaths.line}
-                fill="none"
-                stroke="url(#cpuStroke)"
-                strokeWidth="2.2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                vectorEffect="non-scaling-stroke"
-                style={{ filter: "drop-shadow(0 0 6px rgba(0, 213, 232, 0.45))" }}
-              />
-            </svg>
-
-            {ramBeacon && (
-              <div
-                className="pointer-events-none absolute z-10"
-                style={{
-                  left: `${(ramBeacon.x / width) * 100}%`,
-                  top: `${(ramBeacon.y / height) * 100}%`,
-                }}
-              >
-                <div className="relative h-3 w-3 -translate-x-1/2 -translate-y-1/2 transform-gpu">
-                  <span className="absolute inset-0 animate-ping rounded-full bg-indigo-400/60" />
-                  <span className="absolute left-1/2 top-1/2 h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-indigo-300 shadow-[0_0_6px_rgba(129,140,248,0.85)]" />
-                </div>
-              </div>
-            )}
-            {cpuBeacon && (
-              <div
-                className="pointer-events-none absolute z-10"
-                style={{
-                  left: `${(cpuBeacon.x / width) * 100}%`,
-                  top: `${(cpuBeacon.y / height) * 100}%`,
-                }}
-              >
-                <div className="relative h-3 w-3 -translate-x-1/2 -translate-y-1/2 transform-gpu">
-                  <span className="absolute inset-0 animate-ping rounded-full bg-[#00D5E8]/65" />
-                  <span className="absolute left-1/2 top-1/2 h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[#00D5E8] shadow-[0_0_6px_rgba(0,213,232,0.9)]" />
-                </div>
-              </div>
-            )}
-          </div>
-
-          <div className="mt-1.5 flex justify-between px-1 font-mono text-[11px] text-[#526170]">
-            <span>-60 сек</span>
-            <span>-30 сек</span>
-            <span>Сейчас</span>
-          </div>
-        </div>
-      </div>
-    </SpotlightCard>
-  );
-});

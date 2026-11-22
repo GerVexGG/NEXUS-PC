@@ -1,6 +1,7 @@
-import { useState, useMemo, useCallback } from "react";
+import { useState, useMemo, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { CleanupCategory, CleanupReport } from "../lib/studio";
+import { canSelectCleanup, recommendedCleanupIds } from "../lib/cleanupSelection";
 
 export interface CleanupProgressState {
   isAnalyzing: boolean;
@@ -15,6 +16,7 @@ export function useCleanupCenter(isElevatedAdmin: boolean) {
   const [confirmCleanupOpen, setConfirmCleanupOpen] = useState<boolean>(false);
   const [lastCleanupResult, setLastCleanupResult] = useState<CleanupReport | null>(null);
   const [cleanupError, setCleanupError] = useState<string | null>(null);
+  const busy = useRef(false);
 
   const cleanupProgress = useMemo<CleanupProgressState>(
     () => ({
@@ -25,59 +27,63 @@ export function useCleanupCenter(isElevatedAdmin: boolean) {
   );
 
   const handleAnalyzeCleanup = useCallback(async () => {
-    if (isScanningCleanup || isCleaning) return;
+    if (busy.current) return;
+    busy.current = true;
     setIsScanningCleanup(true);
     setCleanupError(null);
     setConfirmCleanupOpen(false);
     try {
       const categories = await invoke<CleanupCategory[]>("scan_cleanup_targets");
       setCleanupCategories(categories);
-      // По умолчанию отмечаем все непустые категории (кроме требующих прав админа, если нет админки)
-      const autoSelect = categories
-        .filter(
-          (c) =>
-            c.size_bytes > 0 &&
-            c.id !== "recycle_bin" &&
-            c.id !== "windows_update" &&
-            (!c.requires_admin || isElevatedAdmin)
-        )
-        .map((c) => c.id);
-      setSelectedCategories(autoSelect.length > 0 ? autoSelect : []);
+      setSelectedCategories(recommendedCleanupIds(categories, isElevatedAdmin));
+      setLastCleanupResult(null);
     } catch (err) {
       console.error("Ошибка сканирования категорий очистки:", err);
       setCleanupError(String(err));
     } finally {
+      busy.current = false;
       setIsScanningCleanup(false);
     }
-  }, [isScanningCleanup, isCleaning, isElevatedAdmin]);
+  }, [isElevatedAdmin]);
 
   const toggleCategorySelection = useCallback((id: string) => {
+    const category = cleanupCategories.find((entry) => entry.id === id);
+    if (busy.current || !category || !canSelectCleanup(category, isElevatedAdmin)) return;
     setConfirmCleanupOpen(false);
     setSelectedCategories((prev) =>
       prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
     );
-  }, []);
+  }, [cleanupCategories, isElevatedAdmin]);
 
   const handleRunCleanup = useCallback(async () => {
-    if (selectedCategories.length === 0 || isCleaning) return;
+    if (busy.current) return;
+    const included = cleanupCategories.filter((category) =>
+      selectedCategories.includes(category.id) && canSelectCleanup(category, isElevatedAdmin)
+    );
+    if (included.length === 0) return;
+    busy.current = true;
     setIsCleaning(true);
     setCleanupError(null);
     setConfirmCleanupOpen(false);
     try {
       const report = await invoke<CleanupReport>("execute_cleanup", {
-        categoryIds: selectedCategories,
+        categoryIds: included.map((category) => category.id),
       });
       setLastCleanupResult(report);
       // Обновляем размеры категорий после завершения очистки
       const refreshed = await invoke<CleanupCategory[]>("scan_cleanup_targets");
       setCleanupCategories(refreshed);
+      setSelectedCategories((prev) => prev.filter((id) =>
+        refreshed.some((category) => category.id === id && canSelectCleanup(category, isElevatedAdmin))
+      ));
     } catch (err) {
       console.error("Ошибка выполнения очистки:", err);
       setCleanupError(String(err));
     } finally {
+      busy.current = false;
       setIsCleaning(false);
     }
-  }, [selectedCategories, isCleaning]);
+  }, [cleanupCategories, isElevatedAdmin, selectedCategories]);
 
   const totalCleanupBytes = useMemo(
     () => cleanupCategories.reduce((acc, cat) => acc + cat.size_bytes, 0),

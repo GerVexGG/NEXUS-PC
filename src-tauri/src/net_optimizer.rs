@@ -10,9 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::os::windows::process::CommandExt;
 
 #[cfg(target_os = "windows")]
-use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, KEY_WOW64_64KEY};
-#[cfg(target_os = "windows")]
 use winreg::RegKey;
+#[cfg(target_os = "windows")]
+use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, KEY_WOW64_64KEY};
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -102,10 +102,7 @@ pub fn normalize_adapter_id(raw: &str) -> String {
     raw.trim().to_ascii_uppercase()
 }
 
-pub fn adapter_matches_hardware(
-    backup: &AdapterTuningBackup,
-    live: &LiveEthernetAdapter,
-) -> bool {
+pub fn adapter_matches_hardware(backup: &AdapterTuningBackup, live: &LiveEthernetAdapter) -> bool {
     if normalize_adapter_id(&backup.interface_guid) != normalize_adapter_id(&live.interface_guid) {
         return false;
     }
@@ -132,8 +129,10 @@ fn is_target_keyword(keyword: &str) -> bool {
 fn is_property_already_tuned(prop: &LiveAdapterProperty) -> bool {
     if let Some(ref disp) = prop.display_value {
         let lower = disp.trim().to_ascii_lowercase();
-        if matches!(lower.as_str(), "disabled" | "отключено" | "low" | "низкий" | "низкая")
-            || lower.contains("disabled")
+        if matches!(
+            lower.as_str(),
+            "disabled" | "отключено" | "low" | "низкий" | "низкая"
+        ) || lower.contains("disabled")
             || lower.contains("отключ")
         {
             return true;
@@ -186,10 +185,16 @@ pub struct WindowsNetworkOptimizerBackend;
 impl WindowsNetworkOptimizerBackend {
     fn run_powershell(script: &str, envs: &[(&str, &str)]) -> Result<String, String> {
         let mut cmd = Command::new("powershell.exe");
-        cmd.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -246,9 +251,7 @@ impl NetworkOptimizerBackend for WindowsNetworkOptimizerBackend {
             match key.get_value::<u32, _>(value_name) {
                 Ok(v) => Ok(SavedRegDword::Present(v)),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(SavedRegDword::Absent),
-                Err(e) => Err(format!(
-                    "Ошибка чтения параметра реестра {value_name}: {e}"
-                )),
+                Err(e) => Err(format!("Ошибка чтения параметра реестра {value_name}: {e}")),
             }
         }
         #[cfg(not(target_os = "windows"))]
@@ -263,9 +266,9 @@ impl NetworkOptimizerBackend for WindowsNetworkOptimizerBackend {
         {
             let key = Self::open_mm_key(true)?;
             match value {
-                SavedRegDword::Present(v) => key.set_value(value_name, v).map_err(|e| {
-                    format!("Не удалось записать {value_name}={v}: {e}")
-                }),
+                SavedRegDword::Present(v) => key
+                    .set_value(value_name, v)
+                    .map_err(|e| format!("Не удалось записать {value_name}={v}: {e}")),
                 SavedRegDword::Absent => match key.delete_value(value_name) {
                     Ok(()) => Ok(()),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -462,18 +465,16 @@ impl NetworkOptimizerManager {
     fn save_store(&self, store: &NetworkOptimizerBackupStore) -> Result<(), String> {
         if store.packet_priority.is_none() && store.adapters.is_empty() {
             if self.backup_path.exists() {
-                fs::remove_file(&self.backup_path).map_err(|e| {
-                    format!("Не удалось удалить пустой файл резервной копии: {e}")
-                })?;
+                fs::remove_file(&self.backup_path)
+                    .map_err(|e| format!("Не удалось удалить пустой файл резервной копии: {e}"))?;
             }
             return Ok(());
         }
 
         if let Some(parent) = self.backup_path.parent() {
             if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent).map_err(|e| {
-                    format!("Не удалось создать папку резервных копий сети: {e}")
-                })?;
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("Не удалось создать папку резервных копий сети: {e}"))?;
             }
         }
         let mut to_write = store.clone();
@@ -496,8 +497,7 @@ impl NetworkOptimizerManager {
     pub fn get_packet_priority(&self) -> Result<bool, String> {
         let throttle = self.backend.read_mm_dword("NetworkThrottlingIndex")?;
         let resp = self.backend.read_mm_dword("SystemResponsiveness")?;
-        Ok(throttle == SavedRegDword::Present(u32::MAX)
-            && resp == SavedRegDword::Present(0))
+        Ok(throttle == SavedRegDword::Present(u32::MAX) && resp == SavedRegDword::Present(0))
     }
 
     pub fn set_packet_priority(&self, enabled: bool) -> Result<String, String> {
@@ -572,11 +572,14 @@ impl NetworkOptimizerManager {
                 }
             }
 
-            Ok("Игровой приоритет сетевых пакетов включён (исходные значения сохранены)".to_string())
+            Ok(
+                "Игровой приоритет сетевых пакетов включён (исходные значения сохранены)"
+                    .to_string(),
+            )
         } else {
             let Some(mut backup) = store.packet_priority.take() else {
                 return Err(
-                    "Резервная копия исходных параметров мультимедиа не найдена — NEXUS не заменяет системные настройки произвольными значениями"
+                    "Резервная копия исходных параметров мультимедиа не найдена — AURORA не заменяет системные настройки произвольными значениями"
                         .to_string(),
                 );
             };
@@ -598,10 +601,7 @@ impl NetworkOptimizerManager {
             }
 
             if let Some(ref orig_sr) = backup.system_responsiveness {
-                match self
-                    .backend
-                    .write_mm_dword("SystemResponsiveness", orig_sr)
-                {
+                match self.backend.write_mm_dword("SystemResponsiveness", orig_sr) {
                     Ok(()) => {
                         backup.system_responsiveness = None;
                         restored.push("SystemResponsiveness");
@@ -610,8 +610,7 @@ impl NetworkOptimizerManager {
                 }
             }
 
-            if backup.network_throttling_index.is_some() || backup.system_responsiveness.is_some()
-            {
+            if backup.network_throttling_index.is_some() || backup.system_responsiveness.is_some() {
                 store.packet_priority = Some(backup);
             }
             let save_res = self.save_store(&store);
@@ -712,18 +711,19 @@ impl NetworkOptimizerManager {
                     continue;
                 };
 
-                let entry = store
-                    .adapters
-                    .entry(guid.clone())
-                    .or_insert_with(|| AdapterTuningBackup {
-                        interface_guid: guid.clone(),
-                        interface_description: adapter.interface_description.clone(),
-                        pnp_device_id: adapter.pnp_device_id.clone(),
-                        mac_address: adapter.mac_address.clone(),
-                        last_known_name: adapter.name.clone(),
-                        captured_at: now_ts.clone(),
-                        properties: HashMap::new(),
-                    });
+                let entry =
+                    store
+                        .adapters
+                        .entry(guid.clone())
+                        .or_insert_with(|| AdapterTuningBackup {
+                            interface_guid: guid.clone(),
+                            interface_description: adapter.interface_description.clone(),
+                            pnp_device_id: adapter.pnp_device_id.clone(),
+                            mac_address: adapter.mac_address.clone(),
+                            last_known_name: adapter.name.clone(),
+                            captured_at: now_ts.clone(),
+                            properties: HashMap::new(),
+                        });
 
                 entry.last_known_name = adapter.name.clone();
                 if !adapter.pnp_device_id.is_empty() {
@@ -860,7 +860,7 @@ impl NetworkOptimizerManager {
         let mut store = self.load_store()?;
         if store.adapters.is_empty() {
             return Err(
-                "Резервная копия параметров Ethernet-адаптера не найдена — NEXUS не меняет настройки драйвера, которые он не изменял"
+                "Резервная копия параметров Ethernet-адаптера не найдена — AURORA не меняет настройки драйвера, которые он не изменял"
                     .to_string(),
             );
         }
@@ -999,13 +999,7 @@ mod tests {
         }
 
         fn write_mm_dword(&self, value_name: &str, value: &SavedRegDword) -> Result<(), String> {
-            if self
-                .fail_mm_write
-                .lock()
-                .unwrap()
-                .as_deref()
-                == Some(value_name)
-            {
+            if self.fail_mm_write.lock().unwrap().as_deref() == Some(value_name) {
                 return Err(format!("mock write failure for {value_name}"));
             }
             let mut g = self.mm_values.lock().unwrap();
@@ -1096,13 +1090,13 @@ mod tests {
         let backend = Arc::new(MockNetBackend::new());
 
         // Нестандартные исходные значения: NetworkThrottlingIndex = 0 (НЕ Absent и НЕ 10!), SystemResponsiveness отсутствует (Absent!)
-        backend
-            .mm_values
-            .lock()
-            .unwrap()
-            .insert("NetworkThrottlingIndex".to_string(), SavedRegDword::Present(0));
+        backend.mm_values.lock().unwrap().insert(
+            "NetworkThrottlingIndex".to_string(),
+            SavedRegDword::Present(0),
+        );
 
-        let mgr = NetworkOptimizerManager::with_path_and_backend(backup_path.clone(), backend.clone());
+        let mgr =
+            NetworkOptimizerManager::with_path_and_backend(backup_path.clone(), backend.clone());
 
         // Без резервной копии отключение НЕ должно придумывать 10 и 20!
         assert!(mgr.set_packet_priority(false).is_err());
@@ -1147,18 +1141,17 @@ mod tests {
         let dir = TempDir::new("mm_partial");
         let backup_path = dir.0.join("network_optimizer_backup.json");
         let backend = Arc::new(MockNetBackend::new());
-        backend
-            .mm_values
-            .lock()
-            .unwrap()
-            .insert("NetworkThrottlingIndex".to_string(), SavedRegDword::Present(7));
-        backend
-            .mm_values
-            .lock()
-            .unwrap()
-            .insert("SystemResponsiveness".to_string(), SavedRegDword::Present(15));
+        backend.mm_values.lock().unwrap().insert(
+            "NetworkThrottlingIndex".to_string(),
+            SavedRegDword::Present(7),
+        );
+        backend.mm_values.lock().unwrap().insert(
+            "SystemResponsiveness".to_string(),
+            SavedRegDword::Present(15),
+        );
 
-        let mgr = NetworkOptimizerManager::with_path_and_backend(backup_path.clone(), backend.clone());
+        let mgr =
+            NetworkOptimizerManager::with_path_and_backend(backup_path.clone(), backend.clone());
 
         // Ошибка записи SystemResponsiveness -> NetworkThrottlingIndex должен откатиться обратно на 7
         *backend.fail_mm_write.lock().unwrap() = Some("SystemResponsiveness".to_string());
@@ -1180,7 +1173,10 @@ mod tests {
             backend.read_mm_dword("NetworkThrottlingIndex").unwrap(),
             SavedRegDword::Present(7)
         );
-        assert!(backup_path.exists(), "Partial restore failure must keep remaining backup");
+        assert!(
+            backup_path.exists(),
+            "Partial restore failure must keep remaining backup"
+        );
 
         // Повторное отключение после устранения ошибки корректно до-восстанавливает SystemResponsiveness = 15
         *backend.fail_mm_write.lock().unwrap() = None;
@@ -1244,13 +1240,16 @@ mod tests {
             },
         ];
 
-        let mgr = NetworkOptimizerManager::with_path_and_backend(backup_path.clone(), backend.clone());
+        let mgr =
+            NetworkOptimizerManager::with_path_and_backend(backup_path.clone(), backend.clone());
 
         // 1. Частичный сбой на 2-м свойстве -> 1-е свойство должно откатиться на "Enabled"
         *backend.fail_prop_after_count.lock().unwrap() = Some(2);
         assert!(mgr.set_ethernet_tuned(true).is_err());
         assert_eq!(
-            backend.adapters.lock().unwrap()[0].properties[0].display_value.as_deref(),
+            backend.adapters.lock().unwrap()[0].properties[0]
+                .display_value
+                .as_deref(),
             Some("Enabled"),
             "First applied property must roll back on partial tuning failure"
         );
@@ -1261,7 +1260,9 @@ mod tests {
         mgr.set_ethernet_tuned(true).unwrap();
         assert!(mgr.get_ethernet_tuned().unwrap());
         assert_eq!(
-            backend.adapters.lock().unwrap()[0].properties[1].display_value.as_deref(),
+            backend.adapters.lock().unwrap()[0].properties[1]
+                .display_value
+                .as_deref(),
             Some("Disabled")
         );
 
@@ -1276,11 +1277,15 @@ mod tests {
         let err = mgr.set_ethernet_tuned(false).unwrap_err();
         assert!(err.contains("USB Dongle"));
         assert_eq!(
-            backend.adapters.lock().unwrap()[0].properties[0].display_value.as_deref(),
+            backend.adapters.lock().unwrap()[0].properties[0]
+                .display_value
+                .as_deref(),
             Some("Enabled")
         );
         assert_eq!(
-            backend.adapters.lock().unwrap()[0].properties[1].display_value.as_deref(),
+            backend.adapters.lock().unwrap()[0].properties[1]
+                .display_value
+                .as_deref(),
             Some("Extreme"),
             "Must restore exact original 'Extreme' rather than hardcoded default"
         );
