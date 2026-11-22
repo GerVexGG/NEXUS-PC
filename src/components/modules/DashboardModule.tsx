@@ -1,533 +1,419 @@
-import { useEffect, useState, type ReactNode } from "react";
-import { Cpu, Gauge, HardDrive, MemoryStick, Power, Terminal, Trash2 } from "lucide-react";
-import { motion } from "framer-motion";
+import { formatJitter, JITTER_HELP } from "../../lib/latencyHistory";
+import { useWorkspaceState } from "../../hooks/useWorkspaceState";
+import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import {
+  Activity, ArrowDownLeft, ArrowRight, ArrowUpRight, Cable, Check, ChevronDown,
+  CircuitBoard, Clock3, Cpu, FolderOpen, Gauge, HardDrive, Layers3, MemoryStick,
+  Network, Power, Radio, Smartphone, Terminal, Trash2, type LucideIcon,
+} from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
-import { LoadHistoryChart, PageHeader, SegmentedHudBar } from "../../lib/studio";
+import { formatCountdown, type HistoryPoint } from "../../lib/studio";
 import type { NexusController } from "../../hooks/useNexusController";
+import "./DashboardAurora.css";
 
-function pingTone(pingMs: number): { value: string; label: string; className: string } {
-  if (!Number.isFinite(pingMs) || pingMs <= 0 || pingMs >= 999) {
-    return { value: "—", label: "Нет ответа", className: "text-[#8292A3]" };
-  }
-  if (pingMs <= 80) {
-    return {
-      value: `${pingMs}`,
-      label: pingMs <= 40 ? "Отлично" : "Норма",
-      className: "text-[#00D5E8]",
-    };
-  }
-  if (pingMs <= 120) {
-    return { value: `${pingMs}`, label: "Средне", className: "text-amber-400" };
-  }
-  return { value: `${pingMs}`, label: "Высокий пинг", className: "text-rose-400" };
-}
+type Sample = HistoryPoint & { capturedAt: number };
+type RouteSample = { responseMs: number | null; capturedAt: number };
+type ChartKey = "cpu" | "ram";
 
-function PingSpark({ samples }: { samples: number[] }) {
-  if (samples.length < 2) {
-    return <div className="mt-2 h-7 font-mono text-[11px] text-[#526170]">Ожидание замеров канала…</div>;
-  }
-  const min = Math.min(...samples);
-  const max = Math.max(...samples);
-  const span = Math.max(8, max - min);
-  const width = 240;
-  const height = 28;
-  const coords = samples.map((value, index) => {
-    const x = (index / (samples.length - 1)) * width;
-    const y = height - ((value - min) / span) * (height - 8) - 4;
-    return { x, y };
-  });
-  const line = coords
-    .map((pt, index) => `${index === 0 ? "M" : "L"}${pt.x.toFixed(1)},${pt.y.toFixed(1)}`)
-    .join(" ");
-  const area = `${line} L${width},${height} L0,${height} Z`;
-  return (
-    <svg viewBox={`0 0 ${width} ${height}`} className="mt-2 h-7 w-full overflow-visible" aria-hidden>
-      <defs>
-        <linearGradient id="pingAreaGrad" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="#00D5E8" stopOpacity="0.24" />
-          <stop offset="100%" stopColor="#36AFC0" stopOpacity="0" />
-        </linearGradient>
-        <linearGradient id="pingLineGrad" x1="0" y1="0" x2={width} y2="0" gradientUnits="userSpaceOnUse">
-          <stop offset="0%" stopColor="#00D5E8" />
-          <stop offset="100%" stopColor="#36AFC0" />
-        </linearGradient>
-      </defs>
-      <path d={area} fill="url(#pingAreaGrad)" />
-      <path
-        d={line}
-        fill="none"
-        stroke="url(#pingLineGrad)"
-        strokeWidth="1.75"
-        strokeLinejoin="round"
-        strokeLinecap="round"
-      />
-    </svg>
-  );
-}
-
-function MiniTrendSpark({ values, highLoad }: { values: number[]; highLoad: boolean }) {
-  const safe = values.length >= 2 ? values : [values[0] ?? 0, values[0] ?? 0];
-  const w = 48;
-  const h = 16;
-  const line = safe
-    .map((val, idx) => {
-      const x = (idx / Math.max(1, safe.length - 1)) * w;
-      const clamped = Math.min(100, Math.max(0, val));
-      const y = h - (clamped / 100) * (h - 4) - 2;
-      return `${idx === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
-    })
-    .join(" ");
-  return (
-    <svg viewBox={`0 0 ${w} ${h}`} className="h-4 w-12 shrink-0 overflow-visible" aria-hidden>
-      <path
-        d={line}
-        fill="none"
-        stroke={highLoad ? "#f43f5e" : "#00D5E8"}
-        strokeWidth="1.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
-}
-
-function MetricCard({
-  label,
-  icon,
-  value,
-  subValue,
-  detail,
-  percent,
-  badgeText,
-  badgeTone = "normal",
-  sparkValues,
-}: {
+interface RouteProbe {
+  host: string;
   label: string;
-  icon: ReactNode;
-  value: string;
-  subValue?: string;
-  detail: string;
-  percent: number;
-  badgeText: string;
-  badgeTone?: "normal" | "warn" | "critical";
-  sparkValues?: number[];
+  ping_ms: number;
+  rtt_range_ms: number | null;
+  method?: string;
+}
+
+const series = [
+  { key: "cpu", color: "#4ae7ec", label: "CPU" },
+  { key: "ram", color: "#b19aff", label: "RAM" },
+] as const;
+
+const quickLinks = [
+  { tab: "processes", label: "Процессы", Icon: Layers3, hue: "mint" },
+  { tab: "cleanup", label: "Центр очистки", Icon: Trash2, hue: "violet" },
+  { tab: "power", label: "Питание", Icon: Power, hue: "blue" },
+  { tab: "drop", label: "AURORA Drop", Icon: Smartphone, hue: "violet" },
+  { tab: "scripts", label: "Скрипты", Icon: Terminal, hue: "blue" },
+] as const;
+
+const dayFormat = new Intl.DateTimeFormat("ru-RU", { weekday: "long", day: "numeric", month: "long" });
+const percentage = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 1 });
+const chartY = (value: number) => 100 - Math.min(100, Math.max(0, value));
+
+function RouteTrend({ samples }: { samples: RouteSample[] }) {
+  const first = samples[0];
+  const last = samples[samples.length - 1];
+  const values = samples.flatMap(({ responseMs }) => responseMs === null ? [] : [responseMs]);
+  if (!first || !last || values.length < 2) return null;
+  const low = Math.min(...values);
+  const high = Math.max(...values);
+  const elapsed = Math.max(1, last.capturedAt - first.capturedAt);
+  let continuous = false;
+  const d = samples.map(({ responseMs, capturedAt }) => {
+    if (responseMs === null) { continuous = false; return ""; }
+    const x = ((capturedAt - first.capturedAt) / elapsed) * 200;
+    const y = 28 - ((responseMs - low) / Math.max(1, high - low)) * 22;
+    const command = continuous ? "L" : "M";
+    continuous = true;
+    return `${command}${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  return (
+    <details className="av-dash-trend">
+      <summary>История задержки · Москва</summary>
+      <svg viewBox="0 0 200 34" preserveAspectRatio="none" aria-hidden>
+        <path d={d} fill="none" stroke="var(--dash-cyan)" strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
+      </svg>
+      <p>Мин. {low} мс · макс. {high} мс · {values.length} ответов</p>
+    </details>
+  );
+}
+
+const Resource = memo(function Resource({ icon: Icon, label, value, unit, detail, percent, hue, readings, children, onOpen }: {
+  icon: LucideIcon; label: string; value: string | null; unit: string; detail: string;
+  percent?: number; hue: string; readings: { label: string; value: string | null }[];
+  children?: React.ReactNode; onOpen: () => void;
 }) {
-  const isHigh = badgeTone === "critical";
-  const badgeClasses =
-    badgeTone === "critical"
-      ? "border-rose-500/35 bg-rose-500/12 text-rose-300"
-      : badgeTone === "warn"
-      ? "border-amber-500/35 bg-amber-500/12 text-amber-300"
-      : "border-[#00D5E8]/30 bg-[#00D5E8]/10 text-[#00D5E8]";
+  return (
+    <button type="button" className="av-dash-resource av-dash-panel" data-hue={hue} onClick={onOpen}
+      title={detail} aria-label={`${label}. ${value === null ? "Нет показаний" : value + " " + unit}. ${detail}. Открыть датчики`}>
+      <span className="av-resource-top">
+        <span className="av-resource-symbol"><Icon size={21} aria-hidden /></span>
+        <span className="av-resource-name"><strong>{label}</strong><small>{detail}</small></span>
+        <ArrowUpRight size={14} className="av-resource-arrow" aria-hidden />
+      </span>
+      <span className="av-resource-value">{value ?? "—"} {value !== null && <small>{unit}</small>}</span>
+      {children ?? <span className="av-resource-meter" aria-hidden>
+        {percent !== undefined && <i style={{ transform: `scaleX(${Math.min(100, Math.max(0, percent)) / 100})` }} />}
+      </span>}
+      <span className="av-resource-readings">
+        {readings.map((entry) => <span key={entry.label}><b>{entry.value ?? "—"}</b><small>{entry.label}</small></span>)}
+      </span>
+    </button>
+  );
+});
+
+const CpuTrend = memo(function CpuTrend({ history }: { history: Sample[] }) {
+  const samples = history.slice(-24);
+  const first = samples[0];
+  const last = samples[samples.length - 1];
+  const id = useId();
+  if (!first || !last || first === last) return <span className="av-cpu-trend" aria-hidden />;
+  const span = Math.max(1, last.capturedAt - first.capturedAt);
+  const path = samples.map((sample, index) =>
+    `${index ? "L" : "M"} ${(220 * (sample.capturedAt - first.capturedAt) / span).toFixed(2)},${(3 + chartY(sample.cpu) * .35).toFixed(2)}`
+  ).join(" ");
+  return <svg viewBox="0 0 220 42" preserveAspectRatio="none" className="av-cpu-trend" aria-hidden>
+    <defs><linearGradient id={id} x2="0" y2="1"><stop stopColor="#15d9f3" stopOpacity=".36"/><stop offset="1" stopColor="#15d9f3" stopOpacity="0"/></linearGradient></defs>
+    <path d={`${path} L220 42 L0 42 Z`} fill={`url(#${id})`} />
+    <path d={path} stroke="#63ecff" strokeWidth="1.7" fill="none" vectorEffect="non-scaling-stroke" />
+  </svg>;
+});
+
+function NetworkTrend({ history }: { history: NexusController["netSpeedHistory"] }) {
+  const samples = history.slice(-26);
+  if (samples.length < 2) return null;
+  const peak = Math.max(1, ...samples.map(({ rxBps, txBps }) => Math.max(rxBps, txBps)));
+  return <svg role="img" aria-label="Последние замеры приёма и отдачи" className="av-net-trend"
+    viewBox={`0 0 ${samples.length * 8} 30`} preserveAspectRatio="none">
+    {samples.map(({ at, rxBps, txBps }, index) => {
+      const rx = 30 * rxBps / peak;
+      const tx = 30 * txBps / peak;
+      return <g key={at}>
+        <rect x={index * 8} y={30 - rx} width="3" height={rx} rx=".7" fill="#31d7f5" />
+        <rect x={index * 8 + 3.5} y={30 - tx} width="3" height={tx} rx=".7" fill="#ad80ff" />
+      </g>;
+    })}
+  </svg>;
+}
+
+const SystemHistory = memo(function SystemHistory({ history }: { history: Sample[] }) {
+  const gradientId = useId();
+  const [windowSeconds, setWindowSeconds] = useWorkspaceState("dashboard.windowSeconds", 0);
+  const [cursor, setCursor] = useState<number | null>(null);
+  const samples = useMemo(() => {
+    const latest = history[history.length - 1];
+    if (!windowSeconds || !latest) return history;
+    return history.filter((point) => point.capturedAt >= latest.capturedAt - windowSeconds * 1000);
+  }, [history, windowSeconds]);
+  const first = samples[0];
+  const last = samples[samples.length - 1];
+  const span = Math.max(1, (last?.capturedAt ?? 0) - (first?.capturedAt ?? 0));
+  const selected = cursor === null ? -1 : samples.findIndex(({ capturedAt }) => capturedAt === cursor);
+  const index = selected >= 0 ? selected : samples.length - 1;
+  const point = samples[index];
+  const paths = useMemo(() => {
+    if (!samples.length) return { cpu: "", ram: "" };
+    const start = samples[0].capturedAt;
+    const path = (key: ChartKey) => samples.map((sample, index) => {
+      const x = ((sample.capturedAt - start) / span) * 600;
+      return `${index === 0 ? "M" : "L"}${x.toFixed(2)},${chartY(sample[key]).toFixed(2)}`;
+    }).join(" ");
+    return { cpu: path("cpu"), ram: path("ram") };
+  }, [samples, span]);
+  const markerX = point ? ((point.capturedAt - first.capturedAt) / span) * 600 : 0;
 
   return (
-    <div className="tactical-card tactical-brackets flex min-w-0 flex-col justify-between gap-2.5 rounded-xl p-4">
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-wider text-[#8292A3]">
-          <span className="text-[#00D5E8]">{icon}</span>
-          <span>{label}</span>
-        </div>
-        <div className="flex items-center gap-2">
-          {sparkValues && <MiniTrendSpark values={sparkValues} highLoad={isHigh} />}
-          <span className={`rounded border px-1.5 py-0.5 font-mono text-[10px] font-semibold tracking-wider ${badgeClasses}`}>
-            {badgeText}
-          </span>
-        </div>
+    <section className="av-dash-panel av-dash-chart">
+      <header className="av-dash-panel-head">
+        <h2><Activity size={18} aria-hidden />Динамика нагрузки</h2>
+        <label className="av-dash-period">
+          <select aria-label="Интервал графика" value={windowSeconds}
+            onChange={(event) => { setWindowSeconds(Number(event.target.value)); setCursor(null); }}>
+            <option value={0}>Все замеры</option><option value={60}>За минуту</option><option value={30}>За 30 секунд</option>
+          </select>
+          <ChevronDown size={12} aria-hidden />
+        </label>
+      </header>
+      <div className="av-chart-readout">
+        {series.map(({ key, label, color }) => (
+          <div key={key}>
+            <span className="av-chart-label"><i style={{ backgroundColor: color }} />{label}</span>
+            <strong>{point ? percentage.format(point[key]) : "—"}{point && <small> %</small>}</strong>
+          </div>
+        ))}
+        <span className="av-chart-sample" title="Время выбранного замера"><Clock3 size={12} aria-hidden />{point?.timestamp ?? "Ожидание данных"}</span>
       </div>
+      {samples.length < 2 || !point || !last ? (
+        <div className="av-dash-chart-empty"><Activity size={23} aria-hidden />График появится после двух замеров</div>
+      ) : (
+        <div className="av-chart-plot">
+          <div className="av-chart-axis-y" aria-hidden><span>100%</span><span>50%</span><span>0%</span></div>
+          <svg viewBox="0 0 600 100" preserveAspectRatio="none" tabIndex={0} role="slider"
+            aria-label="Замер нагрузки. Используйте стрелки для просмотра истории."
+            aria-valuemin={1} aria-valuemax={samples.length} aria-valuenow={index + 1}
+            aria-valuetext={`${point.timestamp}, CPU ${percentage.format(point.cpu)}%, RAM ${percentage.format(point.ram)}%`}
+            onPointerMove={(event) => {
+              const bounds = event.currentTarget.getBoundingClientRect();
+              const target = ((event.clientX - bounds.left) / bounds.width) * span + first.capturedAt;
+              let closest = first;
+              for (const sample of samples) {
+                if (Math.abs(sample.capturedAt - target) < Math.abs(closest.capturedAt - target)) closest = sample;
+              }
+              setCursor(closest.capturedAt);
+            }}
+            onPointerLeave={() => setCursor(null)} onBlur={() => setCursor(null)}
+            onKeyDown={(event) => {
+              let next = index;
+              switch (event.key) {
+                case "ArrowLeft": next = Math.max(0, index - 1); break;
+                case "ArrowRight": next = Math.min(samples.length - 1, index + 1); break;
+                case "Home": next = 0; break;
+                case "End": next = samples.length - 1; break;
+                default: return;
+              }
+              event.preventDefault();
+              setCursor(samples[next].capturedAt);
+            }}>
+            <defs>{series.map(({ key, color }) => (
+              <linearGradient key={key} id={gradientId + key} x1="0" x2="0" y1="0" y2="1">
+                <stop offset="0%" stopColor={color} stopOpacity=".34" />
+                <stop offset="100%" stopColor={color} stopOpacity=".015" />
+              </linearGradient>
+            ))}</defs>
+            {[0, 25, 50, 75, 100].map((y) => <path key={y} d={`M0 ${y}H600`} className="av-chart-gridline" />)}
+            {[0, 150, 300, 450, 600].map((x) => <path key={x} d={`M${x} 0V100`} className="av-chart-gridline av-chart-gridline--minor" />)}
+            {series.map(({ key }) => <path key={key} d={`${paths[key]} L600,100 H0 Z`} fill={`url(#${gradientId + key})`} />)}
+            {series.map(({ key, color }) => <path key={key} d={paths[key]} fill="none" stroke={color}
+              strokeWidth="2" strokeLinejoin="round" vectorEffect="non-scaling-stroke" />)}
+            {selected >= 0 && <path d={`M${markerX} 0V100`} className="av-chart-crosshair" />}
+          </svg>
+          <div className="av-chart-axis-x"><span>{first.timestamp}</span><span>{last.timestamp}</span></div>
+        </div>
+      )}
+    </section>
+  );
+});
 
-      <div className="flex items-baseline justify-between gap-2">
-        <div className="font-mono text-2xl font-bold tracking-tight text-[#E5EDF5] xl:text-[26px]">
-          {value}
-        </div>
-        {subValue && (
-          <div className="font-mono text-xs font-medium text-[#8292A3]">{subValue}</div>
-        )}
-      </div>
+function NetworkPanel({ c }: { c: NexusController }) {
+  const [diagnosticsOpen, setDiagnosticsOpen] = useWorkspaceState("dashboard.diagnosticsOpen", false);
+  const [routes, setRoutes] = useState<RouteProbe[] | null>(null);
+  const [routeSamples, setRouteSamples] = useState<RouteSample[]>([]);
+  const [routesError, setRoutesError] = useState("");
+  const [diagnostic, setDiagnostic] = useState<"dns" | "priority" | null>(null);
+  const [feedback, setFeedback] = useState<{ text: string; error: boolean } | null>(null);
+  const routeRequest = useRef<Promise<RouteProbe[]> | null>(null);
+  const primary = c.netSnapshotError ? undefined : c.netSnapshot?.adapters.find((adapter) => adapter.is_primary && adapter.is_connected);
+  const primaryHistory = primary && c.netSpeedHistory[0]?.adapter === primary.id ? c.netSpeedHistory : [];
+  useEffect(() => {
+    if (!diagnosticsOpen || !c.windowVisible) return;
+    setRoutes(null);
+    setRouteSamples([]);
+    setRoutesError("");
+    let alive = true;
+    let timer: number | undefined;
+    const poll = async () => {
+      const request = routeRequest.current ?? invoke<RouteProbe[]>("probe_game_routes");
+      routeRequest.current = request;
+      try {
+        const next = await request;
+        if (!alive) return;
+        setRoutes(next.filter((route) => route.label && route.host));
+        const capturedAt = performance.now();
+        const latency = next.find((route) => route.label.includes("Москва"))?.ping_ms ?? 0;
+        setRouteSamples((current) => [...current.slice(-14), { responseMs: latency > 0 ? latency : null, capturedAt }]);
+        setRoutesError("");
+      } catch (error) {
+        if (alive) setRoutesError(String(error));
+      } finally {
+        if (routeRequest.current === request) routeRequest.current = null;
+        if (alive) timer = window.setTimeout(poll, 2000);
+      }
+    };
+    void poll();
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+    };
+  }, [diagnosticsOpen, c.windowVisible]);
 
-      <div className="truncate text-xs text-[#8292A3]" title={detail}>
-        {detail}
-      </div>
-      <SegmentedHudBar percentage={percent} theme="cyan" />
-    </div>
+  const runDiagnostic = async (operation: "dns" | "priority") => {
+    if (operation === "priority" && !c.isElevatedAdmin) {
+      setFeedback({ text: "Для изменения приоритета пакетов нужны права администратора.", error: true });
+      return;
+    }
+    setDiagnostic(operation);
+    setFeedback(null);
+    try {
+      if (operation === "dns") await invoke("flush_dns");
+      else await invoke("set_packet_priority", { enabled: true });
+      setFeedback({ text: operation === "dns" ? "Кеш DNS очищен." : "Приоритет пакетов применён.", error: false });
+    } catch (error) {
+      setFeedback({ text: String(error), error: true });
+    } finally {
+      setDiagnostic(null);
+    }
+  };
+
+  return (
+    <section className="av-dash-panel av-dash-net">
+      <header className="av-dash-panel-head">
+        <h2><Network size={18} aria-hidden />Сеть {primary?.name && <small className="av-net-adapter" title={`Основное подключение · ${primary.name}`}>{primary.name}</small>}</h2>
+        <button className="av-dash-link" type="button" onClick={() => c.setActiveTab("network")}>Монитор <ArrowRight size={14} aria-hidden /></button>
+      </header>
+      <dl className="av-net-readings">
+        {[{ label: "Приём", Icon: ArrowDownLeft, speed: c.rxParts }, { label: "Отдача", Icon: ArrowUpRight, speed: c.txParts }].map(({ label, Icon, speed }) => (
+          <div key={label}><dt><Icon size={14} />{label}</dt><dd>{c.metricsReady ? <>{speed.value.replace(".", ",")} <small>{speed.unit === "MB/S" ? "МБ/с" : "КБ/с"}</small></> : "—"}</dd></div>
+        ))}
+        <div title={c.metrics.net_ping_sample?.host ?? "Внешний контрольный адрес"}><dt><Radio size={14} />Внешний замер</dt><dd>{!c.metricsError && c.metrics.net_ping_sample?.rtt_ms != null ? <>{c.metrics.net_ping_sample.rtt_ms < 1 ? "<1" : c.metrics.net_ping_sample.rtt_ms} <small>мс · {c.metrics.net_ping_method}</small></> : "—"}</dd></div>
+        <div className="av-net-jitter" title={JITTER_HELP}><dt>Джиттер</dt><dd>{formatJitter(c.metricsError ? null : c.networkJitter)}</dd></div>
+      </dl>
+      <NetworkTrend history={primaryHistory} />
+      <details className="av-net-diagnostics" open={diagnosticsOpen} onToggle={(event) => setDiagnosticsOpen(event.currentTarget.open)}>
+        <summary><Cable size={15} aria-hidden />Маршруты и диагностика<ChevronDown size={15} aria-hidden /></summary>
+        {routesError && <p role="alert" className="av-dash-error">{routesError}</p>}
+        {routes === null && !routesError ? <p>Запрос задержки…</p> : routes && routes.length > 0 ? (
+          <ul>{routes.map((route) => (
+            <li key={route.host}>
+              <span title={route.host}>{route.label}</span>
+              <span>{route.ping_ms > 0 ? `${route.ping_ms} мс${route.rtt_range_ms != null ? ` · диапазон ${route.rtt_range_ms} мс` : ""}${route.method ? " · " + route.method : ""}` : "Нет ответа"}</span>
+            </li>
+          ))}</ul>
+        ) : !routesError && <p>Нет результатов опроса</p>}
+        <RouteTrend samples={routeSamples} />
+        <div className="av-net-actions">
+          <button type="button" className="nexus-button" disabled={diagnostic !== null} onClick={() => void runDiagnostic("dns")}>{diagnostic === "dns" ? "Очистка…" : "Сброс DNS"}</button>
+          <button type="button" className="nexus-button" disabled={diagnostic !== null} onClick={() => void runDiagnostic("priority")}>{diagnostic === "priority" ? "Применение…" : "Повысить приоритет пакетов"}</button>
+        </div>
+        {feedback && <p role={feedback.error ? "alert" : "status"} className={feedback.error ? "av-dash-error" : "av-dash-success"}>{!feedback.error && <Check size={14} />}{feedback.text}</p>}
+      </details>
+    </section>
   );
 }
 
 export function DashboardModule({ c }: { c: NexusController }) {
-  const {
-    metrics,
-    history,
-    diskUsedPercentage,
-    isGatewayOnline,
-    rxParts,
-    txParts,
-    hwData,
-    setActiveTab,
-    isElevatedAdmin,
-    metricsReady,
-  } = c;
-
-  const [netBusy, setNetBusy] = useState(false);
-  const [netHint, setNetHint] = useState<string | null>(null);
-  const [routes, setRoutes] = useState<Array<{ label: string; host: string; ping_ms: number; jitter_ms: number }>>([]);
-  const [gameSamples, setGameSamples] = useState<number[]>([]);
-  const [dnsState, setDnsState] = useState<"idle" | "pending" | "done">("idle");
-  const [dnsError, setDnsError] = useState<string | null>(null);
-
-  useEffect(() => {
-    const loadRoutes = () => {
-      invoke<Array<{ label: string; host: string; ping_ms: number; jitter_ms: number }>>("probe_game_routes")
-        .then((next) => {
-          setRoutes(next);
-          const moscow = next.find((route) => route.label.includes("Москва") && route.ping_ms > 0);
-          if (moscow) {
-            setGameSamples((prev) => [...prev, moscow.ping_ms].slice(-15));
-          }
-        })
-        .catch(() => setRoutes([]));
-    };
-    loadRoutes();
-    const timer = window.setInterval(loadRoutes, 2000);
-    return () => window.clearInterval(timer);
-  }, []);
-
-  const gameRoute = routes.find((route) => route.label.includes("Москва") && route.ping_ms > 0);
-  const ping = pingTone(gameRoute?.ping_ms ?? 0);
-  const jitter = gameRoute ? gameRoute.jitter_ms : null;
-  const stable = jitter !== null && jitter <= 7;
-
-  const cpuName = hwData?.cpu.name?.trim();
-  const cpuTemp = hwData?.cpu.package_temp_c ?? hwData?.cpu.max_core_temp_c ?? null;
-  const cpuClockGhz =
-    hwData?.cpu.avg_clock_mhz != null ? (hwData.cpu.avg_clock_mhz / 1000).toFixed(2) : null;
-  const physCores = hwData?.cpu.physical_cores ?? 0;
-  const logCores = hwData?.cpu.logical_cores ?? 0;
-  const coreCount = hwData?.cpu.core_temps.length ?? 0;
-  const cpuDetail = cpuName
-    ? physCores > 0 && logCores > 0
-      ? `${cpuName} · ${physCores}Я/${logCores}П`
-      : coreCount > 0
-      ? `${cpuName} · ${coreCount} ядер`
-      : cpuName
-    : "Вычислительная нагрузка процессора";
-
-  const isHwPolled = hwData !== null;
-  const primaryGpu = hwData?.gpus[0] ?? null;
-  const gpuTemp = primaryGpu?.core_temp_c ?? primaryGpu?.hotspot_temp_c ?? null;
-  const gpuLoad = primaryGpu?.load_percent ?? null;
-  const gpuClock = primaryGpu?.core_clock_mhz ?? null;
-  const gpuPower = primaryGpu?.power_watts ?? null;
-  const gpuVramUsed = primaryGpu?.vram_used_mb ?? null;
-  const gpuVramTotal = primaryGpu?.vram_total_mb ?? null;
-  const gpuValue = !isHwPolled
-    ? "Опрос…"
-    : gpuTemp !== null
-    ? `${gpuTemp.toFixed(0)} °C`
-    : gpuLoad !== null
-    ? `${gpuLoad.toFixed(0)}%`
-    : gpuClock !== null
-    ? `${gpuClock.toFixed(0)} МГц`
-    : primaryGpu
-    ? "Обнаружен"
-    : "Не найден";
-  const gpuSubValue =
-    gpuTemp !== null && gpuLoad !== null
-      ? `${gpuLoad.toFixed(0)}%${gpuPower !== null ? ` · ${gpuPower.toFixed(0)} Вт` : ""}`
-      : gpuPower !== null
-      ? `${gpuPower.toFixed(0)} Вт`
-      : gpuClock !== null && gpuTemp !== null
-      ? `${gpuClock.toFixed(0)} МГц`
-      : gpuVramUsed !== null && gpuVramTotal !== null
-      ? `${(gpuVramUsed / 1024).toFixed(1)}/${(gpuVramTotal / 1024).toFixed(0)} ГБ`
-      : undefined;
-  const gpuDetail = !isHwPolled
-    ? "Подключение к датчикам GPU…"
-    : primaryGpu
-    ? [
-        primaryGpu.name?.trim() || "Графический ускоритель",
-        gpuVramUsed !== null && gpuVramTotal !== null
-          ? `VRAM ${(gpuVramUsed / 1024).toFixed(1)}/${(gpuVramTotal / 1024).toFixed(0)} ГБ`
-          : null,
-      ]
-        .filter(Boolean)
-        .join(" · ")
-    : "Дискретный или DXGI-ускоритель не обнаружен";
-  const gpuPercent =
-    gpuLoad !== null
-      ? Math.min(100, Math.max(0, gpuLoad))
-      : gpuTemp !== null
-      ? Math.min(100, Math.max(12, ((gpuTemp - 25) / 70) * 100))
-      : primaryGpu?.fan_percent ?? 0;
-
-  const linkLabel = isGatewayOnline ? "Шлюз активен" : "Шлюз недоступен";
-  const cpuSpark = history.slice(-12).map((h) => h.cpu);
-  const ramSpark = history.slice(-12).map((h) => h.ram);
-
+  const { setActiveTab, metrics, history, metricsReady, metricsError, hwData, hwmonStatus, hwPollError, diskUsedPercentage } = c;
+  const openHardware = useCallback(() => setActiveTab("hardware"), [setActiveTab]);
+  const openStorage = useCallback(() => setActiveTab("storage"), [setActiveTab]);
+  const hwStale = Boolean(hwPollError || hwData?.telemetry_stale || hwmonStatus.telemetry_stale);
+  const gpu = hwData?.gpus[0];
+  const gpuLoad = gpu?.load_percent ?? null;
+  const gpuTemp = gpu?.core_temp_c ?? null;
+  const gpuClock = gpu?.core_clock_mhz ?? null;
+  const cpuTemp = hwData?.cpu.package_temp_c ?? null;
+  const ramReady = metricsReady && metrics.ram_total_gb > 0;
+  const diskReady = metricsReady && metrics.disk_total_gb > 0;
+  const metricsMessage = metricsError
+    ? (metricsReady ? "Последний полученный замер" : "Системные метрики недоступны")
+    : metricsReady ? "Телеметрия активна" : "Ожидание первого замера";
+  const formatReading = (value: number | null | undefined, suffix: string) =>
+    value == null || !Number.isFinite(value) ? null : `${percentage.format(value)} ${suffix}`;
+  const showClock = (mhz: number | null | undefined) => formatReading(mhz == null ? null : mhz / 1000, "ГГц");
+  const cpu = hwData?.cpu;
+  const gpuLoadReady = !hwStale && gpuLoad !== null;
+  const sensorState = hwmonStatus.status === "driver_blocked" ? "Часть датчиков заблокирована Windows" :
+    hwStale ? "Показания датчиков устарели" :
+    hwmonStatus.status === "ready" && hwData?.sidecar_online ? "Аппаратные датчики подключены" :
+    hwData ? "Доступны показания Windows" : "Ожидание датчиков";
+  const warnings = c.thermalWarnings;
+  const timer = c.timerState && c.remainingSeconds > 0;
   return (
-    <motion.div
-      key="dashboard"
-      initial={{ opacity: 0, y: 6 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -4 }}
-      transition={{ duration: 0.16, ease: "easeOut" }}
-      className="w-full space-y-4"
-    >
-      <PageHeader
-        title="Обзор системы"
-        description="Ключевые показатели вычислительных узлов, накопителей и сетевого канала в реальном времени"
-        actions={
-          <div
-            className={`inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 font-mono text-[11px] font-semibold ${
-              metricsReady
-                ? "border-[#00D5E8]/30 bg-[#00D5E8]/10 text-[#00D5E8]"
-                : "border-amber-500/35 bg-amber-500/12 text-amber-300"
-            }`}
-          >
-            <span
-              className={`h-1.5 w-1.5 rounded-full ${
-                metricsReady ? "bg-[#00D5E8] shadow-[0_0_6px_rgba(0,213,232,0.8)]" : "animate-pulse bg-amber-400"
-              }`}
-            />
-            {metricsReady ? "ТЕЛЕМЕТРИЯ АКТИВНА" : "ОПРОС ДАТЧИКОВ…"}
-          </div>
-        }
-      />
-
-      {!metricsReady ? (
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
-          {["cpu", "gpu", "ram", "disk"].map((key) => (
-            <div key={key} className="tactical-card h-32 animate-pulse rounded-xl" />
-          ))}
+    <div className="av-dashboard">
+      <header className="av-dash-hero">
+        <div className="av-dash-hero-content">
+          <p className="av-dash-day">{dayFormat.format(new Date())}</p>
+          <h1>Обзор системы</h1>
         </div>
-      ) : (
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
-          <MetricCard
-            label="Процессор (CPU)"
-            icon={<Cpu size={14} />}
-            value={`${metrics.cpu_usage.toFixed(1)}%`}
-            subValue={
-              cpuTemp !== null
-                ? `${cpuTemp.toFixed(0)} °C`
-                : cpuClockGhz !== null
-                ? `${cpuClockGhz} ГГц`
-                : undefined
-            }
-            detail={cpuDetail}
-            percent={metrics.cpu_usage}
-            badgeText={metrics.cpu_usage >= 85 ? "НАГРУЗКА" : "АКТИВЕН"}
-            badgeTone={metrics.cpu_usage >= 85 ? "critical" : metrics.cpu_usage >= 70 ? "warn" : "normal"}
-            sparkValues={cpuSpark}
-          />
-          <MetricCard
-            label="Видеокарта (GPU)"
-            icon={<Gauge size={14} />}
-            value={gpuValue}
-            subValue={gpuSubValue}
-            detail={gpuDetail}
-            percent={gpuPercent}
-            badgeText={
-              !isHwPolled
-                ? "ОЖИДАНИЕ"
-                : gpuTemp !== null && gpuTemp >= 82
-                ? "НАГРЕВ"
-                : primaryGpu
-                ? "НОРМА"
-                : "НЕТ ДАТЧИКА"
-            }
-            badgeTone={
-              gpuTemp !== null && gpuTemp >= 82
-                ? "critical"
-                : gpuTemp !== null && gpuTemp >= 72
-                ? "warn"
-                : "normal"
-            }
-          />
-          <MetricCard
-            label="Память (RAM)"
-            icon={<MemoryStick size={14} />}
-            value={`${metrics.ram_used_gb.toFixed(1)} ГБ`}
-            subValue={`из ${metrics.ram_total_gb.toFixed(0)} ГБ`}
-            detail={`Занято ${metrics.ram_percentage.toFixed(0)}% оперативной памяти`}
-            percent={metrics.ram_percentage}
-            badgeText={metrics.ram_percentage >= 88 ? "ДЕФИЦИТ" : "СТАБИЛЬНО"}
-            badgeTone={metrics.ram_percentage >= 88 ? "critical" : metrics.ram_percentage >= 75 ? "warn" : "normal"}
-            sparkValues={ramSpark}
-          />
-          <MetricCard
-            label="Накопитель (Диск)"
-            icon={<HardDrive size={14} />}
-            value={`${metrics.disk_free_gb.toFixed(0)} ГБ`}
-            subValue={`из ${metrics.disk_total_gb.toFixed(0)} ГБ`}
-            detail={`Свободно · Занято ${diskUsedPercentage.toFixed(0)}% системного тома`}
-            percent={diskUsedPercentage}
-            badgeText={diskUsedPercentage >= 90 ? "ЗАПОЛНЕН" : "НОРМА"}
-            badgeTone={diskUsedPercentage >= 90 ? "critical" : diskUsedPercentage >= 80 ? "warn" : "normal"}
-          />
+        <div className="av-hero-actions">
+          <span className="av-hero-status" role="status" data-state={metricsError ? "error" : metricsReady ? "live" : "pending"}><i />{metricsMessage}</span>
+          {timer && <button type="button" className="av-hero-timer" onClick={() => setActiveTab("power")}><Clock3 size={14} />Таймер {formatCountdown(c.remainingSeconds)}</button>}
+          {c.isScanning && <button type="button" onClick={openStorage}><HardDrive size={14} /> Сканирование</button>}
+          {(c.isScanningCleanup || c.isCleaning) && <button type="button" onClick={() => setActiveTab("cleanup")}><Trash2 size={14} /> Центр очистки</button>}
         </div>
-      )}
-
-      <div className="grid grid-cols-1 gap-3 lg:grid-cols-12">
-        <div className="min-w-0 lg:col-span-8">
-          <LoadHistoryChart history={history} />
+      </header>
+      {metricsError && <p className="av-dash-error" role="alert">{metricsError}</p>}
+      <div className="av-dash-board">
+        <div className="av-dash-core">
+          <div className="av-dash-resources" aria-label="Нагрузка оборудования">
+            <Resource label="CPU" icon={Cpu} hue="mint" onOpen={openHardware} unit="%"
+              value={metricsReady ? percentage.format(metrics.cpu_usage) : null}
+              detail={cpu?.name?.trim() || "Процессор"} readings={[
+                { label: "Частота", value: hwStale ? null : showClock(cpu?.avg_clock_mhz) },
+                { label: "Температура пакета", value: hwStale ? null : formatReading(cpuTemp, "°C") },
+              ]}><CpuTrend history={history} /></Resource>
+            <Resource label="GPU" icon={Gauge} hue="violet" onOpen={openHardware} unit="%"
+              value={gpuLoadReady ? percentage.format(gpuLoad) : null} percent={gpuLoadReady ? gpuLoad : undefined}
+              detail={gpu?.name || (hwData ? "Адаптер не обнаружен" : "Видеоадаптер")} readings={[
+                { label: "Частота", value: hwStale ? null : showClock(gpuClock) },
+                { label: "Температура", value: hwStale ? null : formatReading(gpuTemp, "°C") },
+              ]} />
+            <Resource label="RAM" icon={MemoryStick} hue="blue" onOpen={openHardware} unit="%"
+              value={ramReady ? percentage.format(metrics.ram_percentage) : null} percent={ramReady ? metrics.ram_percentage : undefined}
+              detail={ramReady ? `${percentage.format(metrics.ram_total_gb)} ГБ · Оперативная память` : "Оперативная память"} readings={[
+                { label: "Занято", value: ramReady ? formatReading(metrics.ram_used_gb, "ГБ") : null },
+                { label: "Доступно", value: ramReady ? formatReading(Math.max(0, metrics.ram_total_gb - metrics.ram_used_gb), "ГБ") : null },
+              ]} />
+          </div>
+          <div className="av-dash-system">
+            <section className="av-dash-panel av-dash-sensors">
+              <header className="av-dash-panel-head"><h2><CircuitBoard size={18} aria-hidden />Датчики</h2>
+                <button type="button" className="av-dash-link" onClick={openHardware}>Монитор <ArrowUpRight size={14}/></button>
+              </header>
+              <p className="av-sensor-state" data-warning={warnings.length > 0 || hwStale || hwmonStatus.status === "driver_blocked"}>{sensorState}</p>
+              {warnings.length > 0 && <ul className="av-dash-error">{warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>}
+            </section>
+            <section className="av-dash-panel av-dash-storage">
+              <header className="av-dash-panel-head"><h2><HardDrive size={18} aria-hidden />Системный диск</h2>
+                <button type="button" className="av-dash-link" onClick={openStorage}>Открыть <ArrowUpRight size={14}/></button>
+              </header>
+              {diskReady ? <><div className="av-storage-size"><strong>{formatReading(metrics.disk_free_gb, "ГБ")}</strong><span>из {formatReading(metrics.disk_total_gb, "ГБ")} свободно</span></div>
+                <meter min={0} max={100} value={diskUsedPercentage} aria-label="Заполненность системного диска"
+                  data-near-full={diskUsedPercentage >= 90} /></> : <p>Объём диска недоступен</p>}
+            </section>
+          </div>
+          <SystemHistory history={history} />
         </div>
-
-        <div className="flex min-w-0 flex-col gap-3 lg:col-span-4">
-          <div className="tactical-card tactical-brackets rounded-xl p-4">
-            <div className="flex items-center justify-between">
-              <div className="text-xs font-semibold uppercase tracking-wider text-[#8292A3]">
-                Сетевой канал и маршруты
-              </div>
-              <span className="rounded border border-[#202B38] bg-[#151C26] px-2 py-0.5 font-mono text-[10px] font-medium text-[#00D5E8]">
-                {linkLabel}
-              </span>
+        <div className="av-dash-sidebar">
+          <NetworkPanel c={c} />
+          <nav className="av-dash-panel av-dash-tools" aria-label="Быстрые переходы">
+            <header className="av-dash-panel-head"><h2><FolderOpen size={18} aria-hidden />Быстрые действия</h2></header>
+            <div className="av-dash-tool-grid">
+              {quickLinks.map(({ tab, label, Icon, hue }) => <button type="button" key={tab} onClick={() => setActiveTab(tab)} data-hue={hue}>
+                <Icon size={17} aria-hidden /><span>{label}</span><ArrowUpRight size={13} aria-hidden />
+              </button>)}
             </div>
-
-            <div className="mt-2.5 grid grid-cols-2 gap-2 rounded-lg border border-[#202B38] bg-[#0B0E14] px-3 py-2">
-              <div>
-                <div className="text-[11px] text-[#8292A3]">Приём (RX)</div>
-                <div className="font-mono text-sm font-semibold text-[#00D5E8]">
-                  ↓ {rxParts.value} {rxParts.unit}
-                </div>
-              </div>
-              <div className="border-l border-[#202B38] pl-3">
-                <div className="text-[11px] text-[#8292A3]">Отдача (TX)</div>
-                <div className="font-mono text-sm font-semibold text-[#E5EDF5]">
-                  ↑ {txParts.value} {txParts.unit}
-                </div>
-              </div>
-            </div>
-
-            <div className="mt-2.5 flex items-end justify-between gap-3">
-              <div>
-                <div className={`font-mono text-lg font-bold tracking-tight ${ping.className}`}>
-                  {ping.value === "—" ? "—" : `${ping.value} мс`}
-                </div>
-                <div className="text-xs text-[#8292A3]">Москва · {ping.label}</div>
-              </div>
-              <div className="text-right">
-                <div className="font-mono text-sm font-semibold text-[#E5EDF5]">
-                  {jitter === null ? "—" : `±${jitter} мс`}
-                </div>
-                <div
-                  className={`font-mono text-[11px] ${
-                    jitter === null ? "text-[#526170]" : stable ? "text-[#00D5E8]" : "text-amber-300"
-                  }`}
-                >
-                  {jitter === null ? "Замер канала" : stable ? "Канал стабилен" : "Есть джиттер"}
-                </div>
-              </div>
-            </div>
-
-            <PingSpark samples={gameSamples} />
-
-            <div className="mt-2 space-y-2">
-              <div className="space-y-1">
-                {(routes.length > 0
-                  ? routes
-                  : [
-                      { label: "DNS / Магистраль", host: "1.1.1.1", ping_ms: 0, jitter_ms: 0 },
-                      { label: "СНГ / Москва", host: "162.159.135.234", ping_ms: 0, jitter_ms: 0 },
-                      { label: "Европа / Cloudflare", host: "1.0.0.1", ping_ms: 0, jitter_ms: 0 },
-                    ]
-                ).map((route) => (
-                  <div
-                    key={route.host}
-                    className="flex items-center justify-between rounded-md border border-[#202B38] bg-[#0B0E14] px-2.5 py-1 text-xs"
-                  >
-                    <span className="text-[#8292A3]">{route.label}</span>
-                    <span className="font-mono font-medium text-[#E5EDF5]">
-                      {route.ping_ms > 0 ? `${route.ping_ms} мс ±${route.jitter_ms}` : "—"}
-                    </span>
-                  </div>
-                ))}
-              </div>
-
-              <div className="grid grid-cols-2 gap-2">
-                <button
-                  type="button"
-                  disabled={dnsState === "pending"}
-                  onClick={() => {
-                    setDnsError(null);
-                    setDnsState("pending");
-                    invoke("flush_dns")
-                      .then(() => {
-                        setDnsState("done");
-                        window.setTimeout(() => setDnsState("idle"), 3000);
-                      })
-                      .catch((err) => {
-                        setDnsState("idle");
-                        setDnsError(String(err));
-                      });
-                  }}
-                  className="cyber-btn cursor-pointer px-2 py-1.5 font-mono text-[11px] font-semibold text-[#00D5E8] disabled:opacity-60"
-                >
-                  {dnsState === "done" ? "✓ DNS ОЧИЩЕН" : dnsState === "pending" ? "ОЧИСТКА…" : "СБРОС DNS"}
-                </button>
-                <button
-                  type="button"
-                  disabled={netBusy}
-                  onClick={() => {
-                    if (!isElevatedAdmin) {
-                      setNetHint("Требуются права Администратора (кнопка в верхней панели)");
-                      return;
-                    }
-                    setNetBusy(true);
-                    setNetHint(null);
-                    invoke("set_packet_priority", { enabled: true })
-                      .then(() => setNetHint("Применено"))
-                      .catch((err) => setNetHint(String(err)))
-                      .finally(() => setNetBusy(false));
-                  }}
-                  className="cyber-btn cursor-pointer px-2 py-1.5 font-mono text-[11px] font-semibold text-[#00D5E8] disabled:opacity-60"
-                >
-                  {netHint === "Применено" ? "✓ ПРИМЕНЕНО" : netBusy ? "ПРИМЕНЕНИЕ…" : "ПРИОРИТЕТ ПАКЕТОВ"}
-                </button>
-              </div>
-              {netHint && netHint !== "Применено" && <p className="text-xs text-amber-300">{netHint}</p>}
-              {dnsError && <p className="text-xs text-rose-300">{dnsError}</p>}
-            </div>
-          </div>
-
-          <div className="tactical-card tactical-brackets rounded-xl p-4">
-            <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-[#8292A3]">
-              Быстрые переходы
-            </div>
-            <div className="grid grid-cols-2 gap-1.5">
-              <button
-                type="button"
-                onClick={() => setActiveTab("cleanup")}
-                className="group flex cursor-pointer items-center justify-between rounded-lg border border-[#202B38] bg-[#0B0E14] px-2.5 py-2 text-xs font-medium text-[#E5EDF5] transition-colors hover:border-[#00D5E8]/40 hover:bg-[#151C26]"
-              >
-                <span>Очистка</span>
-                <Trash2 size={13} className="text-[#8292A3] transition-colors group-hover:text-[#00D5E8]" />
-              </button>
-              <button
-                type="button"
-                onClick={() => setActiveTab("storage")}
-                className="group flex cursor-pointer items-center justify-between rounded-lg border border-[#202B38] bg-[#0B0E14] px-2.5 py-2 text-xs font-medium text-[#E5EDF5] transition-colors hover:border-[#00D5E8]/40 hover:bg-[#151C26]"
-              >
-                <span>Накопители</span>
-                <HardDrive size={13} className="text-[#8292A3] transition-colors group-hover:text-[#00D5E8]" />
-              </button>
-              <button
-                type="button"
-                onClick={() => setActiveTab("scripts")}
-                className="group flex cursor-pointer items-center justify-between rounded-lg border border-[#202B38] bg-[#0B0E14] px-2.5 py-2 text-xs font-medium text-[#E5EDF5] transition-colors hover:border-[#00D5E8]/40 hover:bg-[#151C26]"
-              >
-                <span>Скрипты</span>
-                <Terminal size={13} className="text-[#8292A3] transition-colors group-hover:text-[#00D5E8]" />
-              </button>
-              <button
-                type="button"
-                onClick={() => setActiveTab("power")}
-                className="group flex cursor-pointer items-center justify-between rounded-lg border border-[#202B38] bg-[#0B0E14] px-2.5 py-2 text-xs font-medium text-[#E5EDF5] transition-colors hover:border-[#00D5E8]/40 hover:bg-[#151C26]"
-              >
-                <span>Питание</span>
-                <Power size={13} className="text-[#8292A3] transition-colors group-hover:text-[#00D5E8]" />
-              </button>
-            </div>
-          </div>
+          </nav>
         </div>
       </div>
-    </motion.div>
+    </div>
   );
 }

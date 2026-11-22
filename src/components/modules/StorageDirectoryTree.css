@@ -1,0 +1,58 @@
+.avs-storage-result {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--nexus-muted);
+  font-size: .76rem;
+}
+.avs-directory, .avs-large-files { min-width: 0; }
+.avs-directory-path, .avs-directory-footer {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  padding: 9px 11px;
+}
+.avs-directory-path nav { flex: 1 1 230px; display: flex; align-items: center; flex-wrap: wrap; gap: 4px; min-width: 0; }
+.avs-directory-path nav span { display: inline-flex; gap: 4px; align-items: center; max-width: 100%; min-width: 0; }
+.avs-directory-path nav button { padding: 3px 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .76rem; }
+.avs-directory-path nav button[aria-current] { color: #aef4ee; background: #21535755; border-radius: 4px; }
+.avs-directory-scroll { overflow: auto; overflow-anchor: none; max-height: max(242px, 54vh); min-height: 113px; }
+.avs-directory-scroll:focus-visible { outline: 1px solid #6ad6d1; outline-offset: -1px; }
+.avs-directory-grid { display: grid; grid-template-columns: minmax(154px, 1fr) 84px 92px 118px 74px 74px; align-items: center; min-width: 596px; }
+.avs-directory-columns { position: sticky; top: 0; z-index: 1; min-height: 34px; background: #172338; color: var(--nexus-muted); }
+.avs-directory-grid > * { padding: 0 8px; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.avs-directory-columns > :not(:first-child), .avs-directory-row > :not(:first-child) { text-align: right; }
+.avs-directory-columns button { display: inline-flex; align-items: center; font-weight: 600; gap: 3px; }
+.avs-directory-columns [aria-sort] { color: #aef4ee; }
+.avs-directory-spacer { min-width: 596px; }
+.avs-directory-columns, .avs-directory-row { font-size: .74rem; }
+.avs-directory-row, .avs-directory-more { height: 32px; border-bottom: 1px solid #b8d3f013; }
+.avs-directory-row { font-variant-numeric: tabular-nums; cursor: default; }
+.avs-directory-row:nth-child(even) { background: #9bc3f207; }
+.avs-directory-row:hover { background: #a0cce916; }
+.avs-directory-row[aria-selected="true"] { background: #26526188; box-shadow: inset 2px 0 #82e2dc; }
+.avs-directory-name { display: flex; align-items: center; gap: 5px; }
+.avs-directory-name > svg { flex: 0 0 auto; color: #83c2cd; }
+.avs-directory-name > span { overflow: hidden; text-overflow: ellipsis; }
+.avs-directory-name > :is(button,i) { flex: 0 0 17px; display: inline-grid; place-items: center; height: 22px; }
+.avs-directory-name > button:hover { color: #aef4ee; background: #92e9de1c; border-radius: 4px; }
+.avs-directory-share { position: relative; isolation: isolate; }
+.avs-directory-share i { position: absolute; inset: 2px auto 2px 0; z-index: -1; border-radius: 3px; background: #3dc4b936; }
+.avs-directory-more button { padding: 5px 12px; color: #9ee7df; }
+.avs-directory-footer { border-top: 1px solid #b8d3f01c; font-size: .73rem; }
+.avs-directory-footer > span { flex: 1; min-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--nexus-muted); }
+.avs-large-search { display: flex; align-items: center; gap: 7px; margin: 10px 0; color: var(--nexus-muted); }
+.avs-large-search input { width: min(420px, 100%); padding: 6px 8px; border: 1px solid #a2c1e334; border-radius: 5px; background: #0c1525; font-size: .78rem; }
+.avs-large-list { overflow: auto; max-height: 300px; }
+.avs-large-list table { width: 100%; table-layout: fixed; font-size: .75rem; }
+.avs-large-list thead { position: sticky; top: 0; background: #172338; }
+.avs-large-list td, .avs-large-list th { padding: 5px 6px; text-align: left; border-bottom: 1px solid #b8d3f013; }
+.avs-large-list th:nth-child(2) { width: 73px; }
+.avs-large-list th:nth-child(3) { width: 208px; }
+.avs-large-list td:first-child > * { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.avs-large-list td:first-child > svg { display: inline-block; float: left; margin-right: 5px; color: #83c2cd; }
+.avs-large-list td small { color: var(--nexus-muted); }
+.avs-large-list td:last-child > button { margin-right: 4px; }

@@ -1,4 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
+import { appendRtt, formatJitter, JITTER_HELP, summarizeRtt, type RttSample } from "../../lib/latencyHistory";
+import { useWorkspaceState } from "../../hooks/useWorkspaceState";
+import { ModuleHeader } from "../ui/ModuleHeader";
+import type { NetworkSpeedSample } from "../../lib/networkHistory";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from "react";
+import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { AnimatePresence, motion } from "framer-motion";
 import {
@@ -19,13 +24,13 @@ import {
   X,
 } from "lucide-react";
 import {
-  PageHeader,
   copyTextToClipboard,
   formatBytes,
   formatLinkSpeed,
   formatThroughputRate,
   type NetworkAdapterInfo,
   type NetworkHealthProbe,
+  type NetworkOptimizerStatus,
 } from "../../lib/studio";
 import type { NexusController } from "../../hooks/useNexusController";
 
@@ -42,6 +47,8 @@ interface NetworkConnection {
 type SocketFilter = "all" | "established" | "listen" | "udp";
 
 const REFRESH_MS = 2000;
+const SOCKET_ROW_HEIGHT = 49;
+const SOCKET_OVERSCAN = 4;
 
 function isListening(state: string): boolean {
   return state === "LISTEN" || state === "LISTENING";
@@ -103,93 +110,136 @@ function EndpointCell({ addr }: { addr: string }) {
   );
 }
 
-export function NetworkModule({ c }: { c: NexusController }) {
+function useSocketConnections(active: boolean) {
   const [connections, setConnections] = useState<NetworkConnection[]>([]);
-  const [search, setSearch] = useState("");
-  const [filter, setFilter] = useState<SocketFilter>("all");
   const [loading, setLoading] = useState(true);
+  const [received, setReceived] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
-  const [menu, setMenu] = useState<{ x: number; y: number; conn: NetworkConnection } | null>(null);
-  const [view, setView] = useState<"overview" | "sockets">("overview");
+  const pending = useRef(false);
 
-  const fetchConnections = async () => {
+  const fetchConnections = useCallback(async () => {
+    if (pending.current) return;
+    pending.current = true;
     try {
       const list = await invoke<NetworkConnection[]>("get_network_connections");
       setConnections(list);
+      setReceived(true);
       setError(null);
     } catch (err) {
       console.error("Ошибка чтения таблицы сокетов:", err);
       setError(String(err));
     } finally {
+      pending.current = false;
       setLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
-    if (view !== "sockets") return;
+    if (!active) return;
     void fetchConnections();
     const timer = setInterval(() => void fetchConnections(), REFRESH_MS);
     return () => clearInterval(timer);
-  }, [view]);
+  }, [active, fetchConnections]);
+
+  return { connections, received, loading, error, setError, fetchConnections };
+}
+
+export function NetworkModule({ c }: { c: NexusController }) {
+  const [search, setSearch] = useWorkspaceState("network.search", "");
+  const [filter, setFilter] = useWorkspaceState<SocketFilter>("network.filter", "all");
+  const [notice, setNotice] = useState<string | null>(null);
+  const [menu, setMenu] = useState<{ x: number; y: number; conn: NetworkConnection } | null>(null);
+  const menuElement = useRef<HTMLDivElement>(null);
+  const menuOrigin = useRef<HTMLElement | null>(null);
+  const [view, setView] = useWorkspaceState<"overview" | "sockets" | "diagnostics" | "optimizer">("network.view", "overview");
+  const [toolsVisited, setToolsVisited] = useState(view === "diagnostics" || view === "optimizer");
+  const { connections, received, loading, error, setError, fetchConnections } = useSocketConnections(view === "sockets" && c.windowVisible);
+  const closeMenu = useCallback(() => setMenu(null), []);
+  const closeMenuAndRestoreFocus = useCallback(() => {
+    closeMenu();
+    menuOrigin.current?.focus({ preventScroll: true });
+  }, [closeMenu]);
+
+  useLayoutEffect(() => {
+    if (menu) menuElement.current?.querySelector("button")?.focus({ preventScroll: true });
+  }, [menu]);
 
   useEffect(() => {
     if (!menu) return;
-    const close = () => setMenu(null);
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") close();
-    };
-    window.addEventListener("mousedown", close);
-    window.addEventListener("keydown", onKey);
+    window.addEventListener("mousedown", closeMenu);
+    window.addEventListener("blur", closeMenu);
+    window.addEventListener("resize", closeMenu);
     return () => {
-      window.removeEventListener("mousedown", close);
-      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("mousedown", closeMenu);
+      window.removeEventListener("blur", closeMenu);
+      window.removeEventListener("resize", closeMenu);
     };
-  }, [menu]);
+  }, [menu, closeMenu]);
 
-  const showNotice = (message: string) => {
+  const showNotice = useCallback((message: string) => {
     setNotice(message);
     setTimeout(() => setNotice((current) => (current === message ? null : current)), 2200);
-  };
+  }, []);
 
-  const copyRemoteIp = async (conn: NetworkConnection) => {
-    const host = endpointHost(conn.remote_addr);
-    await copyTextToClipboard(host);
-    showNotice(`Скопирован IP-адрес: ${host}`);
-  };
+  const copyEndpoint = useCallback(async (value: string, field: string) => {
+    try {
+      await copyTextToClipboard(value);
+      showNotice(`Скопирован ${field}: ${value}`);
+    } catch (err) {
+      setError(String(err));
+    }
+  }, [setError, showNotice]);
+
+  const copyRemoteIp = useCallback((conn: NetworkConnection) => (
+    copyEndpoint(endpointHost(conn.remote_addr), "IP-адрес")
+  ), [copyEndpoint]);
 
   const query = search.trim().toLowerCase();
-  const visible = connections.filter((conn) => {
-    if (filter === "established" && conn.state !== "ESTABLISHED") return false;
-    if (filter === "listen" && !isListening(conn.state)) return false;
-    if (filter === "udp" && conn.protocol.toUpperCase() !== "UDP") return false;
-    if (!query) return true;
-    return (
-      conn.process_name.toLowerCase().includes(query) ||
-      conn.pid.toString().includes(query) ||
-      conn.remote_addr.toLowerCase().includes(query) ||
-      conn.local_addr.toLowerCase().includes(query) ||
-      endpointHost(conn.remote_addr).toLowerCase().includes(query)
-    );
-  });
+  const visible = useMemo(() => {
+    if (filter === "all" && !query) return connections;
+    return connections.filter((conn) => {
+      if (filter === "established" && conn.state !== "ESTABLISHED") return false;
+      if (filter === "listen" && !isListening(conn.state)) return false;
+      if (filter === "udp" && conn.protocol.toUpperCase() !== "UDP") return false;
+      if (!query) return true;
+      return (
+        conn.process_name.toLowerCase().includes(query) ||
+        conn.pid.toString().includes(query) ||
+        conn.remote_addr.toLowerCase().includes(query) ||
+        conn.local_addr.toLowerCase().includes(query) ||
+        endpointHost(conn.remote_addr).toLowerCase().includes(query)
+      );
+    });
+  }, [connections, filter, query]);
 
-  const establishedCount = connections.filter((conn) => conn.state === "ESTABLISHED").length;
-  const listenCount = connections.filter((conn) => isListening(conn.state)).length;
-  const udpCount = connections.filter((conn) => conn.protocol.toUpperCase() === "UDP").length;
+  const { establishedCount, listenCount, udpCount } = useMemo(() => {
+    let establishedCount = 0;
+    let listenCount = 0;
+    let udpCount = 0;
+    for (const conn of connections) {
+      if (conn.state === "ESTABLISHED") establishedCount++;
+      if (isListening(conn.state)) listenCount++;
+      if (conn.protocol.toUpperCase() === "UDP") udpCount++;
+    }
+    return { establishedCount, listenCount, udpCount };
+  }, [connections]);
 
-  const openMenu = (event: MouseEvent<HTMLDivElement>, conn: NetworkConnection) => {
+  const openMenu = useCallback((event: MouseEvent<HTMLDivElement>, conn: NetworkConnection) => {
     event.preventDefault();
     event.stopPropagation();
-    const x = Math.min(event.clientX, window.innerWidth - 260);
-    const y = Math.min(event.clientY, window.innerHeight - 180);
+    const row = event.currentTarget.getBoundingClientRect();
+    const keyboard = event.clientX === 0 && event.clientY === 0;
+    menuOrigin.current = event.currentTarget.querySelector("button");
+    const x = Math.min(keyboard ? row.left : event.clientX, window.innerWidth - 264);
+    const y = Math.min(keyboard ? row.bottom : event.clientY, window.innerHeight - 184);
     setMenu({ x: Math.max(8, x), y: Math.max(8, y), conn });
-  };
+  }, []);
 
   const filters: { id: SocketFilter; label: string }[] = [
-    { id: "all", label: `Все (${connections.length})` },
-    { id: "established", label: `ESTABLISHED (${establishedCount})` },
-    { id: "listen", label: `LISTENING (${listenCount})` },
-    { id: "udp", label: `UDP (${udpCount})` },
+    { id: "all", label: `Все (${received ? connections.length : "—"})` },
+    { id: "established", label: `ESTABLISHED (${received ? establishedCount : "—"})` },
+    { id: "listen", label: `LISTENING (${received ? listenCount : "—"})` },
+    { id: "udp", label: `UDP (${received ? udpCount : "—"})` },
   ];
 
   return (
@@ -200,96 +250,81 @@ export function NetworkModule({ c }: { c: NexusController }) {
         animate={{ opacity: 1, y: 0 }}
         exit={{ opacity: 0, y: -4 }}
         transition={{ duration: 0.16, ease: "easeOut" }}
-        className="w-full space-y-4"
+        className="avs-module avs-network w-full space-y-4"
       >
-        <PageHeader
+        <ModuleHeader module="network"
           title="Сетевой анализатор"
-          description={
-            view === "overview"
-              ? "Пропускная способность в реальном времени, состояние адаптера, статистика сессии и диагностика канала"
-              : "Подробная таблица активных TCP/UDP сокетов и сетевых подключений процессов"
-          }
-          actions={
-            <div className="flex flex-wrap items-center gap-2">
-              {(
-                [
-                  ["overview", "Обзор сети"],
-                  ["sockets", "Расширенные подключения"],
-                ] as const
-              ).map(([id, label]) => (
-                <button
-                  key={id}
-                  type="button"
-                  onClick={() => setView(id)}
-                  className={`cursor-pointer rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
-                    view === id
-                      ? "border-[#00D5E8]/40 bg-[#00D5E8]/12 text-[#00D5E8]"
-                      : "border-[#202B38] bg-[#10151D] text-[#8292A3] hover:text-[#E5EDF5]"
-                  }`}
-                >
-                  {label}
-                </button>
-              ))}
-              {view === "sockets" && (
-                <button
-                  type="button"
-                  onClick={() => void fetchConnections()}
-                  className="cyber-btn inline-flex cursor-pointer items-center gap-2 px-3 py-1.5 text-xs font-medium text-[#00D5E8]"
-                >
-                  <RefreshCw size={13} className={loading ? "animate-spin" : ""} />
-                  Обновить
-                </button>
-              )}
-            </div>
-          }
+          description="Трафик адаптеров, активные соединения и диагностика Windows"
         />
+        <div className="avs-workspace-tabs" role="group" aria-label="Представление сети">
+          {([
+            ["overview", "Обзор сети"],
+            ["sockets", "Расширенные подключения"],
+            ["diagnostics", "Диагностика и DNS"],
+            ["optimizer", "Оптимизатор"],
+          ] as const).map(([id, label]) => (
+            <button key={id} type="button" aria-pressed={view === id} onClick={() => {
+              closeMenu();
+              if (id === "diagnostics" || id === "optimizer") setToolsVisited(true);
+              setView(id);
+            }}>{label}</button>
+          ))}
+          {view === "sockets" && (
+            <button type="button" onClick={() => void fetchConnections()} className="ml-auto" disabled={loading}>
+              <RefreshCw size={14} className={loading ? "animate-spin" : ""} /> Обновить
+            </button>
+          )}
+        </div>
 
-        {view === "overview" ? (
-          <NetworkOverview c={c} />
-        ) : (
+        <div hidden={view !== "overview"}>
+          <NetworkOverview c={c} active={view === "overview" && c.windowVisible} />
+        </div>
+        {toolsVisited && <NetworkToolkit view={view} active={c.windowVisible} />}
+        {view === "sockets" && (
           <div className="space-y-4">
             {/* Сетевая телеметрия */}
             <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
               <div className="tactical-card rounded-xl px-4 py-3">
                 <div className="text-xs text-[#8292A3]">Входящий поток (RX)</div>
                 <div className="mt-1 font-mono text-xl font-bold text-[#00D5E8]">
-                  ↓ {c.rxParts.value} {c.rxParts.unit}
+                  {c.metricsReady ? `↓ ${c.rxParts.value} ${c.rxParts.unit}` : "—"}
                 </div>
               </div>
               <div className="tactical-card rounded-xl px-4 py-3">
                 <div className="text-xs text-[#8292A3]">Исходящий поток (TX)</div>
                 <div className="mt-1 font-mono text-xl font-bold text-[#E5EDF5]">
-                  ↑ {c.txParts.value} {c.txParts.unit}
+                  {c.metricsReady ? `↑ ${c.txParts.value} ${c.txParts.unit}` : "—"}
                 </div>
               </div>
               <div className="tactical-card rounded-xl px-4 py-3">
                 <div className="text-xs text-[#8292A3]">Всего сокетов</div>
                 <div className="mt-1 font-mono text-xl font-bold text-[#E5EDF5]">
-                  {connections.length}
+                  {received ? connections.length : "—"}
                 </div>
               </div>
               <div className="tactical-card rounded-xl px-4 py-3">
                 <div className="text-xs text-[#8292A3]">Установлено (TCP)</div>
                 <div className="mt-1 font-mono text-xl font-bold text-[#00D5E8]">
-                  {establishedCount}
+                  {received ? establishedCount : "—"}
                 </div>
               </div>
               <div className="tactical-card col-span-2 rounded-xl px-4 py-3 lg:col-span-1">
                 <div className="text-xs text-[#8292A3]">Ожидание (LISTEN)</div>
                 <div className="mt-1 font-mono text-xl font-bold text-[#36AFC0]">
-                  {listenCount}
+                  {received ? listenCount : "—"}
                 </div>
               </div>
             </div>
 
             {/* Панель поиска и фильтрации */}
-            <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
+            <div className="avs-band">
               <div className="flex flex-wrap gap-2">
                 {filters.map((item) => (
                   <button
                     key={item.id}
                     type="button"
                     onClick={() => setFilter(item.id)}
+                    aria-pressed={filter === item.id}
                     className={`cursor-pointer rounded-lg border px-3 py-1.5 font-mono text-xs font-medium transition-colors ${
                       filter === item.id
                         ? "border-[#00D5E8]/40 bg-[#00D5E8]/12 text-[#00D5E8]"
@@ -301,7 +336,7 @@ export function NetworkModule({ c }: { c: NexusController }) {
                 ))}
               </div>
 
-              <div className="relative min-w-0 flex-1">
+              <div className="relative min-w-0 flex-[1_1_13rem]">
                 <Search
                   size={14}
                   className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[#526170]"
@@ -311,6 +346,7 @@ export function NetworkModule({ c }: { c: NexusController }) {
                   value={search}
                   onChange={(event) => setSearch(event.target.value)}
                   placeholder="Поиск по процессу, PID, IP-адресу или порту…"
+                  aria-label="Поиск подключений"
                   className="w-full rounded-lg border border-[#202B38] bg-[#10151D] py-2 pr-16 pl-9 text-sm text-[#E5EDF5] outline-none placeholder:text-[#526170] focus:border-[#00D5E8]/50"
                 />
                 <span className="absolute top-1/2 right-3 -translate-y-1/2 font-mono text-[11px] text-[#526170]">
@@ -347,108 +383,33 @@ export function NetworkModule({ c }: { c: NexusController }) {
 
             <div className="tactical-card tactical-brackets overflow-x-auto rounded-xl">
               <div className="min-w-[580px]">
-              <div className="grid grid-cols-[minmax(130px,1.35fr)_62px_minmax(90px,1fr)_minmax(90px,1fr)_114px_44px] gap-2.5 border-b border-[#202B38] bg-[#0B0E14] px-4 py-2.5 text-xs font-medium text-[#8292A3] lg:grid-cols-[minmax(0,1.4fr)_84px_minmax(0,1fr)_minmax(0,1fr)_136px_64px] lg:gap-3">
-                <span>Процесс и PID</span>
-                <span>Протокол</span>
-                <span>Локальный узел :порт</span>
-                <span>Удалённый узел :порт</span>
-                <span>Состояние</span>
-                <span className="text-right">IP</span>
-              </div>
-              <div
-                onScroll={() => setMenu(null)}
-                className="max-h-[calc(100vh-380px)] min-h-[240px] divide-y divide-[#202B38]/60 overflow-y-auto"
-              >
-                {loading && connections.length === 0 ? (
-                  <div className="flex items-center justify-center gap-2 p-12 text-xs text-[#8292A3]">
-                    <Loader2 size={15} className="animate-spin text-[#00D5E8]" />
-                    Опрос сетевого стека Windows…
-                  </div>
-                ) : visible.length === 0 ? (
-                  <div className="flex flex-col items-center gap-2 p-12 text-sm text-[#8292A3]">
-                    <Search size={18} className="text-[#526170]" />
-                    Активные сокеты по заданному фильтру не найдены
-                  </div>
-                ) : (
-                  visible.map((conn, index) => {
-                    const badge = stateBadge(conn.state);
-                    const isTcp = conn.protocol.toUpperCase() === "TCP";
-                    return (
-                      <div
-                        key={`${conn.protocol}-${conn.local_addr}-${conn.remote_addr}-${conn.pid}-${index}`}
-                        onContextMenu={(event) => openMenu(event, conn)}
-                        className="grid grid-cols-[minmax(130px,1.35fr)_62px_minmax(90px,1fr)_minmax(90px,1fr)_114px_44px] items-center gap-2.5 px-4 py-2.5 text-xs transition-colors hover:bg-[#151C26]/65 lg:grid-cols-[minmax(0,1.4fr)_84px_minmax(0,1fr)_minmax(0,1fr)_136px_64px] lg:gap-3"
-                      >
-                        <div className="flex min-w-0 items-center gap-2.5">
-                          <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded border border-[#202B38] bg-[#0B0E14] text-[#8292A3]">
-                            {conn.icon_base64 ? (
-                              <img
-                                src={`data:image/png;base64,${conn.icon_base64}`}
-                                alt=""
-                                draggable={false}
-                                className="h-4 w-4 object-contain"
-                              />
-                            ) : (
-                              <AppWindow size={13} />
-                            )}
-                          </div>
-                          <div className="flex min-w-0 items-center gap-2">
-                            <span className="truncate font-semibold text-[#E5EDF5]">
-                              {conn.process_name}
-                            </span>
-                            <span className="shrink-0 rounded border border-[#202B38] bg-[#0B0E14] px-1.5 py-0.5 font-mono text-[10px] text-[#8292A3]">
-                              PID {conn.pid}
-                            </span>
-                          </div>
-                        </div>
-
-                        <div>
-                          <span
-                            className={`inline-flex rounded border px-2 py-0.5 font-mono text-[10px] font-semibold ${
-                              isTcp
-                                ? "border-[#00D5E8]/30 bg-[#00D5E8]/10 text-[#00D5E8]"
-                                : "border-indigo-500/30 bg-indigo-500/10 text-indigo-300"
-                            }`}
-                          >
-                            {conn.protocol.toUpperCase()}
-                          </span>
-                        </div>
-
-                        <EndpointCell addr={conn.local_addr} />
-                        <EndpointCell addr={conn.remote_addr} />
-
-                        <div>
-                          <span
-                            className={`inline-flex rounded-md border px-2 py-0.5 font-mono text-[10px] font-semibold ${badge.className}`}
-                          >
-                            {badge.label}
-                          </span>
-                        </div>
-
-                        <div className="flex justify-end">
-                          <button
-                            type="button"
-                            title="Копировать удалённый IP-адрес"
-                            onClick={() => void copyRemoteIp(conn)}
-                            className="inline-flex h-7 w-7 cursor-pointer items-center justify-center rounded-lg border border-[#202B38] bg-[#0B0E14] text-[#8292A3] transition-colors hover:border-[#00D5E8]/40 hover:text-[#00D5E8]"
-                          >
-                            <Copy size={13} />
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })
-                )}
-              </div>
+                <div className="grid grid-cols-[minmax(130px,1.35fr)_62px_minmax(90px,1fr)_minmax(90px,1fr)_114px_44px] gap-2.5 border-b border-[#202B38] bg-[#0B0E14] px-4 py-2.5 text-xs font-medium text-[#8292A3] lg:grid-cols-[minmax(0,1.4fr)_84px_minmax(0,1fr)_minmax(0,1fr)_136px_64px] lg:gap-3">
+                  <span>Процесс и PID</span>
+                  <span>Протокол</span>
+                  <span>Локальный узел :порт</span>
+                  <span>Удалённый узел :порт</span>
+                  <span>Состояние</span>
+                  <span className="text-right">IP</span>
+                </div>
+                <SocketTable
+                  connections={visible}
+                  loading={loading && connections.length === 0}
+                  onCopy={copyRemoteIp}
+                  onMenu={openMenu}
+                  onScroll={closeMenu}
+                />
               </div>
             </div>
           </div>
         )}
       </motion.div>
 
-      <AnimatePresence>
+      {createPortal(<AnimatePresence>
         {menu && (
           <motion.div
+            ref={menuElement}
+            aria-label="Действия с подключением"
+            role="menu"
             initial={{ opacity: 0, scale: 0.95, y: -4 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.96 }}
@@ -456,7 +417,18 @@ export function NetworkModule({ c }: { c: NexusController }) {
             style={{ left: menu.x, top: menu.y }}
             onMouseDown={(event) => event.stopPropagation()}
             onContextMenu={(event) => event.preventDefault()}
-            className="fixed z-[100] w-64 rounded-xl border border-[#202B38] bg-[#10151D] p-1.5 text-xs shadow-[0_18px_44px_rgba(0,0,0,0.85)]"
+            onKeyDown={(event) => {
+              if (event.key === "Escape" || event.key === "Tab") {
+                event.preventDefault();
+                closeMenuAndRestoreFocus();
+              } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                event.preventDefault();
+                const items = Array.from(event.currentTarget.querySelectorAll("button"));
+                const current = items.indexOf(document.activeElement as HTMLButtonElement);
+                items[(current + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length]?.focus();
+              }
+            }}
+            className="nexus-panel fixed z-[100] w-64 p-1.5 text-xs shadow-2xl"
           >
             <div className="mb-1 rounded-lg border border-[#202B38] bg-[#0B0E14] px-2.5 py-2">
               <div className="truncate font-semibold text-[#E5EDF5]">{menu.conn.process_name}</div>
@@ -466,9 +438,10 @@ export function NetworkModule({ c }: { c: NexusController }) {
             </div>
             <button
               type="button"
+              role="menuitem"
               onClick={() => {
                 void copyRemoteIp(menu.conn);
-                setMenu(null);
+                closeMenuAndRestoreFocus();
               }}
               className="flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[#E5EDF5] hover:bg-[#151C26]"
             >
@@ -477,11 +450,10 @@ export function NetworkModule({ c }: { c: NexusController }) {
             </button>
             <button
               type="button"
-              onClick={async () => {
-                const port = endpointPort(menu.conn.remote_addr);
-                setMenu(null);
-                await copyTextToClipboard(port);
-                showNotice(`Скопирован порт: ${port}`);
+              role="menuitem"
+              onClick={() => {
+                void copyEndpoint(endpointPort(menu.conn.remote_addr), "порт");
+                closeMenuAndRestoreFocus();
               }}
               className="flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[#E5EDF5] hover:bg-[#151C26]"
             >
@@ -491,12 +463,10 @@ export function NetworkModule({ c }: { c: NexusController }) {
             <div className="my-1 h-px bg-[#202B38]" />
             <button
               type="button"
+              role="menuitem"
               onClick={() => {
-                const pid = menu.conn.pid;
                 setMenu(null);
-                c.setProcessSearch(String(pid));
-                c.setSelectedPid(pid);
-                c.setActiveTab("processes");
+                c.openProcessFromNetwork(menu.conn.pid);
               }}
               className="flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[#00D5E8] hover:bg-[#00D5E8]/10"
             >
@@ -505,31 +475,158 @@ export function NetworkModule({ c }: { c: NexusController }) {
             </button>
           </motion.div>
         )}
-      </AnimatePresence>
+      </AnimatePresence>, document.body)}
     </>
   );
 }
 
-interface SpeedPoint {
-  ts: string;
-  rxBps: number;
-  txBps: number;
+
+interface SocketTableProps {
+  connections: NetworkConnection[];
+  loading: boolean;
+  onCopy: (conn: NetworkConnection) => Promise<void>;
+  onMenu: (event: MouseEvent<HTMLDivElement>, conn: NetworkConnection) => void;
+  onScroll: () => void;
 }
+
+const SocketTable = memo(function SocketTable({
+  connections, loading, onCopy, onMenu, onScroll,
+}: SocketTableProps) {
+  const viewport = useRef<HTMLDivElement>(null);
+  const [height, setHeight] = useState(0);
+  const [scrollTop, setScrollTop] = useState(0);
+  const rowKeys = useMemo(() => {
+    const seen = new Map<string, number>();
+    return connections.map((conn) => {
+      const base = `${conn.protocol}:${conn.pid}|${conn.local_addr}|${conn.remote_addr}`;
+      const occurrence = seen.get(base) ?? 0;
+      seen.set(base, occurrence + 1);
+      return `${base}|${occurrence}`;
+    });
+  }, [connections]);
+
+  useLayoutEffect(() => {
+    const element = viewport.current;
+    if (!element) return;
+    const measure = () => setHeight(element.clientHeight);
+    const observer = new ResizeObserver(measure);
+    measure();
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  const totalHeight = connections.length * SOCKET_ROW_HEIGHT;
+  const top = Math.min(scrollTop, Math.max(0, totalHeight - height));
+  const start = Math.max(0, Math.floor(top / SOCKET_ROW_HEIGHT) - SOCKET_OVERSCAN);
+  const end = Math.min(connections.length, Math.ceil((top + height) / SOCKET_ROW_HEIGHT) + SOCKET_OVERSCAN);
+
+  return (
+    <div
+      ref={viewport}
+      tabIndex={0}
+      aria-label="Список сетевых подключений"
+      onScroll={(event) => {
+        setScrollTop(event.currentTarget.scrollTop);
+        onScroll();
+      }}
+      className="max-h-[calc(100vh-380px)] min-h-[240px] overflow-y-auto"
+    >
+      {loading ? (
+        <div className="flex items-center justify-center gap-2 p-12 text-xs text-[#8292A3]">
+          <Loader2 size={15} className="animate-spin text-[#00D5E8]" />
+          Опрос сетевого стека Windows…
+        </div>
+      ) : connections.length === 0 ? (
+        <div className="flex flex-col items-center gap-2 p-12 text-sm text-[#8292A3]">
+          <Search size={18} className="text-[#526170]" />
+          Активные сокеты по заданному фильтру не найдены
+        </div>
+      ) : (
+        <div style={{ paddingTop: start * SOCKET_ROW_HEIGHT, paddingBottom: (connections.length - end) * SOCKET_ROW_HEIGHT }}>
+          {connections.slice(start, end).map((conn, offset) => {
+            const badge = stateBadge(conn.state);
+            const isTcp = conn.protocol.toUpperCase() === "TCP";
+            return (
+              <div
+                key={rowKeys[start + offset]}
+                onContextMenu={(event) => onMenu(event, conn)}
+                style={{ height: SOCKET_ROW_HEIGHT }}
+                className={`grid grid-cols-[minmax(130px,1.35fr)_62px_minmax(90px,1fr)_minmax(90px,1fr)_114px_44px] items-center gap-2.5 px-4 py-2.5 text-xs transition-colors hover:bg-[#151C26]/65 lg:grid-cols-[minmax(0,1.4fr)_84px_minmax(0,1fr)_minmax(0,1fr)_136px_64px] lg:gap-3 ${start + offset < connections.length - 1 ? "border-b border-[#202B38]/60" : ""}`}
+              >
+                <div className="flex min-w-0 items-center gap-2.5">
+                  <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded border border-[#202B38] bg-[#0B0E14] text-[#8292A3]">
+                    {conn.icon_base64 ? (
+                      <img
+                        src={`data:image/png;base64,${conn.icon_base64}`}
+                        alt=""
+                        draggable={false}
+                        className="h-4 w-4 object-contain"
+                      />
+                    ) : (
+                      <AppWindow size={13} />
+                    )}
+                  </div>
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span className="truncate font-semibold text-[#E5EDF5]">
+                      {conn.process_name}
+                    </span>
+                    <span className="shrink-0 rounded border border-[#202B38] bg-[#0B0E14] px-1.5 py-0.5 font-mono text-[10px] text-[#8292A3]">
+                      PID {conn.pid}
+                    </span>
+                  </div>
+                </div>
+
+                <div>
+                  <span
+                    className={`inline-flex rounded border px-2 py-0.5 font-mono text-[10px] font-semibold ${
+                      isTcp
+                        ? "border-[#00D5E8]/30 bg-[#00D5E8]/10 text-[#00D5E8]"
+                        : "border-indigo-500/30 bg-indigo-500/10 text-indigo-300"
+                    }`}
+                  >
+                    {conn.protocol.toUpperCase()}
+                  </span>
+                </div>
+
+                <EndpointCell addr={conn.local_addr} />
+                <EndpointCell addr={conn.remote_addr} />
+
+                <div>
+                  <span
+                    className={`inline-flex rounded-md border px-2 py-0.5 font-mono text-[10px] font-semibold ${badge.className}`}
+                  >
+                    {badge.label}
+                  </span>
+                </div>
+
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    title="Копировать удалённый IP-адрес"
+                    onClick={() => void onCopy(conn)}
+                    className="inline-flex h-7 w-7 cursor-pointer items-center justify-center rounded-lg border border-[#202B38] bg-[#0B0E14] text-[#8292A3] transition-colors hover:border-[#00D5E8]/40 hover:text-[#00D5E8]"
+                  >
+                    <Copy size={13} />
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+});
 
 function buildSmoothArea(coords: { x: number; y: number }[], baseline: number): { line: string; area: string } {
   if (coords.length === 0) return { line: "", area: "" };
   const fmt = (n: number) => n.toFixed(2);
   let line = `M ${fmt(coords[0].x)} ${fmt(coords[0].y)}`;
   for (let i = 0; i < coords.length - 1; i++) {
-    const p0 = coords[Math.max(0, i - 1)];
     const p1 = coords[i];
     const p2 = coords[i + 1];
-    const p3 = coords[Math.min(coords.length - 1, i + 2)];
-    const cp1x = p1.x + (p2.x - p0.x) / 6;
-    const cp1y = p1.y + (p2.y - p0.y) / 6;
-    const cp2x = p2.x - (p3.x - p1.x) / 6;
-    const cp2y = p2.y - (p3.y - p1.y) / 6;
-    line += ` C ${fmt(cp1x)} ${fmt(cp1y)} ${fmt(cp2x)} ${fmt(cp2y)} ${fmt(p2.x)} ${fmt(p2.y)}`;
+    const midX = fmt((p1.x + p2.x) / 2);
+    line += ` C ${midX} ${fmt(p1.y)} ${midX} ${fmt(p2.y)} ${fmt(p2.x)} ${fmt(p2.y)}`;
   }
   const firstX = fmt(coords[0].x);
   const lastX = fmt(coords[coords.length - 1].x);
@@ -559,7 +656,7 @@ function LiveNetworkSpeedChart({
   unitMode,
   onUnitChange,
 }: {
-  history: SpeedPoint[];
+  history: NetworkSpeedSample[];
   currentRx: number;
   currentTx: number;
   unitMode: "mbps" | "mbs";
@@ -568,7 +665,6 @@ function LiveNetworkSpeedChart({
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const width = 640;
   const height = 196;
-  const maxPoints = 60;
 
   const peakRx = history.reduce((m, p) => Math.max(m, p.rxBps), currentRx);
   const peakTx = history.reduce((m, p) => Math.max(m, p.txBps), currentTx);
@@ -579,13 +675,13 @@ function LiveNetworkSpeedChart({
   const rxPeakFmt = formatThroughputRate(peakRx, unitMode);
   const txPeakFmt = formatThroughputRate(peakTx, unitMode);
 
-  const paddedHistory = history.length > 0 ? history : [{ ts: "—", rxBps: currentRx, txBps: currentTx }];
-  const startOffset = Math.max(0, maxPoints - paddedHistory.length);
+  const first = history[0]?.at ?? 0;
+  const last = history[history.length - 1]?.at ?? first;
+  const fraction = (at: number) => last === first ? 1 : (at - first) / (last - first);
 
   const mapPoints = (key: "rxBps" | "txBps") =>
-    paddedHistory.map((pt, idx) => {
-      const slot = startOffset + idx;
-      const x = (slot / (maxPoints - 1)) * width;
+    history.map((pt) => {
+      const x = fraction(pt.at) * width;
       const ratio = Math.min(1, Math.max(0, pt[key] / ceilingBytes));
       const y = height - ratio * (height - 16) - 8;
       return { x, y };
@@ -600,19 +696,15 @@ function LiveNetworkSpeedChart({
 
   const handleMouseMove = (e: MouseEvent<HTMLDivElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
-    if (rect.width <= 0 || paddedHistory.length === 0) return;
+    if (rect.width <= 0 || history.length === 0) return;
     const relX = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    const slot = Math.round(relX * (maxPoints - 1));
-    const localIdx = slot - startOffset;
-    if (localIdx >= 0 && localIdx < paddedHistory.length) {
-      setHoverIdx(localIdx);
-    } else {
-      setHoverIdx(null);
-    }
+    const target = first + relX * (last - first);
+    setHoverIdx(history.reduce((nearest, p, index) =>
+      Math.abs(p.at - target) < Math.abs(history[nearest].at - target) ? index : nearest, 0));
   };
 
-  const hovered = hoverIdx !== null ? paddedHistory[hoverIdx] : null;
-  const hoverX = hoverIdx !== null ? ((startOffset + hoverIdx) / (maxPoints - 1)) * 100 : 0;
+  const hovered = hoverIdx !== null ? history[hoverIdx] : null;
+  const hoverX = hovered ? fraction(hovered.at) * 100 : 0;
   const hoveredRx = hovered ? formatThroughputRate(hovered.rxBps, unitMode) : null;
   const hoveredTx = hovered ? formatThroughputRate(hovered.txBps, unitMode) : null;
 
@@ -620,13 +712,13 @@ function LiveNetworkSpeedChart({
   const topLabel = formatThroughputRate(ceilingBytes, unitMode);
 
   return (
-    <section className="tactical-card tactical-brackets rounded-xl p-4 sm:p-5">
+    <section className="avs-network-plot tactical-card rounded-xl p-4 sm:p-5" aria-label="График пропускной способности">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="flex flex-wrap items-center gap-6">
           <div>
             <div className="flex items-center gap-1.5 text-xs text-[#8292A3]">
               <ArrowDown size={13} className="text-[#00D5E8]" />
-              <span>Приём (Download)</span>
+              <span>Приём</span>
             </div>
             <div className="mt-1 flex items-baseline gap-2">
               <span className="font-mono text-2xl font-bold tracking-tight text-[#00D5E8] sm:text-3xl">
@@ -644,7 +736,7 @@ function LiveNetworkSpeedChart({
           <div>
             <div className="flex items-center gap-1.5 text-xs text-[#8292A3]">
               <ArrowUp size={13} className="text-indigo-400" />
-              <span>Отдача (Upload)</span>
+              <span>Отдача</span>
             </div>
             <div className="mt-1 flex items-baseline gap-2">
               <span className="font-mono text-2xl font-bold tracking-tight text-indigo-300 sm:text-3xl">
@@ -680,6 +772,7 @@ function LiveNetworkSpeedChart({
                 key={id}
                 type="button"
                 onClick={() => onUnitChange(id)}
+                aria-pressed={unitMode === id}
                 className={`cursor-pointer rounded-md px-2.5 py-1 font-mono text-[11px] font-medium transition-colors ${
                   unitMode === id
                     ? "bg-[#151C26] text-[#00D5E8]"
@@ -706,10 +799,22 @@ function LiveNetworkSpeedChart({
           </div>
 
           <div
+            data-graph
             onMouseMove={handleMouseMove}
             onMouseLeave={() => setHoverIdx(null)}
             className="relative h-48 min-w-0 flex-1 cursor-crosshair overflow-hidden rounded-lg border border-[#202B38] bg-[#0B0E14]"
           >
+            {history.length > 1 && <input
+              type="range" min={0} max={history.length - 1} step={1}
+              className="avs-chart-scrubber"
+              aria-label="Замер скорости адаптера"
+              aria-valuetext={hovered && hoveredRx && hoveredTx
+                ? `${hovered.ts}. Приём ${hoveredRx.value} ${hoveredRx.unit}. Отдача ${hoveredTx.value} ${hoveredTx.unit}.`
+                : history[history.length - 1].ts}
+              value={hovered && hoverIdx !== null ? hoverIdx : history.length - 1}
+              onChange={(event) => setHoverIdx(event.currentTarget.valueAsNumber)}
+              onFocus={() => setHoverIdx(history.length - 1)} onBlur={() => setHoverIdx(null)}
+            />}
             <svg
               viewBox={`0 0 ${width} ${height}`}
               preserveAspectRatio="none"
@@ -763,6 +868,7 @@ function LiveNetworkSpeedChart({
               />
             </svg>
 
+            {history.length === 0 && <p>Ожидание первого измерения</p>}
             {txLast && (
               <div
                 className="pointer-events-none absolute h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-indigo-400 shadow-[0_0_6px_rgba(129,140,248,0.85)]"
@@ -802,9 +908,9 @@ function LiveNetworkSpeedChart({
         </div>
 
         <div className="mt-1.5 flex flex-wrap justify-between gap-2 px-0.5 font-mono text-[11px] text-[#526170] sm:pl-[92px]">
-          <span>-60 сек</span>
-          <span className="text-[#8292A3]/80">Трафик интерфейса в реальном времени (адаптивная шкала)</span>
-          <span>Сейчас (1 с)</span>
+          <span>{history[0]?.ts ?? "—"}</span>
+          <span>Трафик адаптера</span>
+          <span>{history[history.length - 1]?.ts ?? "—"}</span>
         </div>
       </div>
     </section>
@@ -825,11 +931,14 @@ function InfoRow({ label, value, mono = false }: { label: string; value: string;
   );
 }
 
-function NetworkOverview({ c }: { c: NexusController }) {
-  const { netSnapshot, selectedAdapterId, setSelectedAdapterId, netSpeedHistory, refreshNetworkTelemetry } = c;
-  const [unitMode, setUnitMode] = useState<"mbps" | "mbs">("mbps");
-  const [probeSamples, setProbeSamples] = useState<NetworkHealthProbe[]>([]);
+function NetworkOverview({ c, active }: { c: NexusController; active: boolean }) {
+  const { netSnapshot, netSnapshotError, selectedAdapterId, setSelectedAdapterId, netSpeedHistory, refreshNetworkTelemetry } = c;
+  const [unitMode, setUnitMode] = useWorkspaceState<"mbps" | "mbs">("network.unitMode", "mbps");
+  const [latestProbe, setLatestProbe] = useState<NetworkHealthProbe | null>(null);
+  const [rttHistory, setRttHistory] = useState<RttSample[]>([]);
   const [probing, setProbing] = useState(false);
+  const [probeFailure, setProbeFailure] = useState<string | null>(null);
+  const probeScope = useRef<{ pending: boolean } | null>(null);
 
   const visibleAdapters: NetworkAdapterInfo[] = useMemo(() => {
     const all = netSnapshot?.adapters ?? [];
@@ -848,59 +957,68 @@ function NetworkOverview({ c }: { c: NexusController }) {
 
   const activeGateway = activeAdapter?.gateways[0] ?? null;
 
+  useEffect(() => {
+    setLatestProbe(null);
+    setRttHistory([]);
+    setProbeFailure(null);
+  }, [activeAdapter?.id, activeGateway]);
+
   const runHealthProbe = useCallback(async () => {
+    const scope = probeScope.current;
+    if (!scope || scope.pending) return;
+    scope.pending = true;
     setProbing(true);
     try {
       const sample = await invoke<NetworkHealthProbe>("probe_network_health", {
         gatewayIp: activeGateway,
         externalHost: "1.1.1.1",
       });
-      setProbeSamples((prev) => {
-        const next = [...prev, sample];
-        return next.length > 30 ? next.slice(next.length - 30) : next;
-      });
+      if (probeScope.current === scope) {
+        setLatestProbe(sample);
+        setRttHistory(previous => appendRtt(previous, {
+          host: sample.external_host,
+          timestamp_ms: sample.timestamp_ms,
+          method: sample.external_method,
+          route: sample.external_route ?? null,
+          rtt_ms: sample.external_ping_ms,
+        }));
+        setProbeFailure(null);
+      }
     } catch (err) {
-      console.error("Ошибка проверки состояния канала:", err);
+      if (probeScope.current === scope) {
+        setLatestProbe(null);
+        setRttHistory([]);
+        setProbeFailure(String(err));
+      }
     } finally {
-      setProbing(false);
+      scope.pending = false;
+      if (probeScope.current === scope) setProbing(false);
     }
   }, [activeGateway]);
 
   useEffect(() => {
-    setProbeSamples([]);
-  }, [activeAdapter?.id, activeGateway]);
-
-  useEffect(() => {
+    if (!active) return;
+    probeScope.current = { pending: false };
     void runHealthProbe();
     const timer = window.setInterval(() => {
       void runHealthProbe();
     }, 2500);
-    return () => window.clearInterval(timer);
-  }, [runHealthProbe]);
+    return () => {
+      probeScope.current = null;
+      window.clearInterval(timer);
+    };
+  }, [active, activeAdapter?.id, runHealthProbe]);
 
-  const latestProbe = probeSamples[probeSamples.length - 1] ?? null;
-  const extPings = probeSamples
-    .map((s) => s.external_ping_ms)
-    .filter((v): v is number => v !== null && Number.isFinite(v));
-  const avgPing =
-    extPings.length > 0 ? extPings.reduce((sum, v) => sum + v, 0) / extPings.length : null;
-  const jitterMs =
-    extPings.length >= 2
-      ? extPings.slice(1).reduce((sum, v, i) => sum + Math.abs(v - extPings[i]), 0) /
-        (extPings.length - 1)
-      : null;
-  const packetLossPct =
-    probeSamples.length > 0
-      ? ((probeSamples.length - extPings.length) / probeSamples.length) * 100
-      : null;
+  const { avgMs: avgPing, jitterMs, successes, lossPct: packetLossPct } = summarizeRtt(rttHistory);
 
-  const currentRxBps = activeAdapter?.rx_bytes_per_sec ?? netSnapshot?.total_rx_bytes_per_sec ?? 0;
-  const currentTxBps = activeAdapter?.tx_bytes_per_sec ?? netSnapshot?.total_tx_bytes_per_sec ?? 0;
   const errorsTotal = activeAdapter ? activeAdapter.rx_errors + activeAdapter.tx_errors : 0;
   const droppedTotal = activeAdapter ? activeAdapter.rx_dropped + activeAdapter.tx_dropped : 0;
 
   return (
     <div className="space-y-4">
+      {netSnapshotError && <p role="alert" className="nexus-message nexus-message--error">
+        {netSnapshot ? "Не удалось обновить адаптеры. Показан последний замер." : "Не удалось прочитать сетевые адаптеры."} {netSnapshotError}
+      </p>}
       <div className="tactical-card flex flex-wrap items-center justify-between gap-3 rounded-xl px-4 py-3">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
           <span className="inline-flex items-center gap-1.5 text-xs font-medium text-[#8292A3]">
@@ -908,7 +1026,7 @@ function NetworkOverview({ c }: { c: NexusController }) {
             Адаптер:
           </span>
           {visibleAdapters.length === 0 ? (
-            <span className="font-mono text-xs text-[#526170]">Опрос интерфейсов Windows…</span>
+            <span className="text-xs text-[var(--nexus-muted)]">{netSnapshotError ? "Список недоступен" : netSnapshot ? "Интерфейсы не обнаружены" : "Опрос интерфейсов Windows…"}</span>
           ) : (
             visibleAdapters.map((adapter) => {
               const selected = activeAdapter?.id === adapter.id;
@@ -917,6 +1035,7 @@ function NetworkOverview({ c }: { c: NexusController }) {
                 <button
                   key={adapter.id}
                   type="button"
+                  aria-pressed={selected}
                   onClick={() => setSelectedAdapterId(adapter.id)}
                   className={`inline-flex max-w-[260px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs transition-colors ${
                     selected
@@ -940,6 +1059,7 @@ function NetworkOverview({ c }: { c: NexusController }) {
         <div className="flex items-center gap-2">
           <button
             type="button"
+            disabled={!activeAdapter}
             onClick={() => void refreshNetworkTelemetry(true)}
             className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-[#202B38] bg-[#0B0E14] px-2.5 py-1.5 text-xs font-medium text-[#8292A3] transition-colors hover:border-[#00D5E8]/35 hover:text-[#E5EDF5]"
           >
@@ -949,13 +1069,13 @@ function NetworkOverview({ c }: { c: NexusController }) {
         </div>
       </div>
 
-      <LiveNetworkSpeedChart
+      {activeAdapter && <LiveNetworkSpeedChart
         history={netSpeedHistory}
-        currentRx={currentRxBps}
-        currentTx={currentTxBps}
+        currentRx={activeAdapter.rx_bytes_per_sec}
+        currentTx={activeAdapter.tx_bytes_per_sec}
         unitMode={unitMode}
         onUnitChange={setUnitMode}
-      />
+      />}
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
         <section className="tactical-card tactical-brackets rounded-xl p-4 lg:col-span-6">
@@ -1047,30 +1167,30 @@ function NetworkOverview({ c }: { c: NexusController }) {
               <span className="font-mono text-[10px] text-[#526170]">Счётчики адаптера</span>
             </div>
 
-            <div className="mt-3 grid grid-cols-2 gap-2.5">
+            {activeAdapter ? <div className="mt-3 grid grid-cols-2 gap-2.5">
               <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] px-3 py-2.5">
                 <div className="text-[11px] text-[#8292A3]">Получено за сессию</div>
                 <div className="mt-1 font-mono text-base font-bold text-[#00D5E8]">
-                  {formatBytes(activeAdapter?.session_rx_bytes ?? 0)}
+                  {formatBytes(activeAdapter.session_rx_bytes)}
                 </div>
                 <div className="mt-0.5 font-mono text-[10px] text-[#526170]">
-                  Всего ОС: {formatBytes(activeAdapter?.total_rx_bytes ?? 0)}
+                  Всего ОС: {formatBytes(activeAdapter.total_rx_bytes)}
                 </div>
               </div>
               <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] px-3 py-2.5">
                 <div className="text-[11px] text-[#8292A3]">Отправлено за сессию</div>
                 <div className="mt-1 font-mono text-base font-bold text-indigo-300">
-                  {formatBytes(activeAdapter?.session_tx_bytes ?? 0)}
+                  {formatBytes(activeAdapter.session_tx_bytes)}
                 </div>
                 <div className="mt-0.5 font-mono text-[10px] text-[#526170]">
-                  Всего ОС: {formatBytes(activeAdapter?.total_tx_bytes ?? 0)}
+                  Всего ОС: {formatBytes(activeAdapter.total_tx_bytes)}
                 </div>
               </div>
               <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] px-3 py-2.5">
                 <div className="text-[11px] text-[#8292A3]">Пакеты (RX / TX)</div>
                 <div className="mt-1 font-mono text-sm font-semibold text-[#E5EDF5]">
-                  {(activeAdapter?.rx_packets ?? 0).toLocaleString("ru-RU")} /{" "}
-                  {(activeAdapter?.tx_packets ?? 0).toLocaleString("ru-RU")}
+                  {activeAdapter.rx_packets.toLocaleString("ru-RU")} /{" "}
+                  {activeAdapter.tx_packets.toLocaleString("ru-RU")}
                 </div>
               </div>
               <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] px-3 py-2.5">
@@ -1083,7 +1203,7 @@ function NetworkOverview({ c }: { c: NexusController }) {
                   {errorsTotal.toLocaleString("ru-RU")} / {droppedTotal.toLocaleString("ru-RU")}
                 </div>
               </div>
-            </div>
+            </div> : <p className="py-5 text-sm text-[var(--nexus-muted)]">Нет показаний адаптера</p>}
           </section>
 
           <section className="tactical-card tactical-brackets rounded-xl p-4">
@@ -1103,6 +1223,7 @@ function NetworkOverview({ c }: { c: NexusController }) {
               </button>
             </div>
 
+            {probeFailure && <p role="alert" className="nexus-message nexus-message--error mt-3">Не удалось проверить канал. {probeFailure}</p>}
             <div className="mt-3 grid grid-cols-2 gap-2.5 sm:grid-cols-3">
               <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] px-3 py-2">
                 <div className="text-[11px] text-[#8292A3]">Доступность шлюза</div>
@@ -1123,7 +1244,7 @@ function NetworkOverview({ c }: { c: NexusController }) {
                       : `${latestProbe.gateway_ping_ms} мс · ОК`
                     : latestProbe
                     ? "Недоступен"
-                    : "Замер…"}
+                    : probeFailure ? "Нет замера" : "Замер…"}
                 </div>
               </div>
 
@@ -1139,9 +1260,9 @@ function NetworkOverview({ c }: { c: NexusController }) {
                   }`}
                 >
                   {latestProbe == null
-                    ? "Замер…"
+                    ? (probeFailure ? "Нет замера" : "Замер…")
                     : latestProbe.external_reachable
-                    ? `${latestProbe.external_ping_ms ?? "—"} мс (${latestProbe.external_method})`
+                    ? `${latestProbe.external_ping_ms === 0 ? "<1" : latestProbe.external_ping_ms ?? "—"} мс (${latestProbe.external_method})`
                     : "Нет ответа"}
                 </div>
               </div>
@@ -1154,14 +1275,14 @@ function NetworkOverview({ c }: { c: NexusController }) {
               </div>
 
               <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] px-3 py-2">
-                <div className="text-[11px] text-[#8292A3]">Джиттер (Jitter)</div>
+                <div className="text-[11px] text-[#8292A3]" title={JITTER_HELP}>Джиттер (Jitter)</div>
                 <div className="mt-0.5 font-mono text-sm font-semibold text-[#E5EDF5]">
-                  {jitterMs !== null ? `${jitterMs.toFixed(1)} мс` : "—"}
+                  {formatJitter(jitterMs)}
                 </div>
               </div>
 
               <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] px-3 py-2">
-                <div className="text-[11px] text-[#8292A3]">Потери (Loss)</div>
+                <div className="text-[11px] text-[#8292A3]" title="Доля проб без ответа. ICMP и резервная TCP-проба могут использоваться в одной попытке.">Пробы без ответа</div>
                 <div
                   className={`mt-0.5 font-mono text-sm font-semibold ${
                     packetLossPct == null
@@ -1180,7 +1301,7 @@ function NetworkOverview({ c }: { c: NexusController }) {
               <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] px-3 py-2">
                 <div className="text-[11px] text-[#8292A3]">Серия замеров</div>
                 <div className="mt-0.5 font-mono text-sm font-semibold text-[#8292A3]">
-                  {extPings.length}/{probeSamples.length || 0} ОК
+                  {successes}/{rttHistory.length} ОК
                 </div>
               </div>
             </div>
@@ -1188,7 +1309,6 @@ function NetworkOverview({ c }: { c: NexusController }) {
         </div>
       </div>
 
-      <NetworkToolkit />
     </div>
   );
 }
@@ -1203,19 +1323,23 @@ interface StabilityReport {
   sent: number;
   received: number;
   loss_percent: number;
-  min_ms: number;
-  avg_ms: number;
-  max_ms: number;
-  jitter_ms: number;
+  min_ms: number | null;
+  avg_ms: number | null;
+  max_ms: number | null;
+  jitter_ms: number | null;
 }
+
+const formatRtt = (value: number | null, digits = 0) =>
+  value === null ? "Н/Д" : `${value.toFixed(digits)} мс`;
 
 interface DnsBenchRow {
   name: string;
   server: string;
   ms: number | null;
+  method?: string;
 }
 
-function NetworkToolkit() {
+function NetworkToolkit({ view, active }: { view: "overview" | "sockets" | "diagnostics" | "optimizer"; active: boolean }) {
   const [host, setHost] = useState(PROBE_TARGETS[0].host);
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -1224,15 +1348,69 @@ function NetworkToolkit() {
   const [dnsRows, setDnsRows] = useState<DnsBenchRow[]>([]);
   const [dnsBusy, setDnsBusy] = useState(false);
   const [dnsError, setDnsError] = useState("");
+  const [optStatus, setOptStatus] = useState<NetworkOptimizerStatus | null>(null);
+  const [optBusy, setOptBusy] = useState<"packet" | "ethernet" | null>(null);
+  const [optNotice, setOptNotice] = useState<string | null>(null);
+  const [optError, setOptError] = useState<string | null>(null);
   const progressTimerRef = useRef<number | null>(null);
+  const requestedInitialStatus = useRef(false);
+
+  const loadOptimizerStatus = useCallback(async () => {
+    try {
+      const next = await invoke<NetworkOptimizerStatus>("get_network_optimizer_status");
+      setOptStatus(next);
+    } catch (error) {
+      setOptStatus(null);
+      setOptError(String(error));
+    }
+  }, []);
 
   useEffect(() => {
-    return () => {
+    if (view === "optimizer" && active && !requestedInitialStatus.current) {
+      requestedInitialStatus.current = true;
+      void loadOptimizerStatus();
+    }
+  }, [active, view, loadOptimizerStatus]);
+
+  useEffect(() => () => {
       if (progressTimerRef.current) {
         clearInterval(progressTimerRef.current);
       }
-    };
   }, []);
+
+  const handleTogglePacketPriority = async () => {
+    if (!optStatus || optBusy) return;
+    const nextEnabled = !optStatus.packet_priority_enabled;
+    setOptBusy("packet");
+    setOptError(null);
+    setOptNotice(null);
+    try {
+      const msg = await invoke<string>("set_packet_priority", { enabled: nextEnabled });
+      setOptNotice(msg);
+    } catch (err) {
+      setOptError(String(err));
+    } finally {
+      await loadOptimizerStatus();
+      setOptBusy(null);
+    }
+  };
+
+  const handleToggleEthernetTuned = async () => {
+    if (!optStatus || optBusy) return;
+    const nextEnabled = !optStatus.ethernet_tuned;
+    setOptBusy("ethernet");
+    setOptError(null);
+    setOptNotice(null);
+    try {
+      const msg = await invoke<string>("set_ethernet_tuned", { enabled: nextEnabled });
+      setOptNotice(msg);
+    } catch (err) {
+      setOptError(String(err));
+    } finally {
+      await loadOptimizerStatus();
+      setOptBusy(null);
+    }
+  };
 
   const fastest = dnsRows.reduce<number | null>((best, row) => {
     if (row.ms == null) return best;
@@ -1248,8 +1426,97 @@ function NetworkToolkit() {
     : "text-rose-300";
 
   return (
-    <div className="space-y-4">
-      <section className="tactical-card tactical-brackets rounded-xl p-5">
+    <div hidden={view !== "optimizer" && view !== "diagnostics"}>
+      <section hidden={view !== "optimizer"} className="nexus-panel p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#202B38] pb-3">
+          <div>
+            <h3 className="text-sm font-semibold text-[#E5EDF5]">
+              Оптимизация сетевого стека и адаптера (Network Optimizer)
+            </h3>
+            <p className="mt-0.5 text-xs text-[#8292A3]">
+              Перед изменением системных параметров сохраняет исходные значения реестра и драйвера по GUID адаптера для точного отката
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => void loadOptimizerStatus()}
+            className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-[#202B38] bg-[#0B0E14] px-2.5 py-1 text-xs text-[#8292A3] hover:text-[#E5EDF5]"
+          >
+            <RefreshCw size={11} />
+            Обновить статус
+          </button>
+        </div>
+
+        <div className="mt-3 grid gap-3 lg:grid-cols-2">
+          <div className="flex items-center justify-between gap-4 rounded-lg border border-[#202B38] bg-[#0B0E14] p-3.5">
+            <div className="min-w-0">
+              <div className="text-sm font-medium text-[#E5EDF5]">Приоритет сетевых пакетов (MMCSS)</div>
+              <div className="mt-0.5 text-xs text-[#8292A3]">
+                {optStatus?.packet_priority_has_backup
+                  ? "Исходные значения NetworkThrottlingIndex и SystemResponsiveness сохранены в резервной копии"
+                  : "При включении сохранит текущие значения Windows перед изменением"}
+              </div>
+            </div>
+            <button
+              type="button"
+              disabled={!optStatus || optBusy !== null}
+              onClick={() => void handleTogglePacketPriority()}
+              className={`shrink-0 cursor-pointer rounded-lg border px-3 py-1.5 font-mono text-xs font-semibold transition-colors disabled:opacity-50 ${
+                optStatus?.packet_priority_enabled
+                  ? "border-[#00D5E8]/45 bg-[#00D5E8]/15 text-[#00D5E8]"
+                  : "border-[#202B38] bg-[#151C26] text-[#E5EDF5] hover:border-[#00D5E8]/35"
+              }`}
+            >
+              {optBusy === "packet"
+                ? "ПРИМЕНЕНИЕ…"
+                : optStatus?.packet_priority_enabled
+                ? "ВКЛЮЧЕНО · ОТКАТИТЬ"
+                : "ВКЛЮЧИТЬ"}
+            </button>
+          </div>
+
+          <div className="flex items-center justify-between gap-4 rounded-lg border border-[#202B38] bg-[#0B0E14] p-3.5">
+            <div className="min-w-0">
+              <div className="text-sm font-medium text-[#E5EDF5]">Тюнинг Ethernet (EEE / Interrupts)</div>
+              <div className="mt-0.5 text-xs text-[#8292A3]">
+                {optStatus?.ethernet_has_backup
+                  ? `Сохранена резервная копия драйвера для адаптеров: ${optStatus.backed_up_adapters_count}`
+                  : "Отключает энергосбережение EEE и снижает задержки с транзакционным откатом"}
+              </div>
+            </div>
+            <button
+              type="button"
+              disabled={!optStatus || optBusy !== null}
+              onClick={() => void handleToggleEthernetTuned()}
+              className={`shrink-0 cursor-pointer rounded-lg border px-3 py-1.5 font-mono text-xs font-semibold transition-colors disabled:opacity-50 ${
+                optStatus?.ethernet_tuned
+                  ? "border-[#00D5E8]/45 bg-[#00D5E8]/15 text-[#00D5E8]"
+                  : "border-[#202B38] bg-[#151C26] text-[#E5EDF5] hover:border-[#00D5E8]/35"
+              }`}
+            >
+              {optBusy === "ethernet"
+                ? "ПРИМЕНЕНИЕ…"
+                : optStatus?.ethernet_tuned
+                ? "ОПТИМИЗИРОВАНО · ВОССТАНОВИТЬ"
+                : "ОПТИМИЗИРОВАТЬ"}
+            </button>
+          </div>
+        </div>
+
+        {optNotice && (
+          <div className="mt-3 rounded-lg border border-[#00D5E8]/35 bg-[#00D5E8]/10 px-3 py-2 text-xs text-[#00D5E8]">
+            {optNotice}
+          </div>
+        )}
+        {optError && (
+          <div className="mt-3 rounded-lg border border-rose-500/35 bg-rose-500/12 px-3 py-2 text-xs text-rose-300">
+            {optError}
+          </div>
+        )}
+      </section>
+
+      <div hidden={view !== "diagnostics"} className="avs-network-tools">
+      <section className="nexus-panel p-5">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h3 className="text-sm font-semibold text-[#E5EDF5]">
@@ -1331,17 +1598,17 @@ function NetworkToolkit() {
           <div className="mt-4 grid gap-3 sm:grid-cols-4">
             <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] px-3.5 py-2.5">
               <div className="text-[11px] text-[#8292A3]">Минимальный пинг</div>
-              <div className="mt-0.5 font-mono text-base font-bold text-[#E5EDF5]">{report.min_ms} мс</div>
+              <div className="mt-0.5 font-mono text-base font-bold text-[#E5EDF5]">{formatRtt(report.min_ms)}</div>
             </div>
             <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] px-3.5 py-2.5">
               <div className="text-[11px] text-[#8292A3]">Средний пинг</div>
               <div className="mt-0.5 font-mono text-base font-bold text-[#00D5E8]">
-                {report.avg_ms.toFixed(1)} мс
+                {formatRtt(report.avg_ms, 1)}
               </div>
             </div>
             <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] px-3.5 py-2.5">
               <div className="text-[11px] text-[#8292A3]">Максимальный пинг</div>
-              <div className="mt-0.5 font-mono text-base font-bold text-[#E5EDF5]">{report.max_ms} мс</div>
+              <div className="mt-0.5 font-mono text-base font-bold text-[#E5EDF5]">{formatRtt(report.max_ms)}</div>
             </div>
             <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] px-3.5 py-2.5">
               <div className="text-[11px] text-[#8292A3]">Потери и джиттер</div>
@@ -1349,14 +1616,14 @@ function NetworkToolkit() {
                 Потери: {report.loss_percent.toFixed(1)}%
               </div>
               <div className="font-mono text-[11px] text-[#8292A3]">
-                Jitter: ±{report.jitter_ms.toFixed(1)} мс
+                Станд. отклонение RTT: {formatRtt(report.jitter_ms, 1)}
               </div>
             </div>
           </div>
         )}
       </section>
 
-      <section className="tactical-card tactical-brackets overflow-hidden rounded-xl">
+      <section className="nexus-panel overflow-hidden">
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#202B38] px-5 py-3.5">
           <div>
             <h3 className="text-sm font-semibold text-[#E5EDF5]">Сравнение резолверов DNS</h3>
@@ -1384,6 +1651,7 @@ function NetworkToolkit() {
             <tr>
               <th className="px-5 py-2.5 font-medium">Провайдер DNS</th>
               <th className="px-5 py-2.5 font-medium">Узел</th>
+              <th className="px-5 py-2.5 font-medium">Метод</th>
               <th className="px-5 py-2.5 font-medium">Время отклика</th>
             </tr>
           </thead>
@@ -1391,10 +1659,10 @@ function NetworkToolkit() {
             {(dnsRows.length > 0
               ? dnsRows
               : [
-                  { name: "Cloudflare DNS", server: "1.1.1.1", ms: null },
-                  { name: "Google Public DNS", server: "8.8.8.8", ms: null },
-                  { name: "Quad9 Security DNS", server: "9.9.9.9", ms: null },
-                  { name: "Текущий провайдер", server: "Системный", ms: null },
+                  { name: "Cloudflare DNS", server: "1.1.1.1", ms: null, method: "UDP DNS" },
+                  { name: "Google Public DNS", server: "8.8.8.8", ms: null, method: "UDP DNS" },
+                  { name: "Quad9 Security DNS", server: "9.9.9.9", ms: null, method: "UDP DNS" },
+                  { name: "Текущий провайдер", server: "Системный", ms: null, method: "UDP DNS" },
                 ]
             ).map((row) => (
               <tr key={row.name} className="border-b border-[#202B38]/60 last:border-0">
@@ -1407,14 +1675,22 @@ function NetworkToolkit() {
                   )}
                 </td>
                 <td className="px-5 py-3 font-mono text-[#8292A3]">{row.server}</td>
+                <td className="px-5 py-3">
+                  <span className="rounded border border-[#202B38] bg-[#0B0E14] px-2 py-0.5 font-mono text-[10px] text-[#8292A3]">
+                    {row.method || "UDP DNS"}
+                  </span>
+                </td>
                 <td className="px-5 py-3 font-mono font-semibold text-[#E5EDF5]">
-                  {row.ms == null ? <span className="text-[#526170]">Не проверено</span> : `${row.ms} мс`}
+                  {row.ms == null
+                    ? <span className="text-[#8292A3]">{dnsRows.length ? "Нет результатов" : "Не проверено"}</span>
+                    : `${row.ms} мс`}
                 </td>
               </tr>
             ))}
           </tbody>
         </table>
       </section>
+      </div>
     </div>
   );
 }

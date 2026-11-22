@@ -54,6 +54,66 @@ pub struct NetworkHealthProbe {
     pub external_reachable: bool,
     pub external_ping_ms: Option<u32>,
     pub external_method: String,
+    pub external_route: Option<String>,
+}
+
+/// Identifies the Windows egress interface, source address and next hop for a probe.
+#[cfg(target_os = "windows")]
+pub(crate) fn route_key(ip: std::net::Ipv4Addr) -> Option<String> {
+    use windows::Win32::NetworkManagement::IpHelper::{
+        GetBestRoute, GetBestRoute2, MIB_IPFORWARD_ROW2, MIB_IPFORWARDROW,
+    };
+    use windows::Win32::Networking::WinSock::{
+        AF_INET, IN_ADDR, IN_ADDR_0, SOCKADDR_IN, SOCKADDR_INET,
+    };
+
+    let raw_ip = u32::from_ne_bytes(ip.octets());
+    let mut route = MIB_IPFORWARDROW::default();
+    let mut best = MIB_IPFORWARD_ROW2::default();
+    let mut source = SOCKADDR_INET::default();
+    let destination = SOCKADDR_INET {
+        Ipv4: SOCKADDR_IN {
+            sin_family: AF_INET,
+            sin_addr: IN_ADDR {
+                S_un: IN_ADDR_0 { S_addr: raw_ip },
+            },
+            ..Default::default()
+        },
+    };
+    // SAFETY: all inputs and output buffers use the matching Win32 layout.
+    unsafe {
+        if GetBestRoute(raw_ip, None, &mut route) != 0
+            || GetBestRoute2(
+                None,
+                route.dwForwardIfIndex,
+                None,
+                &destination,
+                0,
+                &mut best,
+                &mut source,
+            )
+            .0 != 0
+            || source.si_family != AF_INET
+            || best.NextHop.si_family != AF_INET
+        {
+            return None;
+        }
+        Some(format!(
+            "{}:{:08x}:{:08x}",
+            best.InterfaceIndex,
+            source.Ipv4.sin_addr.S_un.S_addr,
+            best.NextHop.Ipv4.sin_addr.S_un.S_addr,
+        ))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn route_key(_ip: std::net::Ipv4Addr) -> Option<String> {
+    None
+}
+
+pub(crate) fn confirmed_route(ip: std::net::Ipv4Addr, before: Option<String>) -> Option<String> {
+    before.filter(|key| route_key(ip).as_ref() == Some(key))
 }
 
 #[cfg(target_os = "windows")]
@@ -71,8 +131,8 @@ mod imp {
         IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho, MIB_IF_TABLE2,
     };
     use windows::Win32::NetworkManagement::Ndis::{
-        IfOperStatusDormant, IfOperStatusDown, IfOperStatusLowerLayerDown,
-        IfOperStatusNotPresent, IfOperStatusTesting, IfOperStatusUp, MediaConnectStateConnected,
+        IfOperStatusDormant, IfOperStatusDown, IfOperStatusLowerLayerDown, IfOperStatusNotPresent,
+        IfOperStatusTesting, IfOperStatusUp, MediaConnectStateConnected,
     };
     use windows::Win32::Networking::WinSock::{
         AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKET_ADDRESS,
@@ -125,7 +185,9 @@ mod imp {
                 if (row.flags & 0x02) != 0 || row.if_type == 24 || row.if_type == 131 {
                     continue;
                 }
-                if (row.flags & 0x01) == 0 && !(row.oper_status == IfOperStatusUp.0 || row.media_connected) {
+                if (row.flags & 0x01) == 0
+                    && !(row.oper_status == IfOperStatusUp.0 || row.media_connected)
+                {
                     continue;
                 }
                 if let Some(prev) = self.sys_prev_counters.get(&row.luid) {
@@ -156,7 +218,10 @@ mod imp {
             }
 
             if updated_any {
-                self.sys_last_rates = ((total_rx_bps / 1024.0) as f32, (total_tx_bps / 1024.0) as f32);
+                self.sys_last_rates = (
+                    (total_rx_bps / 1024.0) as f32,
+                    (total_tx_bps / 1024.0) as f32,
+                );
             }
             Ok(self.sys_last_rates)
         }
@@ -231,7 +296,8 @@ mod imp {
                     || desc_lower.contains("6to4")
                     || desc_lower.contains("ip-https");
 
-                let is_bluetooth = desc_lower.contains("bluetooth") || name_lower.contains("bluetooth");
+                let is_bluetooth =
+                    desc_lower.contains("bluetooth") || name_lower.contains("bluetooth");
                 let is_vpn_or_virt = desc_lower.contains("wireguard")
                     || desc_lower.contains("openvpn")
                     || desc_lower.contains("tap-windows")
@@ -249,8 +315,11 @@ mod imp {
                     || desc_lower.contains("virtual");
 
                 let ndis_hw = (row.flags & 0x01) != 0;
-                let reg_hw = meta.map(|m| (m.characteristics & 0x04) != 0).unwrap_or(false);
-                let is_physical = (ndis_hw || reg_hw) && !is_bluetooth && !is_vpn_or_virt && !is_system_tunnel;
+                let reg_hw = meta
+                    .map(|m| (m.characteristics & 0x04) != 0)
+                    .unwrap_or(false);
+                let is_physical =
+                    (ndis_hw || reg_hw) && !is_bluetooth && !is_vpn_or_virt && !is_system_tunnel;
 
                 let (adapter_kind, adapter_type_label) = classify_adapter(
                     addr.if_type,
@@ -279,14 +348,28 @@ mod imp {
                     0
                 };
 
-                let (rx_bytes_per_sec, tx_bytes_per_sec) = if let Some(prev) = self.prev_counters.get(&addr.luid) {
-                    let dt = now.duration_since(prev.at).as_secs_f64();
-                    if dt >= 0.15 {
-                        let rates = (
-                            row.in_octets.saturating_sub(prev.in_octets) as f64 / dt,
-                            row.out_octets.saturating_sub(prev.out_octets) as f64 / dt,
-                        );
-                        self.last_rates.insert(addr.luid, rates);
+                let (rx_bytes_per_sec, tx_bytes_per_sec) =
+                    if let Some(prev) = self.prev_counters.get(&addr.luid) {
+                        let dt = now.duration_since(prev.at).as_secs_f64();
+                        if dt >= 0.15 {
+                            let rates = (
+                                row.in_octets.saturating_sub(prev.in_octets) as f64 / dt,
+                                row.out_octets.saturating_sub(prev.out_octets) as f64 / dt,
+                            );
+                            self.last_rates.insert(addr.luid, rates);
+                            self.prev_counters.insert(
+                                addr.luid,
+                                CounterSample {
+                                    in_octets: row.in_octets,
+                                    out_octets: row.out_octets,
+                                    at: now,
+                                },
+                            );
+                            rates
+                        } else {
+                            *self.last_rates.get(&addr.luid).unwrap_or(&(0.0, 0.0))
+                        }
+                    } else {
                         self.prev_counters.insert(
                             addr.luid,
                             CounterSample {
@@ -295,21 +378,8 @@ mod imp {
                                 at: now,
                             },
                         );
-                        rates
-                    } else {
-                        *self.last_rates.get(&addr.luid).unwrap_or(&(0.0, 0.0))
-                    }
-                } else {
-                    self.prev_counters.insert(
-                        addr.luid,
-                        CounterSample {
-                            in_octets: row.in_octets,
-                            out_octets: row.out_octets,
-                            at: now,
-                        },
-                    );
-                    (0.0, 0.0)
-                };
+                        (0.0, 0.0)
+                    };
 
                 let baseline = self
                     .session_baselines
@@ -389,7 +459,11 @@ mod imp {
             let selected = selected_adapter_id
                 .and_then(|id| adapters.iter().find(|a| a.id == id))
                 .or_else(|| adapters.iter().find(|a| a.is_primary))
-                .or_else(|| adapters.iter().find(|a| !a.is_system_tunnel && a.is_connected))
+                .or_else(|| {
+                    adapters
+                        .iter()
+                        .find(|a| !a.is_system_tunnel && a.is_connected)
+                })
                 .or_else(|| adapters.iter().find(|a| !a.is_system_tunnel));
 
             let active_adapter_id = selected.map(|a| a.id.clone());
@@ -470,12 +544,16 @@ mod imp {
             return None;
         }
         let sa = unsafe { &*(sockaddr.lpSockaddr as *const SOCKADDR) };
-        if sa.sa_family == AF_INET && sockaddr.iSockaddrLength as usize >= std::mem::size_of::<SOCKADDR_IN>() {
+        if sa.sa_family == AF_INET
+            && sockaddr.iSockaddrLength as usize >= std::mem::size_of::<SOCKADDR_IN>()
+        {
             let sin = unsafe { &*(sockaddr.lpSockaddr as *const SOCKADDR_IN) };
             let bytes = unsafe { sin.sin_addr.S_un.S_addr }.to_ne_bytes();
             return Some(IpAddr::V4(Ipv4Addr::from(bytes)));
         }
-        if sa.sa_family == AF_INET6 && sockaddr.iSockaddrLength as usize >= std::mem::size_of::<SOCKADDR_IN6>() {
+        if sa.sa_family == AF_INET6
+            && sockaddr.iSockaddrLength as usize >= std::mem::size_of::<SOCKADDR_IN6>()
+        {
             let sin6 = unsafe { &*(sockaddr.lpSockaddr as *const SOCKADDR_IN6) };
             let bytes = unsafe { sin6.sin6_addr.u.Byte };
             return Some(IpAddr::V6(Ipv6Addr::from(bytes)));
@@ -536,14 +614,16 @@ mod imp {
 
             for _ in 0..4 {
                 let ptr = buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
-                let code = GetAdaptersAddresses(AF_UNSPEC.0 as u32, flags, None, Some(ptr), &mut size);
+                let code =
+                    GetAdaptersAddresses(AF_UNSPEC.0 as u32, flags, None, Some(ptr), &mut size);
                 if code == 0 {
                     let mut out = Vec::new();
                     let mut cur = ptr;
                     while !cur.is_null() {
                         let item = &*cur;
                         let if_index = item.Anonymous1.Anonymous.IfIndex;
-                        let mac_len = (item.PhysicalAddressLength as usize).min(item.PhysicalAddress.len());
+                        let mac_len =
+                            (item.PhysicalAddressLength as usize).min(item.PhysicalAddress.len());
                         let mac_address = if mac_len > 0 {
                             item.PhysicalAddress[..mac_len]
                                 .iter()
@@ -560,8 +640,12 @@ mod imp {
                         while !u_cur.is_null() {
                             if let Some(ip) = sockaddr_to_ip(&(*u_cur).Address) {
                                 match ip {
-                                    IpAddr::V4(v4) => push_unique(&mut ipv4_addresses, v4.to_string()),
-                                    IpAddr::V6(v6) => push_unique(&mut ipv6_addresses, v6.to_string()),
+                                    IpAddr::V4(v4) => {
+                                        push_unique(&mut ipv4_addresses, v4.to_string())
+                                    }
+                                    IpAddr::V6(v6) => {
+                                        push_unique(&mut ipv6_addresses, v6.to_string())
+                                    }
                                 }
                             }
                             u_cur = (*u_cur).Next;
@@ -638,7 +722,8 @@ mod imp {
                 };
                 let characteristics: u32 = sub.get_value("Characteristics").unwrap_or(0);
                 let provider_name: String = sub.get_value("ProviderName").unwrap_or_default();
-                let device_instance_id: String = sub.get_value("DeviceInstanceID").unwrap_or_default();
+                let device_instance_id: String =
+                    sub.get_value("DeviceInstanceID").unwrap_or_default();
                 map.insert(
                     guid.trim().to_ascii_lowercase(),
                     NicRegMeta {
@@ -728,14 +813,34 @@ mod imp {
         if is_bluetooth {
             return ("bluetooth".to_string(), "Bluetooth PAN".to_string());
         }
-        if if_type == 131 || desc_lower.contains("wireguard") || desc_lower.contains("openvpn") || desc_lower.contains("vpn") || desc_lower.contains("wintun") || desc_lower.contains("zerotier") || desc_lower.contains("tailscale") {
-            return ("vpn".to_string(), if is_system_tunnel { "Системный туннель".to_string() } else { "VPN / Туннель".to_string() });
+        if if_type == 131
+            || desc_lower.contains("wireguard")
+            || desc_lower.contains("openvpn")
+            || desc_lower.contains("vpn")
+            || desc_lower.contains("wintun")
+            || desc_lower.contains("zerotier")
+            || desc_lower.contains("tailscale")
+        {
+            return (
+                "vpn".to_string(),
+                if is_system_tunnel {
+                    "Системный туннель".to_string()
+                } else {
+                    "VPN / Туннель".to_string()
+                },
+            );
         }
         if is_vpn_or_virt || is_system_tunnel {
             return ("virtual".to_string(), "Виртуальный адаптер".to_string());
         }
         // NdisPhysicalMediumNative802_11 = 9, NdisPhysicalMediumWirelessLan = 1, IF_TYPE_IEEE80211 = 71
-        if if_type == 71 || physical_medium == 1 || physical_medium == 9 || desc_lower.contains("wi-fi") || desc_lower.contains("wireless") || desc_lower.contains("wlan") {
+        if if_type == 71
+            || physical_medium == 1
+            || physical_medium == 9
+            || desc_lower.contains("wi-fi")
+            || desc_lower.contains("wireless")
+            || desc_lower.contains("wlan")
+        {
             return ("wifi".to_string(), "Wi-Fi (802.11)".to_string());
         }
         if desc_lower.contains("usb") || desc_lower.contains("rndis") {
@@ -824,20 +929,22 @@ mod imp {
             }
         });
 
+        let route_before = super::route_key(ext_ip);
         let (external_reachable, external_ping_ms, external_method) =
             if let Some(ms) = icmp_ping_ipv4(ext_ip, 850) {
-                (true, Some(ms.max(1)), "ICMP".to_string())
+                (true, Some(ms), "ICMP".to_string())
             } else {
                 let addr = SocketAddr::new(IpAddr::V4(ext_ip), 53);
                 let start = Instant::now();
                 if TcpStream::connect_timeout(&addr, Duration::from_millis(750)).is_ok() {
-                    let ms = (start.elapsed().as_millis() as u32).max(1);
+                    let ms = start.elapsed().as_millis() as u32;
                     (true, Some(ms), "TCP:53".to_string())
                 } else {
-                    (false, None, "ICMP".to_string())
+                    (false, None, String::new())
                 }
             };
 
+        let external_route = super::confirmed_route(ext_ip, route_before);
         let (gateway_reachable, gateway_ping_ms) = gw_handle.join().unwrap_or((false, None));
 
         NetworkHealthProbe {
@@ -849,6 +956,7 @@ mod imp {
             external_reachable,
             external_ping_ms,
             external_method,
+            external_route,
         }
     }
 }
@@ -888,6 +996,7 @@ mod imp {
             external_reachable: false,
             external_ping_ms: None,
             external_method: "Unavailable".to_string(),
+            external_route: None,
         }
     }
 }
@@ -936,7 +1045,9 @@ mod tests {
                 a.description
             );
             assert!(
-                !a.description.to_ascii_lowercase().contains("qos packet scheduler"),
+                !a.description
+                    .to_ascii_lowercase()
+                    .contains("qos packet scheduler"),
                 "Unexpected duplicate QoS scheduler adapter: {}",
                 a.description
             );
@@ -946,11 +1057,6 @@ mod tests {
             !snap.adapters.is_empty(),
             "Expected at least one network adapter"
         );
-        assert!(
-            snap.adapters.iter().any(|a| a.is_physical && !a.is_system_tunnel),
-            "Expected at least one physical network adapter"
-        );
-
         let primary_gw = snap
             .active_adapter_id
             .as_deref()
@@ -960,5 +1066,18 @@ mod tests {
         let probe = probe_network_health(primary_gw, Some("1.1.1.1".to_string()));
         println!("Network health probe: {:#?}", probe);
         assert_eq!(probe.external_host, "1.1.1.1");
+    }
+
+    #[test]
+    #[ignore = "requires physical NIC adapter on bare-metal Windows host"]
+    fn hardware_live_physical_nic_probe() {
+        let mut state = NetworkMonitorState::new();
+        let snap = state.snapshot(None, false).expect("snapshot");
+        assert!(
+            snap.adapters
+                .iter()
+                .any(|a| a.is_physical && !a.is_system_tunnel),
+            "Expected at least one physical network adapter"
+        );
     }
 }

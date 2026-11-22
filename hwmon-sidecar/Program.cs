@@ -47,6 +47,9 @@ public sealed class CpuTelemetryDto
     [JsonPropertyName("package_temp_c")]
     public float? PackageTempC { get; set; }
 
+    [JsonPropertyName("package_temp_sensor")]
+    public string? PackageTempSensor { get; set; }
+
     [JsonPropertyName("max_core_temp_c")]
     public float? MaxCoreTempC { get; set; }
 
@@ -200,7 +203,7 @@ public sealed class HardwareTelemetryDto
 
 internal static class Program
 {
-    private static volatile bool _shouldExit;
+    private static readonly ManualResetEventSlim ExitEvent = new(false);
 
     private static bool CheckIsAdmin()
     {
@@ -462,14 +465,14 @@ internal static class Program
         Console.CancelKeyPress += (_, e) =>
         {
             e.Cancel = true;
-            _shouldExit = true;
+            ExitEvent.Set();
         };
 
         _ = Task.Run(async () =>
         {
             try
             {
-                while (await Console.In.ReadLineAsync() is not null)
+                while (!ExitEvent.IsSet && await Console.In.ReadLineAsync() is not null)
                 {
                     // Если родительский процесс жив и держит пайп открытым — ждём
                 }
@@ -478,7 +481,10 @@ internal static class Program
             {
                 // Поток ввода закрыт
             }
-            _shouldExit = true;
+            finally
+            {
+                ExitEvent.Set();
+            }
         });
 
         var computer = new Computer
@@ -495,9 +501,17 @@ internal static class Program
         {
             computer.Open();
         }
-        catch
+        catch (Exception ex)
         {
-            // Продолжаем работу с доступными датчиками даже при частичной ошибке драйвера
+            try
+            {
+                Console.Error.WriteLine($"[hwmon-open-error] {ex.Message}");
+                Console.Error.Flush();
+            }
+            catch
+            {
+                // Игнорируем сбой stderr при недоступном потоке
+            }
         }
 
         var visitor = new UpdateVisitor();
@@ -506,7 +520,7 @@ internal static class Program
             WriteIndented = false
         };
 
-        while (!_shouldExit)
+        while (!ExitEvent.IsSet)
         {
             try
             {
@@ -516,12 +530,33 @@ internal static class Program
                 Console.WriteLine(json);
                 Console.Out.Flush();
             }
-            catch
+            catch (IOException)
             {
-                // Не прерываем цикл при единичной ошибке чтения
+                ExitEvent.Set();
+                break;
+            }
+            catch (ObjectDisposedException)
+            {
+                ExitEvent.Set();
+                break;
+            }
+            catch (Exception ex)
+            {
+                try
+                {
+                    Console.Error.WriteLine($"[hwmon-loop-error] {ex.Message}");
+                    Console.Error.Flush();
+                }
+                catch
+                {
+                    // Игнорируем ошибку записи в stderr
+                }
             }
 
-            Thread.Sleep(1000);
+            if (ExitEvent.Wait(1000))
+            {
+                break;
+            }
         }
 
         try
@@ -543,44 +578,48 @@ internal static class Program
             TimestampMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
         };
 
+        bool cpuSelected = false;
         foreach (var hw in computer.Hardware)
         {
             switch (hw.HardwareType)
             {
                 case HardwareType.Cpu:
                 {
+                    if (cpuSelected) break;
+                    cpuSelected = true;
                     dto.Cpu.Name = hw.Name;
                     var clockValues = new List<float>();
 
                     foreach (var s in GetAllSensorsRecursive(hw))
                     {
-                        string sName = s.Name ?? "";
+                        string sName = s.Name?.Trim() ?? "";
                         string sLower = sName.ToLowerInvariant();
 
                         if (s.SensorType == SensorType.Temperature && IsValidTemp(s.Value))
                         {
-                            if (sLower.Contains("distance")) continue;
+                            if (sLower.Contains("distance") || sLower.Contains("tjmax")) continue;
 
                             float t = s.Value!.Value;
-                            if (sLower.Contains("package") || sLower.Contains("tctl") || sLower.Contains("tdie") || sLower.Contains("average"))
+                            if (ReferenceEquals(s.Hardware, hw) && (sLower is "cpu package" or "package"))
                             {
-                                dto.Cpu.PackageTempC = t;
+                                if (!dto.Cpu.PackageTempC.HasValue)
+                                {
+                                    dto.Cpu.PackageTempC = t;
+                                    dto.Cpu.PackageTempSensor = sName;
+                                }
                             }
-                            else if (sLower.Contains("core") || sLower.Contains("ccd"))
+                            else
                             {
                                 dto.Cpu.CoreTemps.Add(new CoreTempDto
                                 {
                                     Name = sName,
                                     TempC = t
                                 });
-                                if (!dto.Cpu.MaxCoreTempC.HasValue || t > dto.Cpu.MaxCoreTempC.Value)
+                                if ((sLower.StartsWith("cpu core #") || sLower.StartsWith("core #"))
+                                    && (!dto.Cpu.MaxCoreTempC.HasValue || t > dto.Cpu.MaxCoreTempC.Value))
                                 {
                                     dto.Cpu.MaxCoreTempC = t;
                                 }
-                            }
-                            else if (!dto.Cpu.PackageTempC.HasValue)
-                            {
-                                dto.Cpu.PackageTempC = t;
                             }
                         }
                         else if (s.SensorType == SensorType.Clock && IsValidPositive(s.Value))
@@ -606,14 +645,6 @@ internal static class Program
                         }
                     }
 
-                    if (!dto.Cpu.PackageTempC.HasValue && dto.Cpu.MaxCoreTempC.HasValue)
-                    {
-                        dto.Cpu.PackageTempC = dto.Cpu.MaxCoreTempC;
-                    }
-                    if (!dto.Cpu.MaxCoreTempC.HasValue && dto.Cpu.PackageTempC.HasValue)
-                    {
-                        dto.Cpu.MaxCoreTempC = dto.Cpu.PackageTempC;
-                    }
                     if (clockValues.Count > 0)
                     {
                         dto.Cpu.AvgClockMhz = clockValues.Average();

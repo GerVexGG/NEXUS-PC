@@ -1,19 +1,19 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "nexus",
-  "version": "0.2.2",
-  "identifier": "com.gervex.nexus",
+  "productName": "AURORA",
+  "version": "2.0.0",
+  "identifier": "com.gervex.aurora",
   "build": {
     "beforeDevCommand": "npm run dev",
-    "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build:all",
     "frontendDist": "../dist"
   },
   "app": {
     "windows": [
       {
         "label": "main",
-        "title": "NEXUS PC",
+        "title": "AURORA",
         "width": 1240,
         "height": 800,
         "minWidth": 900,
@@ -22,19 +22,19 @@
         "resizable": true,
         "decorations": false,
         "transparent": false,
-        "backgroundColor": "#07080B",
+        "backgroundColor": "#090e1c",
         "shadow": true,
-        "visible": true
+        "visible": false
       },
       {
         "label": "tray_hud",
-        "title": "NEXUS PC",
+        "title": "AURORA",
         "url": "index.html?view=tray",
         "width": 280,
         "height": 180,
         "decorations": false,
         "transparent": false,
-        "backgroundColor": "#07080B",
+        "backgroundColor": "#090e1c",
         "alwaysOnTop": true,
         "visible": false,
         "skipTaskbar": true,
@@ -43,12 +43,21 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; frame-src 'none'",
+      "devCsp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost ws://127.0.0.1:1420 ws://127.0.0.1:1421; object-src 'none'"
     }
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis"],
+    "publisher": "Gervex",
+    "shortDescription": "AURORA Windows System Suite",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["Russian", "English"]
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -56,8 +65,6 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": [
-      "nexus-hwmon.exe"
-    ]
+    "resources": { "nexus-hwmon.exe": "aurora-hwmon.exe" }
   }
 }

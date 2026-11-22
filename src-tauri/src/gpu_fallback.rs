@@ -1,16 +1,16 @@
 #[cfg(target_os = "windows")]
 mod imp {
     use std::collections::HashMap;
-    use windows::core::Interface;
     use windows::Win32::Graphics::Dxgi::{
         CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
         DXGI_QUERY_VIDEO_MEMORY_INFO, IDXGIAdapter3, IDXGIFactory1,
     };
     use windows::Win32::System::Performance::{
-        PDH_FMT_COUNTERVALUE, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE,
-        PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
-        PdhGetFormattedCounterArrayW, PdhGetFormattedCounterValue, PdhOpenQueryW,
+        PDH_FMT_COUNTERVALUE, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PdhAddEnglishCounterW,
+        PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW,
+        PdhGetFormattedCounterValue, PdhOpenQueryW,
     };
+    use windows::core::Interface;
     use winreg::RegKey;
     use winreg::enums::HKEY_LOCAL_MACHINE;
 
@@ -39,11 +39,7 @@ mod imp {
         let res = unsafe {
             PdhAddEnglishCounterW(query, windows::core::PCWSTR(wide.as_ptr()), 0, &mut counter)
         };
-        if res == 0 {
-            counter.0 as isize
-        } else {
-            0
-        }
+        if res == 0 { counter.0 as isize } else { 0 }
     }
 
     fn read_scalar_double(counter_handle: isize) -> Option<f64> {
@@ -81,10 +77,14 @@ mod imp {
                     };
                 }
                 let gpu_counter = add_counter(query, "\\GPU Engine(*)\\Utilization Percentage");
-                let cpu_perf_counter =
-                    add_counter(query, "\\Processor Information(_Total)\\% Processor Performance");
-                let cpu_freq_counter =
-                    add_counter(query, "\\Processor Information(_Total)\\Processor Frequency");
+                let cpu_perf_counter = add_counter(
+                    query,
+                    "\\Processor Information(_Total)\\% Processor Performance",
+                );
+                let cpu_freq_counter = add_counter(
+                    query,
+                    "\\Processor Information(_Total)\\Processor Frequency",
+                );
 
                 if gpu_counter == 0 && cpu_perf_counter == 0 {
                     let _ = PdhCloseQuery(query);
@@ -158,10 +158,9 @@ mod imp {
                 return None;
             }
             let counter = unsafe {
-                std::mem::transmute::<
-                    isize,
-                    windows::Win32::System::Performance::PDH_HCOUNTER,
-                >(self.gpu_counter)
+                std::mem::transmute::<isize, windows::Win32::System::Performance::PDH_HCOUNTER>(
+                    self.gpu_counter,
+                )
             };
 
             let mut buf_size: u32 = 0;
@@ -249,7 +248,10 @@ mod imp {
         fn drop(&mut self) {
             if self.query != 0 {
                 unsafe {
-                    let query = std::mem::transmute::<isize, windows::Win32::System::Performance::PDH_HQUERY>(self.query);
+                    let query = std::mem::transmute::<
+                        isize,
+                        windows::Win32::System::Performance::PDH_HQUERY,
+                    >(self.query);
                     let _ = PdhCloseQuery(query);
                 }
                 self.query = 0;
@@ -340,10 +342,20 @@ mod imp {
 
     pub fn enrich_gpus(gpus: &mut Vec<crate::GpuTelemetry>, pdh_load: Option<f32>) {
         let dxgi = query_dxgi_gpus();
+        enrich_gpus_with_dxgi_list(gpus, &dxgi, pdh_load);
+    }
+
+    pub(crate) fn enrich_gpus_with_dxgi_list(
+        gpus: &mut Vec<crate::GpuTelemetry>,
+        dxgi: &[DxgiAdapterTelemetry],
+        pdh_load: Option<f32>,
+    ) {
         if gpus.is_empty() {
             for (idx, item) in dxgi.iter().enumerate() {
                 let vram_used_percent = match (item.vram_used_mb, item.vram_total_mb) {
-                    (Some(used), Some(total)) if total > 0.0 => Some(((used / total) * 100.0).clamp(0.0, 100.0)),
+                    (Some(used), Some(total)) if total > 0.0 => {
+                        Some(((used / total) * 100.0).clamp(0.0, 100.0))
+                    }
                     _ => None,
                 };
                 gpus.push(crate::GpuTelemetry {
@@ -363,11 +375,20 @@ mod imp {
         for (idx, gpu) in gpus.iter_mut().enumerate() {
             if gpu.vendor.is_empty() {
                 let lower = gpu.name.to_ascii_lowercase();
-                if lower.contains("nvidia") || lower.contains("geforce") || lower.contains("rtx") || lower.contains("gtx") || lower.contains("quadro") {
+                if lower.contains("nvidia")
+                    || lower.contains("geforce")
+                    || lower.contains("rtx")
+                    || lower.contains("gtx")
+                    || lower.contains("quadro")
+                {
                     gpu.vendor = "NVIDIA".to_string();
                 } else if lower.contains("amd") || lower.contains("radeon") {
                     gpu.vendor = "AMD".to_string();
-                } else if lower.contains("intel") || lower.contains("arc") || lower.contains("uhd") || lower.contains("iris") {
+                } else if lower.contains("intel")
+                    || lower.contains("arc")
+                    || lower.contains("uhd")
+                    || lower.contains("iris")
+                {
                     gpu.vendor = "Intel".to_string();
                 }
             }
@@ -377,9 +398,17 @@ mod imp {
                 .iter()
                 .find(|d| {
                     let dn = normalize_gpu_name(&d.name);
-                    !dn.is_empty() && !gpu_norm.is_empty() && (dn == gpu_norm || dn.contains(&gpu_norm) || gpu_norm.contains(&dn))
+                    !dn.is_empty()
+                        && !gpu_norm.is_empty()
+                        && (dn == gpu_norm || dn.contains(&gpu_norm) || gpu_norm.contains(&dn))
                 })
-                .or_else(|| if dxgi.len() == 1 && idx == 0 { Some(&dxgi[0]) } else { None });
+                .or_else(|| {
+                    if dxgi.len() == 1 && idx == 0 {
+                        Some(&dxgi[0])
+                    } else {
+                        None
+                    }
+                });
 
             if let Some(d) = matched {
                 if gpu.vendor.is_empty() && !d.vendor.is_empty() {
@@ -427,6 +456,14 @@ mod imp {
 
 #[cfg(not(target_os = "windows"))]
 mod imp {
+    #[derive(Clone, Debug)]
+    pub struct DxgiAdapterTelemetry {
+        pub name: String,
+        pub vendor: String,
+        pub vram_total_mb: Option<f32>,
+        pub vram_used_mb: Option<f32>,
+        pub is_software: bool,
+    }
     pub struct GpuPdhSampler;
     impl GpuPdhSampler {
         pub fn new() -> Self {
@@ -447,8 +484,16 @@ mod imp {
         false
     }
     pub fn enrich_gpus(_gpus: &mut Vec<crate::GpuTelemetry>, _pdh_load: Option<f32>) {}
+    pub(crate) fn enrich_gpus_with_dxgi_list(
+        _gpus: &mut Vec<crate::GpuTelemetry>,
+        _dxgi: &[DxgiAdapterTelemetry],
+        _pdh_load: Option<f32>,
+    ) {
+    }
 }
 
+#[cfg(test)]
+pub(crate) use imp::{DxgiAdapterTelemetry, enrich_gpus_with_dxgi_list};
 pub use imp::{GpuPdhSampler, enrich_gpus, is_hvci_enabled};
 
 #[cfg(test)]
@@ -456,38 +501,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dxgi_and_pdh_enrich_populates_real_gpu() {
-        let mut sampler = GpuPdhSampler::new();
-        std::thread::sleep(std::time::Duration::from_millis(120));
-        let (pdh_load, cpu_clock_mhz) = sampler.sample_hardware_pdh(true, Some(3600.0));
-        println!(
-            "PDH cpu_clock_mhz={cpu_clock_mhz:?}, hvci_enabled={}",
-            is_hvci_enabled()
-        );
+    fn dxgi_and_pdh_enrich_populates_gpu_telemetry_without_physical_hardware() {
+        let mock_dxgi = vec![DxgiAdapterTelemetry {
+            name: "NVIDIA GeForce RTX 4070".to_string(),
+            vendor: "NVIDIA".to_string(),
+            vram_total_mb: Some(12288.0),
+            vram_used_mb: Some(3072.0),
+            is_software: false,
+        }];
 
-        let mut empty: Vec<crate::GpuTelemetry> = Vec::new();
-        enrich_gpus(&mut empty, pdh_load);
-        println!("DXGI/PDH fallback GPUs: {:#?}", empty);
+        // 1. Когда LHM недоступен (gpus пуст) — синтезируется карточка из DXGI + PDH
+        let mut from_fallback: Vec<crate::GpuTelemetry> = Vec::new();
+        enrich_gpus_with_dxgi_list(&mut from_fallback, &mock_dxgi, Some(18.5));
+        assert_eq!(from_fallback.len(), 1);
+        assert_eq!(from_fallback[0].name, "NVIDIA GeForce RTX 4070");
+        assert_eq!(from_fallback[0].vendor, "NVIDIA");
+        assert_eq!(from_fallback[0].vram_total_mb, Some(12288.0));
+        assert_eq!(from_fallback[0].vram_used_mb, Some(3072.0));
+        assert_eq!(from_fallback[0].vram_used_percent, Some(25.0));
+        assert_eq!(from_fallback[0].load_percent, Some(18.5));
+        assert!(from_fallback[0].telemetry_source.contains("DXGI"));
 
-        assert!(!empty.is_empty(), "Expected at least one DXGI GPU adapter");
-        let gpu = &empty[0];
-        assert!(!gpu.name.trim().is_empty(), "GPU name should not be empty");
-        assert!(gpu.vram_total_mb.unwrap_or(0.0) > 0.0, "VRAM total MB should be > 0");
-        assert!(gpu.telemetry_source.contains("DXGI"));
-
-        // Verify partial LHM enrichment preserves existing sensors and fills missing VRAM/load
+        // 2. Частичный LHM сохраняет температуру и дозаполняет VRAM + load
         let mut partial = vec![crate::GpuTelemetry {
-            name: gpu.name.clone(),
+            name: "GeForce RTX 4070".to_string(),
             core_temp_c: Some(45.0),
             telemetry_source: "LibreHardwareMonitor".to_string(),
             ..Default::default()
         }];
-        enrich_gpus(&mut partial, Some(12.5));
+        enrich_gpus_with_dxgi_list(&mut partial, &mock_dxgi, Some(12.5));
         assert_eq!(partial[0].core_temp_c, Some(45.0));
         assert_eq!(partial[0].load_percent, Some(12.5));
-        assert!(partial[0].vram_total_mb.unwrap_or(0.0) > 0.0);
+        assert_eq!(partial[0].vram_total_mb, Some(12288.0));
         assert!(partial[0].telemetry_source.contains("LibreHardwareMonitor"));
         assert!(partial[0].telemetry_source.contains("DXGI"));
         assert!(partial[0].telemetry_source.contains("PDH"));
+
+        // 3. Проверка отсутствия падения при живом вызове на виртуальной/headless ОС без дискретного GPU
+        let mut live_gpus: Vec<crate::GpuTelemetry> = Vec::new();
+        enrich_gpus(&mut live_gpus, None);
+        for g in &live_gpus {
+            assert!(!g.name.trim().is_empty());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires physical GPU with dedicated VRAM"]
+    fn hardware_live_dxgi_dedicated_gpu_probe() {
+        let mut sampler = GpuPdhSampler::new();
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let (pdh_load, _cpu_clock_mhz) = sampler.sample_hardware_pdh(true, Some(3600.0));
+        let mut gpus: Vec<crate::GpuTelemetry> = Vec::new();
+        enrich_gpus(&mut gpus, pdh_load);
+        assert!(!gpus.is_empty(), "Expected at least one DXGI GPU adapter");
+        let gpu = &gpus[0];
+        assert!(!gpu.name.trim().is_empty());
+        assert!(
+            gpu.vram_total_mb.unwrap_or(0.0) > 0.0,
+            "Physical GPU should report dedicated VRAM > 0 MB"
+        );
     }
 }

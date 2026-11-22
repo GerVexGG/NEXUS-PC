@@ -1,0 +1,61 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [master, main, "fix/**", "feat/aurora-2"]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  verify-windows:
+    name: Build & Test (Windows x64)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Rust cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Publish C# hardware telemetry sidecar (win-x64)
+        run: npm run build:sidecar
+
+      - name: Run frontend unit tests
+        run: npm run test
+
+      - name: Run TypeScript check and Vite production build
+        run: npm run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+      - name: Check Rust compilation
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Run Rust library unit tests (excluding bare-metal hardware probes)
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Build Windows x64 installer
+        run: npm run tauri -- build --bundles nsis

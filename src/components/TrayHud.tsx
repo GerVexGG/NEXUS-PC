@@ -1,122 +1,113 @@
 import { useEffect, useState } from "react";
+import { ArrowUpRight, Power, TriangleAlert } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import type { Metrics } from "../lib/studio";
+import "../AuroraShell.css";
 
 interface RouteProbe {
   label: string;
-  host: string;
   ping_ms: number;
-  jitter_ms: number;
+  rtt_range_ms: number | null;
+  method?: string;
 }
 
 export function TrayHud() {
   const [metrics, setMetrics] = useState<Metrics | null>(null);
-  const [routes, setRoutes] = useState<RouteProbe[]>([]);
+  const [routes, setRoutes] = useState<RouteProbe[] | null>(null);
+  const [error, setError] = useState("");
 
   useEffect(() => {
+    const hud = getCurrentWindow();
     let alive = true;
+    let pending = false;
+    let acquiredFocus = false;
     const pull = async () => {
-      const [metricsResult, routesResult] = await Promise.allSettled([
-        invoke<Metrics>("get_system_metrics"),
-        invoke<RouteProbe[]>("probe_game_routes"),
-      ]);
-      if (!alive) return;
-      if (metricsResult.status === "fulfilled") setMetrics(metricsResult.value);
-      if (routesResult.status === "fulfilled") setRoutes(routesResult.value);
+      if (pending) return;
+      pending = true;
+      try {
+        if (!(await hud.isVisible()) || !alive) return;
+        await Promise.allSettled([
+          invoke<Metrics>("get_system_metrics").then(
+            (sample) => { if (alive) setMetrics(sample); },
+            () => { if (alive) setMetrics(null); },
+          ),
+          invoke<RouteProbe[]>("probe_game_routes").then(
+            (sample) => { if (alive) setRoutes(sample); },
+            () => { if (alive) setRoutes([]); },
+          ),
+        ]);
+      } catch (err) {
+        if (alive) setError(String(err));
+      } finally {
+        pending = false;
+      }
     };
+
+    const unlisten = hud.onFocusChanged(({ payload }) => {
+      if (!alive) return;
+      if (payload) {
+        acquiredFocus = true;
+        void pull();
+      } else if (acquiredFocus) {
+        acquiredFocus = false;
+        void hud.hide().catch((err) => setError(String(err)));
+      }
+    });
     void pull();
     const timer = window.setInterval(() => void pull(), 2000);
     return () => {
       alive = false;
       window.clearInterval(timer);
+      void unlisten.then((stop) => stop()).catch(console.error);
     };
   }, []);
 
-  useEffect(() => {
-    const unlisten = getCurrentWindow().onFocusChanged(({ payload: focused }) => {
-      if (!focused) {
-        void getCurrentWindow().hide();
+  async function openMain() {
+    setError("");
+    try {
+      try {
+        await invoke("restore_from_tray");
+      } catch {
+        const main = await WebviewWindow.getByLabel("main");
+        if (!main) throw new Error("Главное окно недоступно");
+        await main.show();
+        if (await main.isMinimized()) await main.unminimize();
+        await main.setFocus();
+        await getCurrentWindow().hide();
       }
-    });
-    return () => {
-      void unlisten.then((stop) => stop());
-    };
-  }, []);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
 
-  const gameRoute = routes.find((route) => route.label.includes("Москва") && route.ping_ms > 0);
-  const ping = gameRoute && gameRoute.ping_ms > 0 && gameRoute.ping_ms < 999 ? gameRoute.ping_ms : null;
-  const jitter = gameRoute ? gameRoute.jitter_ms : null;
-  const stable = jitter !== null && jitter <= 7;
+  const route = routes?.find((entry) => entry.label.includes("Москва") && entry.ping_ms > 0 && entry.ping_ms < 999);
+  const latency = route ? route.ping_ms + " мс" : "—";
+  const quality = route ? "Есть ответ" : routes ? "Нет ответа" : "Опрос…";
+  const samples = [
+    { label: route?.method ? "Задержка · " + route.method : "Задержка", value: latency },
+    { label: "Диапазон RTT", value: route?.rtt_range_ms != null ? route.rtt_range_ms + " мс" : "Н/Д" },
+    { label: "Процессор", value: metrics && Number.isFinite(metrics.cpu_usage) ? metrics.cpu_usage.toFixed(0) + "%" : "—" },
+    { label: "Память", value: metrics && metrics.ram_total_gb > 0 ? metrics.ram_percentage.toFixed(0) + "%" : "—" },
+  ];
 
   return (
-    <div className="hud-bg flex h-screen w-screen flex-col justify-between border border-[#202B38] bg-[#07080B] p-3 text-[#E5EDF5]">
-      <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs">
-        <span className="font-mono text-[11px] text-[#8292A3]">PING</span>
-        <span
-          className={`text-right font-mono font-semibold ${
-            ping === null
-              ? "text-[#8292A3]"
-              : ping <= 80
-              ? "text-[#00D5E8]"
-              : ping <= 120
-              ? "text-amber-400"
-              : "text-rose-400"
-          }`}
-        >
-          {ping === null ? "—" : `${ping} мс`}
-        </span>
-        <span className="font-mono text-[11px] text-[#8292A3]">JITTER</span>
-        <span className="text-right font-mono font-semibold text-[#E5EDF5]">
-          {jitter === null ? "—" : `±${jitter} мс`}
-        </span>
-        <span className="font-mono text-[11px] text-[#8292A3]">КАНАЛ</span>
-        <span
-          className={`text-right font-mono text-[11px] ${
-            jitter === null ? "text-[#8292A3]" : stable ? "text-[#00D5E8]" : "text-amber-300"
-          }`}
-        >
-          {jitter === null ? "ОПРОС" : stable ? "СТАБИЛЬНО" : "ДЖИТТЕР"}
-        </span>
-        <span className="font-mono text-[11px] text-[#8292A3]">CPU</span>
-        <span className="text-right font-mono font-semibold text-[#00D5E8]">
-          {metrics ? `${metrics.cpu_usage.toFixed(0)}%` : "—"}
-        </span>
-        <span className="font-mono text-[11px] text-[#8292A3]">RAM</span>
-        <span className="text-right font-mono font-semibold text-[#36AFC0]">
-          {metrics ? `${metrics.ram_percentage.toFixed(0)}%` : "—"}
-        </span>
+    <div className="nexus-shell av-tray flex h-screen w-screen flex-col justify-between p-2.5">
+      <div className="flex items-center justify-between gap-2 text-xs">
+        <strong className="av-tray-brand"><img src="/aurora.svg" width="22" height="22" alt=""/> AURORA</strong>
+        <span className="text-[11px] text-[var(--nexus-muted)]">{quality}</span>
       </div>
-      <div className="mt-2 flex gap-1.5">
-        <button
-          type="button"
-          onClick={() => {
-            void (async () => {
-              try {
-                await invoke("restore_from_tray");
-              } catch {
-                const main = await WebviewWindow.getByLabel("main");
-                await main?.show();
-                if (await main?.isMinimized()) {
-                  await main?.unminimize();
-                }
-                await main?.setFocus();
-                await getCurrentWindow().hide();
-              }
-            })();
-          }}
-          className="cyber-btn flex-1 px-2 py-1.5 font-mono text-[11px] font-semibold text-[#00D5E8]"
-        >
-          ОТКРЫТЬ NEXUS
-        </button>
-        <button
-          type="button"
-          onClick={() => void invoke("app_exit")}
-          className="cyber-btn-danger px-2.5 py-1.5 font-mono text-[11px] font-semibold text-rose-300"
-        >
-          ВЫХОД
-        </button>
+      <dl className="grid grid-cols-2 gap-x-3 gap-y-1.5 rounded-lg border border-[var(--nexus-line)] bg-[var(--nexus-surface)] px-2.5 py-1.5">
+        {samples.map((sample) => <div key={sample.label} className="min-w-0">
+          <dt className="truncate text-[11px] text-[var(--nexus-muted)]">{sample.label}</dt>
+          <dd className="font-mono text-xs font-semibold tabular-nums">{sample.value}</dd>
+        </div>)}
+      </dl>
+      {error && <div role="alert" title={error} className="flex items-center gap-1 text-[11px] text-rose-200"><TriangleAlert size={12} /><span className="truncate">{error}</span></div>}
+      <div className="flex gap-1.5">
+        <button type="button" onClick={() => void openMain()} className="nexus-button nexus-button--primary flex-1"><ArrowUpRight size={14} /> Открыть AURORA</button>
+        <button type="button" onClick={() => void invoke("app_exit").catch((err) => setError(String(err)))} className="nexus-button nexus-button--danger" title="Завершить AURORA"><Power size={13} /> Выход</button>
       </div>
     </div>
   );

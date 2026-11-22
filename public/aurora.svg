@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="512" height="512" role="img" aria-label="AURORA">
+  <defs>
+    <linearGradient id="apex" x1=".78" y1=".02" x2=".16" y2=".94" gradientUnits="objectBoundingBox">
+      <stop stop-color="#7af6ff"/><stop offset=".27" stop-color="#11c6fc"/>
+      <stop offset=".62" stop-color="#3d64ef"/><stop offset="1" stop-color="#945cff"/>
+    </linearGradient>
+    <linearGradient id="fold" x1=".12" y1=".12" x2=".88" y2=".92">
+      <stop stop-color="#2476ce"/><stop offset=".54" stop-color="#6450dc"/><stop offset="1" stop-color="#bd60ff"/>
+    </linearGradient>
+    <linearGradient id="wave" x1=".06" y1=".66" x2=".96" y2=".26">
+      <stop stop-color="#05ccde"/><stop offset=".34" stop-color="#67f3ff"/>
+      <stop offset=".69" stop-color="#4d9dfd"/><stop offset="1" stop-color="#ae76ff"/>
+    </linearGradient>
+  </defs>
+  <path fill="url(#apex)" d="M6 111 54 15c4-9 15-10 20 0l48 96c2 5-1 8-6 8-9 0-17-6-23-14L64 49 33 109c-5 7-14 10-22 10-5 0-7-4-5-8Z"/>
+  <path fill="url(#fold)" d="M64 49c6-8 14-8 23-4l35 66c2 5-1 8-6 8-9 0-17-6-23-14Z"/>
+  <path fill="url(#wave)" d="M6 111c21-17 39-32 60-35 23-4 40 6 48 20-15-9-32-11-47-4-14 6-23 16-36 23-6 3-13 4-20 4-5 0-7-4-5-8Z"/>
+</svg>

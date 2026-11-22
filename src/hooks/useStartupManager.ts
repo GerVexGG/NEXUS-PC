@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback } from "react";
+import { useState, useMemo, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { StartupItem } from "../lib/studio";
 
@@ -9,9 +9,13 @@ export function useStartupManager() {
   const [startupSearch, setStartupSearch] = useState<string>("");
   const [startupFilter, setStartupFilter] = useState<StartupFilterType>("all");
   const [startupLoading, setStartupLoading] = useState<boolean>(false);
+  const [startupPendingId, setStartupPendingId] = useState<string | null>(null);
   const [startupError, setStartupError] = useState<string | null>(null);
+  const busy = useRef(false);
 
   const fetchStartupItems = useCallback(async () => {
+    if (busy.current) return;
+    busy.current = true;
     setStartupLoading(true);
     setStartupError(null);
     try {
@@ -21,12 +25,14 @@ export function useStartupManager() {
       console.error("Ошибка чтения автозагрузки:", err);
       setStartupError(String(err));
     } finally {
+      busy.current = false;
       setStartupLoading(false);
     }
   }, []);
 
   const handleToggleStartupItem = useCallback(async (item: StartupItem) => {
     if (
+      busy.current ||
       item.phantom ||
       (!item.id.startsWith("reg|") &&
         !item.id.startsWith("dir|") &&
@@ -35,32 +41,32 @@ export function useStartupManager() {
     ) {
       return;
     }
+    busy.current = true;
+    setStartupPendingId(item.id);
     const nextEnabled = !item.enabled;
     setStartupError(null);
-
-    setStartupItems((prev) =>
-      prev.map((entry) =>
-        entry.id === item.id ? { ...entry, enabled: nextEnabled } : entry
-      )
-    );
 
     try {
       await invoke("toggle_startup_item", {
         id: item.id,
         enable: nextEnabled,
       });
+      setStartupItems((prev) =>
+        prev.map((entry) => (entry.id === item.id ? { ...entry, enabled: nextEnabled } : entry))
+      );
     } catch (err) {
       console.error("Ошибка переключения автозагрузки:", err);
       setStartupError(String(err));
-      setStartupItems((prev) =>
-        prev.map((entry) =>
-          entry.id === item.id ? { ...entry, enabled: item.enabled } : entry
-        )
-      );
+    } finally {
+      busy.current = false;
+      setStartupPendingId(null);
     }
   }, []);
 
   const handleDeleteStartupItem = useCallback(async (item: StartupItem) => {
+    if (busy.current) return;
+    busy.current = true;
+    setStartupPendingId(item.id);
     setStartupError(null);
     try {
       await invoke("remove_startup_entry", {
@@ -71,6 +77,9 @@ export function useStartupManager() {
     } catch (err) {
       console.error("Ошибка удаления записи автозагрузки:", err);
       setStartupError(String(err));
+    } finally {
+      busy.current = false;
+      setStartupPendingId(null);
     }
   }, []);
 
@@ -88,7 +97,7 @@ export function useStartupManager() {
 
   const totalStartupCount = useMemo(() => startupItems.length, [startupItems]);
   const activeStartupCount = useMemo(
-    () => startupItems.filter((i) => i.enabled).length,
+    () => startupItems.filter((i) => i.enabled && !i.phantom).length,
     [startupItems]
   );
   const brokenStartupCount = useMemo(
@@ -110,6 +119,7 @@ export function useStartupManager() {
       return (
         item.name.toLowerCase().includes(q) ||
         item.clean_path.toLowerCase().includes(q) ||
+        item.command.toLowerCase().includes(q) ||
         item.location.toLowerCase().includes(q)
       );
     });
@@ -124,6 +134,7 @@ export function useStartupManager() {
     startupFilter,
     setStartupFilter,
     startupLoading,
+    startupPendingId,
     setStartupLoading,
     startupError,
     setStartupError,

@@ -1,10 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { StorageDirectoryTree } from "./StorageDirectoryTree";
+import "./StorageDirectoryTree.css";
+import { ModuleHeader } from "../ui/ModuleHeader";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { motion } from "framer-motion";
 import {
-  ChevronRight,
+  AlertTriangle,
   FileText,
-  Folder,
   FolderOpen,
   HardDrive,
   Layers,
@@ -15,17 +17,16 @@ import {
   Square,
 } from "lucide-react";
 import {
-  PageHeader,
-  SegmentedHudBar,
-  TREEMAP_PALETTE,
+  copyTextToClipboard,
   formatBytes,
   getCategoryStyle,
-  type FolderNode,
 } from "../../lib/studio";
 import { useStorageScanElapsed } from "../../hooks/useStorageScanner";
 import type { NexusController } from "../../hooks/useNexusController";
 
 interface DiskHealthInfo {
+  device_id?: number | null;
+  serial_number?: string;
   model: string;
   kind: string;
   firmware?: string;
@@ -45,73 +46,39 @@ function driveLabel(drive: string): string {
   return `Том ${letter.endsWith(":") ? letter : `${letter}:`}`;
 }
 
-function joinWin(parts: string[]): string {
-  if (parts.length === 0) return "";
-  if (parts[0].endsWith(":")) return `${parts[0]}\\${parts.slice(1).join("\\")}`;
-  return parts.join("\\");
-}
-
-function groupPrefix(kind: "game" | "program" | "folder"): string {
-  if (kind === "game") return "Игра";
-  if (kind === "program") return "Программа";
-  return "Каталог";
-}
-
-function heavyGroup(path: string): { kind: "game" | "program" | "folder"; title: string; folder: string } {
-  const parts = path.replace(/\//g, "\\").split("\\").filter(Boolean);
-  const lower = parts.map((part) => part.toLowerCase());
-  let bestRank = 0;
-  let bestAt = -1;
-  let bestKind: "game" | "program" = "game";
-  const note = (rank: number, at: number, kind: "game" | "program") => {
-    if (at <= 0 || at >= parts.length - 1 || !parts[at] || rank <= bestRank) return;
-    bestRank = rank;
-    bestAt = at;
-    bestKind = kind;
-  };
-  for (let index = 0; index < lower.length; index += 1) {
-    if (lower[index] === "steamapps" && lower[index + 1] === "common") note(100, index + 2, "game");
-    if (lower[index] === "gog galaxy" && lower[index + 1] === "games") note(90, index + 2, "game");
-    if (lower[index] === "gog games" || lower[index] === "epic games") note(85, index + 1, "game");
-    if (lower[index] === "riot games") note(80, index + 1, "game");
-    if (lower[index] === "games") note(70, index + 1, "game");
-    if (lower[index] === "program files (x86)" || lower[index] === "program files") note(40, index + 1, "program");
-  }
-  if (bestAt > 0) {
-    return { kind: bestKind, title: parts[bestAt], folder: joinWin(parts.slice(0, bestAt + 1)) };
-  }
-  const root = parts[0]?.endsWith(":") ? 1 : 0;
-  const title = parts[root] && root < parts.length - 1 ? parts[root] : parts[parts.length - 2] || parts[0] || "";
-  const nameAt = parts[root] && root < parts.length - 1 ? root : Math.max(0, parts.length - 2);
-  return { kind: "folder", title, folder: joinWin(parts.slice(0, nameAt + 1)) };
-}
-
 function StorageScanButton({
   isScanning,
+  isCancelling,
+  startedAt,
+  hasTarget,
   onStartScan,
   onCancelScan,
 }: {
   isScanning: boolean;
+  isCancelling: boolean;
+  startedAt: number | null;
+  hasTarget: boolean;
   onStartScan: () => void;
   onCancelScan: () => void;
 }) {
-  const scanElapsedSec = useStorageScanElapsed(isScanning);
+  const scanElapsedSec = useStorageScanElapsed(isScanning, startedAt);
   return (
     <div className="flex items-center gap-2">
       <button
         type="button"
-        disabled={isScanning}
+        disabled={isScanning || isCancelling || !hasTarget}
         onClick={onStartScan}
-        className="cyber-btn inline-flex cursor-pointer items-center gap-2.5 px-4 py-2.5 font-mono text-xs font-semibold uppercase tracking-wider text-[#00D5E8] disabled:opacity-70"
+        className="nexus-button nexus-button--primary"
       >
         {isScanning ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />}
-        {isScanning ? `Сканирование · ${scanElapsedSec.toFixed(0)} сек` : "Сканировать том"}
+        {isCancelling ? "Остановка…" : isScanning ? `Сканирование · ${scanElapsedSec} с` : "Сканировать том"}
       </button>
-      {isScanning && (
+      {(isScanning || isCancelling) && (
         <button
           type="button"
           onClick={onCancelScan}
-          className="cyber-btn-danger inline-flex cursor-pointer items-center gap-1.5 px-3 py-2.5 text-xs font-medium text-rose-300"
+          disabled={isCancelling}
+          className="nexus-button"
         >
           <Square size={12} className="fill-current" />
           Остановить
@@ -126,56 +93,61 @@ export function StorageModule({ c }: { c: NexusController }) {
     metrics,
     diskUsedPercentage,
     availableDrives,
+    drivesLoading,
+    drivesError,
+    fetchAvailableDrives,
     selectedDriveOrPath,
-    setSelectedDriveOrPath,
     isScanning,
+    isCancellingScan,
+    scanStartedAt,
+    scanTarget,
+    scanCancelled,
     scanResult,
     scanError,
-    treemapStack,
-    selectedTreemapNode,
-    setSelectedTreemapNode,
     handleStartStorageScan,
     handleCancelStorageScan,
     handleOpenPathInExplorer,
-    treemapRects,
     filteredTopFiles,
     fileSearch,
     setFileSearch,
-    setScanResult,
-    setTreemapStack,
   } = c;
 
-  const [heavyMode, setHeavyMode] = useState<"groups" | "files">("groups");
+  const { storageLocation, goToStorage } = c;
+  const { view } = storageLocation;
+  const setView = (view: "analysis" | "smart") => goToStorage({ ...storageLocation, view });
   const [diskHealth, setDiskHealth] = useState<DiskHealthInfo[]>([]);
-  const [diskHealthLoading, setDiskHealthLoading] = useState(false);
+  const [diskHealthLoading, setDiskHealthLoading] = useState(true);
   const [diskHealthError, setDiskHealthError] = useState("");
+  const diskHealthPending = useRef(false);
+  const [profileScan, setProfileScan] = useState(false);
+  const [copiedPath, setCopiedPath] = useState("");
+  const [locating, setLocating] = useState(false);
+  const locateRequest = useRef(0);
+  const currentScanId = scanResult?.scan_id;
 
-  const activeFolderNode = treemapStack[treemapStack.length - 1] ?? scanResult?.root_node ?? null;
+  useLayoutEffect(() => {
+    setLocating(false);
+    return () => { locateRequest.current++; };
+  }, [storageLocation, currentScanId]);
 
-  const heavyGroups = useMemo(() => {
-    const query = fileSearch.trim().toLowerCase();
-    const nodes: FolderNode[] = activeFolderNode?.children ?? [];
-    return nodes
-      .map((node) => {
-        const group = heavyGroup(`${node.path}\\item`);
-        return {
-          node,
-          kind: group.kind,
-          title: node.name || group.title,
-          folder: node.path || group.folder,
-          size: node.size_bytes,
-        };
-      })
-      .filter(
-        (group) =>
-          !query ||
-          group.title.toLowerCase().includes(query) ||
-          group.folder.toLowerCase().includes(query)
-      )
-      .sort((a, b) => b.size - a.size);
-  }, [activeFolderNode, fileSearch]);
+  const locate = async (path: string) => {
+    const scanId = currentScanId;
+    if (scanId === undefined) return;
+    const request = ++locateRequest.current;
+    setLocating(true);
+    try {
+      const [folder, file] = await invoke<[string, string]>("locate_storage_file", { scanId, path });
+      if (locateRequest.current === request) goToStorage({ volume: selectedDriveOrPath, scanId, folder, file, view: "analysis" });
+    } catch (error) {
+      if (locateRequest.current === request) c.setScanError(String(error));
+    } finally {
+      if (locateRequest.current === request) setLocating(false);
+    }
+  };
 
   const loadDiskHealth = useCallback(async () => {
+    if (diskHealthPending.current) return;
+    diskHealthPending.current = true;
     setDiskHealthLoading(true);
     try {
       const rows = await invoke<DiskHealthInfo[]>("get_disk_health_info");
@@ -184,19 +156,20 @@ export function StorageModule({ c }: { c: NexusController }) {
     } catch (err) {
       setDiskHealthError(String(err));
     } finally {
+      diskHealthPending.current = false;
       setDiskHealthLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    void loadDiskHealth();
-  }, [loadDiskHealth]);
+    if (view === "smart" && c.windowVisible) void loadDiskHealth();
+  }, [view, c.windowVisible, loadDiskHealth]);
 
   const selectedLetter = selectedDriveOrPath.trim().slice(0, 2).toUpperCase();
   const matchedVolume = availableDrives.find(
     (d) => d.mount_point.trim().slice(0, 2).toUpperCase() === selectedLetter
   );
-  const showsSystemVolume = selectedLetter.startsWith("C") || selectedDriveOrPath.trim() === "";
+  const showsSystemVolume = selectedLetter === "C:" && metrics.disk_total_gb > 0;
   const freeGb =
     matchedVolume && matchedVolume.total_bytes > 0
       ? matchedVolume.available_bytes / 1024 / 1024 / 1024
@@ -223,24 +196,44 @@ export function StorageModule({ c }: { c: NexusController }) {
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0, y: -4 }}
       transition={{ duration: 0.16, ease: "easeOut" }}
-      className="w-full space-y-4"
+      className="avs-module avs-storage w-full space-y-4"
     >
-      <PageHeader
+      <ModuleHeader module="storage"
         title="Анализатор накопителей"
-        description="Карта распределения пространства Treemap, инспекция крупных каталогов и S.M.A.R.T.-диагностика"
-        actions={
+        description="Выберите том для анализа каталогов, поиска крупных файлов и проверки S.M.A.R.T."
+        actions={(view === "analysis" || isScanning || isCancellingScan) && (
+          <>
+            <label className="flex cursor-pointer items-center gap-2 text-xs text-[var(--nexus-muted)]">
+              <input type="checkbox" className="accent-cyan-300" checked={profileScan}
+                disabled={isScanning || isCancellingScan} onChange={(event) => setProfileScan(event.target.checked)} />
+              Диагностика скорости
+            </label>
           <StorageScanButton
             isScanning={isScanning}
-            onStartScan={() => void handleStartStorageScan()}
+            isCancelling={isCancellingScan}
+            startedAt={scanStartedAt}
+            hasTarget={Boolean(selectedDriveOrPath)}
+            onStartScan={() => void handleStartStorageScan(undefined, profileScan)}
             onCancelScan={() => void handleCancelStorageScan()}
           />
-        }
+          </>
+        )}
       />
 
+      <div className="avs-workspace-tabs" role="group" aria-label="Представление накопителей">
+        <button type="button" aria-pressed={view === "analysis"} onClick={() => setView("analysis")}><Layers size={16} /> Дерево и файлы</button>
+        <button type="button" aria-pressed={view === "smart"} onClick={() => setView("smart")}><HardDrive size={16} /> Состояние S.M.A.R.T.</button>
+      </div>
+      {view === "analysis" && <div className="avs-volume-workspace">
       {/* Панель выбора тома и ёмкости */}
-      <div className="tactical-card tactical-brackets rounded-xl p-4">
+      <section className="nexus-panel avs-storage-volumes p-4" aria-label="Тома Windows" aria-busy={drivesLoading}>
         <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2" role="group" aria-label="Выбор тома">
+            {(drivesLoading || availableDrives.length === 0) && (
+              <span role="status" className="text-sm text-[#a0adbb]">
+                {drivesLoading ? "Получение списка томов…" : drivesError ? "Список томов недоступен" : "Доступных томов нет"}
+              </span>
+            )}
             {availableDrives.map((drive) => {
               const mount = drive.mount_point;
               const selected = selectedDriveOrPath.toUpperCase() === mount.toUpperCase();
@@ -248,22 +241,30 @@ export function StorageModule({ c }: { c: NexusController }) {
                 <button
                   key={mount}
                   type="button"
+                  aria-pressed={selected}
+                  disabled={isCancellingScan}
                   onClick={() => {
-                    if (selected) return;
-                    setSelectedDriveOrPath(mount);
-                    setScanResult(null);
-                    setTreemapStack([]);
+                    if (!selected) goToStorage({ volume: mount, folder: "", view: "analysis" });
                   }}
-                  className={`cursor-pointer rounded-lg border px-3.5 py-2 text-xs font-medium transition-colors ${
-                    selected
-                      ? "border-[#00D5E8]/40 bg-[#00D5E8]/12 text-[#00D5E8]"
-                      : "border-[#202B38] bg-[#0B0E14] text-[#8292A3] hover:text-[#E5EDF5]"
-                  }`}
+                  className="avs-volume-button"
                 >
-                  {driveLabel(mount)}
+                  <HardDrive size={19} aria-hidden="true" />
+                  <span className="text-sm font-semibold">{driveLabel(mount)}
+                    {drive.total_bytes > 0 && <small>{formatBytes(drive.total_bytes)}</small>}
+                  </span>
                 </button>
               );
             })}
+            <button
+              type="button"
+              onClick={() => void fetchAvailableDrives()}
+              disabled={drivesLoading || isScanning || isCancellingScan}
+              className="nexus-button"
+              aria-label="Обновить список томов"
+              title="Обновить список томов"
+            >
+              <RefreshCw size={14} className={drivesLoading ? "animate-spin" : ""} />
+            </button>
           </div>
 
           <div className="flex flex-wrap items-baseline gap-4 lg:text-right">
@@ -282,82 +283,70 @@ export function StorageModule({ c }: { c: NexusController }) {
           </div>
         </div>
 
-        <div className="mt-3">
-          <SegmentedHudBar percentage={usedPct} theme="cyan" />
-        </div>
-
-        {scanError && (
-          <div className="mt-3 rounded-lg border border-rose-500/35 bg-rose-500/12 px-3 py-2 text-xs text-rose-300">
-            {scanError}
+        {totalGb !== null && (
+          <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-[#1b2632]" role="meter" aria-label="Занято на томе" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(usedPct)}>
+            <div className="h-full rounded-full bg-[#00b8cd]" style={{ width: `${usedPct}%` }} />
           </div>
         )}
-      </div>
 
-      {/* Центральная зона: Карта Treemap и Инспектор тяжёлых объектов */}
-      {!scanResult && !isScanning && (
-        <div className="tactical-card tactical-brackets rounded-xl p-6">
-          <div className="flex flex-col items-center justify-between gap-6 lg:flex-row">
-            <div className="flex items-start gap-4">
-              <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl border border-[#00D5E8]/30 bg-[#00D5E8]/10 text-[#00D5E8]">
-                <Layers size={22} />
-              </div>
-              <div>
-                <div className="flex items-center gap-2">
-                  <h3 className="text-base font-semibold text-[#E5EDF5]">
-                    Карта пространства Treemap · {selectedDriveOrPath || "C:\\"}
-                  </h3>
-                  <span className="rounded border border-[#202B38] bg-[#151C26] px-2 py-0.5 font-mono text-[10px] text-[#8292A3]">
-                    ГОТОВ К ОБХОДУ
-                  </span>
-                </div>
-                <p className="mt-1 max-w-2xl text-xs leading-relaxed text-[#8292A3]">
-                  Запустите сканирование в верхней панели для построения иерархической карты каталогов Treemap, поиска ресурсоёмких игр, кэша и крупнейших файлов на выбранном томе.
-                </p>
-              </div>
-            </div>
+        {(scanError || drivesError) && (
+          <div role="alert" className="mt-3 rounded-lg border border-rose-500/35 bg-rose-500/12 px-3 py-2 text-xs text-rose-300">
+            {scanError ?? drivesError}
+          </div>
+        )}
+      </section>
 
-            <div className="grid w-full grid-cols-3 gap-2.5 lg:w-auto lg:min-w-[360px]">
-              <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] p-3">
-                <div className="font-mono text-[10px] text-[#00D5E8]">01 // TREEMAP</div>
-                <div className="mt-1 text-xs font-medium text-[#E5EDF5]">Карта блоков</div>
-                <div className="mt-0.5 text-[11px] text-[#8292A3]">Навигация по папкам</div>
-              </div>
-              <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] p-3">
-                <div className="font-mono text-[10px] text-[#00D5E8]">02 // КАТАЛОГИ</div>
-                <div className="mt-1 text-xs font-medium text-[#E5EDF5]">Игры и программы</div>
-                <div className="mt-0.5 text-[11px] text-[#8292A3]">Группировка объёма</div>
-              </div>
-              <div className="rounded-lg border border-[#202B38] bg-[#0B0E14] p-3">
-                <div className="font-mono text-[10px] text-[#00D5E8]">03 // ФАЙЛЫ</div>
-                <div className="mt-1 text-xs font-medium text-[#E5EDF5]">Топ объектов</div>
-                <div className="mt-0.5 text-[11px] text-[#8292A3]">Поиск гигабайтов</div>
-              </div>
-            </div>
+      <div className="avs-volume-content">
+      {!scanResult && !isScanning && !isCancellingScan && selectedDriveOrPath && (
+        <div className="avs-scan-welcome min-w-0">
+          <Layers size={34} strokeWidth={1.4} aria-hidden="true" />
+          <div className="min-w-0">
+            <h3 className="text-base font-semibold text-[#E5EDF5]">
+              {scanCancelled && scanTarget === selectedDriveOrPath ? "Сканирование остановлено" : "Дерево занятого места"}
+            </h3>
+            <p className="mt-1 text-sm text-[#a0adbb]">Просканируйте выбранный том, чтобы увидеть объёмы каталогов и крупнейшие файлы.</p>
           </div>
         </div>
       )}
 
-      {isScanning && !scanResult && (
-        <div className="tactical-card flex flex-col items-center justify-center gap-3 rounded-xl px-6 py-14 text-center">
+      {(isScanning || isCancellingScan) && !scanResult && (
+        <div role="status" className="nexus-empty flex flex-col items-center justify-center gap-3 px-6 py-10 text-center">
           <Loader2 size={24} className="animate-spin text-[#00D5E8]" />
           <div className="text-sm font-semibold text-[#E5EDF5]">
-            Многопоточный обход файловой системы {selectedDriveOrPath}…
+            {isCancellingScan ? "Останавливаем сканирование" : "Сканируем"} {scanTarget}…
           </div>
           <p className="max-w-md text-xs text-[#8292A3]">
-            Формируется дерево каталогов и индекс наиболее крупных файлов. Вы можете остановить операцию в любой момент.
+            {isCancellingScan ? "Ожидаем подтверждения отмены." : "Идёт подсчёт размеров каталогов и крупных файлов."}
           </p>
         </div>
       )}
 
       {scanResult && (
         <div className="space-y-4">
-          {/* Распределение типов файлов (category_sizes) */}
+          <div className="avs-storage-result">
+            <span>{formatBytes(scanResult.total_scanned_bytes)} · {scanResult.total_files_count.toLocaleString("ru-RU")} файлов
+              {" · "}{(scanResult.total_dirs_count ?? 0).toLocaleString("ru-RU")} папок</span>
+                {scanResult.is_partial && (
+                  <details key={scanResult.root_node.path} className="avs-scan-partial">
+                    <summary className="nexus-button text-amber-200">
+                      <AlertTriangle size={14} aria-hidden /> Частичный результат · {(scanResult.skipped_dirs_count ?? 0) + (scanResult.skipped_files_count ?? 0)} проп.
+                    </summary>
+                    <div className="nexus-panel avs-scan-partial-details">
+                      <dl>
+                        <div><dt>Пропущено каталогов</dt><dd>{scanResult.skipped_dirs_count ?? 0}</dd></div>
+                        <div><dt>Отказы в доступе</dt><dd>{scanResult.access_denied_count ?? 0}</dd></div>
+                        <div><dt>Пропущено файлов</dt><dd>{scanResult.skipped_files_count ?? 0}</dd></div>
+                      </dl>
+                      <p>Карта учитывает только прочитанные файлы. Пропущенные пути и системные данные могут увеличить фактический объём на диске.</p>
+                      {!!scanResult.skipped_samples?.length && <ul aria-label="Примеры пропущенных путей">{scanResult.skipped_samples.map((path) => <li key={path} title={path}>{path}</li>)}</ul>}
+                    </div>
+                  </details>
+                )}
+          </div>
           {scanResult.category_sizes.length > 0 && scanResult.total_scanned_bytes > 0 && (
-            <section className="tactical-card rounded-xl p-4">
+            <section className="nexus-panel avs-storage-categories p-3" aria-labelledby="storage-category-title">
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <span className="text-xs font-semibold uppercase tracking-wider text-[#8292A3]">
-                  Распределение по категориям файлов
-                </span>
+                <h3 id="storage-category-title" className="text-sm font-semibold">Категории файлов</h3>
                 <span className="font-mono text-xs text-[#8292A3]">
                   Проиндексировано:{" "}
                   <span className="font-semibold text-[#00D5E8]">
@@ -368,7 +357,7 @@ export function StorageModule({ c }: { c: NexusController }) {
               <div className="mt-2.5 flex h-2.5 w-full overflow-hidden rounded-full bg-[#0B0E14] p-0.5">
                 {scanResult.category_sizes.map(([category, sizeBytes]) => {
                   const pct = (sizeBytes / scanResult.total_scanned_bytes) * 100;
-                  if (pct < 0.4) return null;
+                  if (sizeBytes <= 0) return null;
                   const style = getCategoryStyle(category);
                   return (
                     <div
@@ -403,257 +392,83 @@ export function StorageModule({ c }: { c: NexusController }) {
               </div>
             </section>
           )}
-
-          <div className="grid grid-cols-1 gap-4 xl:grid-cols-12">
-          {/* Главный визуальный блок Treemap */}
-          <div className="tactical-card tactical-brackets flex min-w-0 flex-col justify-between rounded-xl p-4 xl:col-span-8">
-            <div>
-              <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-                <div className="flex flex-wrap items-center gap-1 text-xs text-[#8292A3]">
-                  {treemapStack.map((node, idx) => (
-                    <span key={node.path + idx} className="flex items-center gap-1">
-                      {idx > 0 && <ChevronRight size={12} className="text-[#526170]" />}
-                      <button
-                        type="button"
-                        onClick={() => {
-                          const nextStack = treemapStack.slice(0, idx + 1);
-                          setTreemapStack(nextStack);
-                          setSelectedTreemapNode(node);
-                        }}
-                        className={`cursor-pointer rounded px-1.5 py-0.5 font-mono text-xs transition-colors ${
-                          idx === treemapStack.length - 1
-                            ? "bg-[#00D5E8]/12 font-semibold text-[#00D5E8]"
-                            : "text-[#8292A3] hover:text-[#E5EDF5]"
-                        }`}
-                      >
-                        {node.name || node.path}
-                      </button>
-                    </span>
-                  ))}
-                </div>
-                <span className="font-mono text-xs text-[#8292A3]">
-                  Просканировано:{" "}
-                  <span className="font-semibold text-[#00D5E8]">
-                    {formatBytes(scanResult.total_scanned_bytes)}
-                  </span>{" "}
-                  · {scanResult.total_files_count.toLocaleString("ru-RU")} файлов
-                </span>
-              </div>
-
-              <div className="relative h-[320px] overflow-hidden rounded-xl border border-[#202B38] bg-[#0B0E14] p-1.5 xl:h-[400px] 2xl:h-[480px]">
-                {treemapRects.length === 0 ? (
-                  <div className="flex h-full items-center justify-center text-sm text-[#8292A3]">
-                    В выбранном каталоге нет вложенных подпапок
-                  </div>
-                ) : (
-                  treemapRects.map((rect) => {
-                    const selected = selectedTreemapNode?.path === rect.node.path;
-                    const palette = TREEMAP_PALETTE[rect.colorIndex] ?? TREEMAP_PALETTE[0];
-                    return (
-                      <div
-                        key={rect.node.path}
-                        style={{
-                          left: `${rect.x}%`,
-                          top: `${rect.y}%`,
-                          width: `${rect.w}%`,
-                          height: `${rect.h}%`,
-                        }}
-                        className="absolute p-0.5"
-                      >
-                        <button
-                          type="button"
-                          title={`${rect.node.name} — ${formatBytes(rect.node.size_bytes)} (двойной клик — войти внутрь)`}
-                          onClick={() => setSelectedTreemapNode(rect.node)}
-                          onDoubleClick={() => {
-                            if (rect.node.children.length > 0) {
-                              setTreemapStack((prev) => [...prev, rect.node]);
-                              setSelectedTreemapNode(rect.node.children[0] ?? rect.node);
-                            }
-                          }}
-                          className={`flex h-full w-full cursor-pointer flex-col justify-between overflow-hidden rounded-lg border bg-gradient-to-br p-2 text-left transition-all ${palette} ${
-                            selected ? "ring-1 ring-[#00D5E8]" : ""
-                          }`}
-                        >
-                          <span className="flex items-center justify-between gap-1 text-xs font-medium">
-                            <span className="truncate">{rect.node.name}</span>
-                            {rect.node.children.length > 0 && rect.w > 12 && (
-                              <Folder size={12} className="shrink-0 opacity-75" />
-                            )}
-                          </span>
-                          {rect.w > 12 && rect.h > 18 && (
-                            <span className="truncate font-mono text-[11px] font-semibold">
-                              {formatBytes(rect.node.size_bytes)}
-                            </span>
-                          )}
+          {scanResult.scan_id !== undefined && (
+            <StorageDirectoryTree
+              key={`${scanResult.scan_id}:${storageLocation.scanId === scanResult.scan_id ? storageLocation.folder : ""}:${storageLocation.file ?? ""}`}
+              scanId={scanResult.scan_id}
+              folder={storageLocation.scanId === scanResult.scan_id ? storageLocation.folder : ""}
+              file={storageLocation.scanId === scanResult.scan_id ? storageLocation.file : undefined}
+              usedBytes={matchedVolume && matchedVolume.total_bytes > 0
+                ? Math.max(0, matchedVolume.total_bytes - matchedVolume.available_bytes) : null}
+              navigate={(folder) => goToStorage({ volume: selectedDriveOrPath, folder, scanId: scanResult.scan_id, view })}
+              reveal={handleOpenPathInExplorer}
+            />
+          )}
+          <details className="nexus-panel avs-large-files p-3">
+            <summary className="cursor-pointer text-sm font-semibold">Крупнейшие файлы тома · {scanResult.top_files.length}</summary>
+            <label className="avs-large-search">
+              <Search size={14} aria-hidden />
+              <input value={fileSearch} onChange={(event) => setFileSearch(event.target.value)}
+                aria-label="Поиск среди крупнейших файлов" placeholder="Имя, расширение или путь" />
+            </label>
+            {filteredTopFiles.length === 0 ? <p className="nexus-empty">Крупные файлы не найдены</p> :
+              <div className="avs-large-list">
+                <table aria-label="Крупнейшие файлы тома">
+                  <thead><tr><th scope="col">Имя и путь</th><th scope="col">Размер</th><th scope="col">Действия</th></tr></thead>
+                  <tbody>{filteredTopFiles.map(file => (
+                    <tr key={file.path}>
+                      <td title={file.path}><FileText size={14} aria-hidden /><strong>{file.name}</strong><small>{file.path}</small></td>
+                      <td>{formatBytes(file.size_bytes)}</td>
+                      <td>
+                        <button type="button" className="nexus-button" onClick={() => void locate(file.path)} disabled={locating}
+                          aria-label={`Найти в дереве: ${file.name}`}>В дереве</button>
+                        <button type="button" className="nexus-button" onClick={() => void handleOpenPathInExplorer(file.path)}
+                          title="Показать в Проводнике" aria-label={`Показать файл: ${file.name}`}><FolderOpen size={15} /></button>
+                        <button type="button" className="nexus-button" aria-label={`Копировать путь: ${file.name}`}
+                          onClick={async () => {
+                            try {
+                              await copyTextToClipboard(file.path);
+                              setCopiedPath(file.path);
+                            } catch (error) { c.setScanError(String(error)); }
+                          }}>
+                          {copiedPath === file.path ? "Скопировано" : "Путь"}
                         </button>
-                      </div>
-                    );
-                  })
-                )}
-              </div>
-            </div>
-
-            {selectedTreemapNode && (
-              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[#202B38] bg-[#0B0E14] px-3 py-2 text-xs">
-                <div className="min-w-0 flex-1 truncate font-mono text-[#8292A3]" title={selectedTreemapNode.path}>
-                  <span className="font-semibold text-[#E5EDF5]">{selectedTreemapNode.name}</span> ·{" "}
-                  <span className="text-[#00D5E8]">{formatBytes(selectedTreemapNode.size_bytes)}</span> ·{" "}
-                  <span>{selectedTreemapNode.path}</span>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => void handleOpenPathInExplorer(selectedTreemapNode.path)}
-                  className="inline-flex shrink-0 cursor-pointer items-center gap-1.5 rounded border border-[#202B38] bg-[#151C26] px-2.5 py-1 text-xs font-medium text-[#E5EDF5] hover:border-[#00D5E8]/40"
-                >
-                  <FolderOpen size={12} className="text-[#00D5E8]" />
-                  Проводник
-                </button>
-              </div>
-            )}
-          </div>
-
-          {/* Правая панель: Тяжёлые папки и Топ файлов */}
-          <div className="tactical-card tactical-brackets flex h-[412px] min-h-0 min-w-0 flex-col rounded-xl p-4 xl:col-span-4 xl:h-[492px] 2xl:h-[572px]">
-            <div className="flex items-center justify-between gap-2">
-              <h3 className="text-sm font-semibold text-[#E5EDF5]">Инспектор объёма</h3>
-              <div className="flex gap-1">
-                {(
-                  [
-                    ["groups", "Каталоги"],
-                    ["files", "Топ файлов"],
-                  ] as const
-                ).map(([id, label]) => (
-                  <button
-                    key={id}
-                    type="button"
-                    onClick={() => setHeavyMode(id)}
-                    className={`cursor-pointer rounded-md border px-2.5 py-1 text-[11px] font-medium transition-colors ${
-                      heavyMode === id
-                        ? "border-[#00D5E8]/40 bg-[#00D5E8]/12 text-[#00D5E8]"
-                        : "border-[#202B38] bg-[#0B0E14] text-[#8292A3] hover:text-[#E5EDF5]"
-                    }`}
-                  >
-                    {label}
-                  </button>
+                      </td>
+                    </tr>))}</tbody>
+                </table>
+              </div>}
+          </details>
+          {scanResult.diagnostics && (
+            <details className="nexus-panel p-4 text-sm">
+              <summary className="cursor-pointer font-semibold">Диагностика сканирования</summary>
+              <p className="my-2 text-xs text-[var(--nexus-muted)]">
+                {formatBytes(scanResult.total_scanned_bytes)} · {scanResult.total_files_count.toLocaleString("ru-RU")} файлов
+                {" · "}{scanResult.total_dirs_count?.toLocaleString("ru-RU")} каталогов
+                {" · "}{scanResult.excluded_count ?? 0} исключено по правилам
+              </p>
+              <p className="text-xs text-[var(--nexus-muted)]">Время этапов обхода суммируется по рабочим потокам.</p>
+              <dl className="mt-2 grid grid-cols-2 gap-2 font-mono text-xs sm:grid-cols-3">
+                {([
+                  ["Чтение каталогов", scanResult.diagnostics.enumeration_worker_ms],
+                  ["Метаданные", scanResult.diagnostics.metadata_worker_ms],
+                  ["Подсчёт файлов", scanResult.diagnostics.counting_worker_ms],
+                  ["Суммирование", scanResult.diagnostics.aggregation_worker_ms],
+                  ["Сборка дерева", scanResult.diagnostics.tree_worker_ms],
+                  ["Подготовка результата", scanResult.diagnostics.finalize_ms],
+                  ["Пробная сериализация", scanResult.diagnostics.serialization_sample_ms],
+                  ["Сканирование целиком", scanResult.diagnostics.elapsed_ms],
+                  ["Запрос из WebView2", scanResult.ipc_roundtrip_ms],
+                ] as const).map(([label, time]) => (
+                  <div key={label}><dt className="text-[var(--nexus-muted)]">{label}</dt><dd>{time === undefined ? "—" : `${time.toFixed(1)} мс`}</dd></div>
                 ))}
-              </div>
-            </div>
+              </dl>
+            </details>
+          )}
 
-            <div className="relative mt-2.5">
-              <Search
-                size={13}
-                className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-[#526170]"
-              />
-              <input
-                type="text"
-                value={fileSearch}
-                onChange={(event) => setFileSearch(event.target.value)}
-                placeholder="Фильтр по названию или пути…"
-                className="w-full rounded-lg border border-[#202B38] bg-[#0B0E14] py-1.5 pl-8 pr-2.5 text-xs text-[#E5EDF5] outline-none placeholder:text-[#526170] focus:border-[#00D5E8]/50"
-              />
-            </div>
-
-            <div className="mt-2.5 min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
-              {heavyMode === "groups" ? (
-                heavyGroups.length === 0 ? (
-                  <p className="py-6 text-center text-xs text-[#8292A3]">Крупные каталоги не найдены</p>
-                ) : (
-                  heavyGroups.map((group) => (
-                    <div
-                      key={group.folder}
-                      className="rounded-lg border border-[#202B38] bg-[#0B0E14] px-3 py-2 transition-colors hover:border-[#00D5E8]/30"
-                    >
-                      <div className="flex items-start justify-between gap-2">
-                        <div className="min-w-0">
-                          <div className="truncate text-xs font-medium text-[#E5EDF5]">
-                            <span className="text-[#8292A3]">[{groupPrefix(group.kind)}]</span> {group.title}
-                          </div>
-                          <div
-                            className="mt-0.5 truncate font-mono text-[11px] text-[#526170]"
-                            title={group.folder}
-                          >
-                            {group.folder}
-                          </div>
-                        </div>
-                        <span className="shrink-0 font-mono text-xs font-semibold text-[#00D5E8]">
-                          {formatBytes(group.size)}
-                        </span>
-                      </div>
-                      <div className="mt-1.5 flex items-center gap-3">
-                        <button
-                          type="button"
-                          onClick={() => void handleOpenPathInExplorer(group.folder)}
-                          className="inline-flex cursor-pointer items-center gap-1.5 text-[11px] text-[#8292A3] hover:text-[#00D5E8]"
-                        >
-                          <FolderOpen size={11} />
-                          Открыть в проводнике
-                        </button>
-                        {group.node.children.length > 0 && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setTreemapStack((prev) => [...prev, group.node]);
-                              setSelectedTreemapNode(group.node.children[0] ?? group.node);
-                            }}
-                            className="inline-flex cursor-pointer items-center gap-1 text-[11px] text-[#00D5E8] hover:underline"
-                          >
-                            <Layers size={11} />
-                            Открыть в Treemap
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  ))
-                )
-              ) : filteredTopFiles.length === 0 ? (
-                <p className="py-6 text-center text-xs text-[#8292A3]">Крупные файлы не найдены</p>
-              ) : (
-                filteredTopFiles.map((file, idx) => {
-                  const group = heavyGroup(file.path);
-                  return (
-                    <div
-                      key={file.path + idx}
-                      className="rounded-lg border border-[#202B38] bg-[#0B0E14] px-3 py-2 transition-colors hover:border-[#00D5E8]/30"
-                    >
-                      <div className="flex items-start justify-between gap-2">
-                        <div className="min-w-0">
-                          <div className="flex items-center gap-1.5">
-                            <FileText size={13} className="shrink-0 text-[#8292A3]" />
-                            <span className="truncate text-xs font-medium text-[#E5EDF5]">
-                              {file.name || group.title}
-                            </span>
-                          </div>
-                          <div
-                            className="mt-0.5 truncate font-mono text-[11px] text-[#526170]"
-                            title={file.path}
-                          >
-                            {file.path}
-                          </div>
-                        </div>
-                        <span className="shrink-0 font-mono text-xs font-semibold text-[#00D5E8]">
-                          {formatBytes(file.size_bytes)}
-                        </span>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => void handleOpenPathInExplorer(file.path)}
-                        className="mt-1.5 inline-flex cursor-pointer items-center gap-1.5 text-[11px] text-[#8292A3] hover:text-[#00D5E8]"
-                      >
-                        <FolderOpen size={11} />
-                        Показать файл
-                      </button>
-                    </div>
-                  );
-                })
-              )}
-            </div>
-          </div>
-          </div>
         </div>
       )}
-
-      {/* Физическое состояние накопителей (S.M.A.R.T.) */}
-      <section className="tactical-card tactical-brackets rounded-xl p-4">
+      </div></div>}
+      {view === "smart" && <section className="nexus-panel avs-smart-panel p-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2">
             <HardDrive size={15} className="text-[#00D5E8]" />
@@ -677,10 +492,10 @@ export function StorageModule({ c }: { c: NexusController }) {
 
         {diskHealthError && <p className="mt-2 text-xs text-rose-300">{diskHealthError}</p>}
         {diskHealth.length === 0 && !diskHealthError ? (
-          <p className="mt-3 text-sm text-[#8292A3]">Чтение параметров S.M.A.R.T. контроллера…</p>
+          <p className="mt-3 text-sm text-[#aebfdb]">{diskHealthLoading ? "Чтение параметров S.M.A.R.T. контроллера…" : "Нет доступных показаний S.M.A.R.T."}</p>
         ) : (
           <div className="mt-3 grid gap-3 lg:grid-cols-2">
-            {diskHealth.map((disk) => {
+            {diskHealth.map((disk, idx) => {
               const hasSmart = disk.health_percent !== null && disk.health_percent !== undefined;
               const percent = hasSmart ? disk.health_percent! : 0;
               const tone = !hasSmart
@@ -690,17 +505,26 @@ export function StorageModule({ c }: { c: NexusController }) {
                 : percent >= 50
                 ? "bg-amber-400"
                 : "bg-rose-400";
+              const diskKey =
+                disk.device_id != null
+                  ? `disk-${disk.device_id}`
+                  : disk.serial_number
+                  ? `sn-${disk.serial_number}`
+                  : `${disk.model}-${disk.kind}-${idx}`;
               return (
                 <div
-                  key={disk.model + disk.kind}
+                  key={diskKey}
                   className="rounded-lg border border-[#202B38] bg-[#0B0E14] p-3.5"
                 >
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0">
                       <div className="truncate text-sm font-medium text-[#E5EDF5]">{disk.model}</div>
-                      {disk.firmware && (
+                      {(disk.firmware || disk.device_id != null || disk.available_spare != null) && (
                         <div className="font-mono text-[10px] text-[#526170]">
-                          Прошивка: {disk.firmware}
+                          {disk.device_id != null ? `Диск #${disk.device_id}` : ""}
+                          {disk.firmware
+                            ? `${disk.device_id != null ? " · " : ""}Прошивка: ${disk.firmware}`
+                            : ""}
                           {disk.available_spare != null ? ` · Резерв: ${disk.available_spare}%` : ""}
                         </div>
                       )}
@@ -713,7 +537,7 @@ export function StorageModule({ c }: { c: NexusController }) {
                     <span>
                       Ресурс:{" "}
                       <span className="font-mono font-semibold text-[#E5EDF5]">
-                        {hasSmart ? `${percent}%` : "Недоступно"}
+                        {hasSmart ? `${percent}%` : disk.health_label || "Недоступно"}
                       </span>
                       {hasSmart ? ` (${disk.health_label})` : ""}
                     </span>
@@ -763,7 +587,7 @@ export function StorageModule({ c }: { c: NexusController }) {
             })}
           </div>
         )}
-      </section>
+      </section>}
     </motion.div>
   );
 }
